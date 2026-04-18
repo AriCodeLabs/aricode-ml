@@ -1,2 +1,10 @@
 .aricode/
 *.aricode*
+
+# MNIST IDX files — downloaded on demand by examples/mnist/get_data.sh
+examples/mnist/*-idx?-ubyte
+examples/mnist/*.gz
+
+# Compiled demos
+examples/mnist/mnist
+examples/xor

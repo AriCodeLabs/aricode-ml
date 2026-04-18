@@ -1,0 +1,222 @@
+// aricode-ml: examples/mnist/mnist.ari
+//
+// Train a 784 → 128 → 10 MLP on a MNIST subset (1000 train / 500 test).
+// ReLU hidden, softmax output, cross-entropy loss, SGD (batch=1).
+//
+// Expected: test accuracy climbs from ~10% (random) to >88% by epoch 5.
+//
+// Prereq: ./get_data.sh in this directory.
+// Compile: aric mnist.ari -o mnist
+// Run from this directory: ./mnist
+
+import "../../dense.ari"     as dense;
+import "../../loss.ari"      as loss;
+import "../../optimizer.ari" as opt;
+
+// ---------------------------------------------------------------------
+// Raw byte IO — IDX files are big-endian, so we assemble 32-bit ints
+// out of the four leading bytes when needed.  The image/label data
+// itself is plain u8, read with byte_at.
+// ---------------------------------------------------------------------
+
+fn load_file(path_str: i32, byte_count: i32) -> i32 {
+    // byte_count doesn't have to be a multiple of 8 — arr_new rounds
+    // up the underlying allocation.
+    let slots: i32 = (byte_count + 7) / 8;
+    let buf: i32 = arr_new(slots);
+    let fd: i32 = file_open(path_str, 0);      // O_RDONLY
+    file_read(fd, buf, byte_count);
+    file_close(fd);
+    return buf;
+}
+
+fn load_image_at(img_buf: i32, offset: i32, out: i32) -> i32 {
+    // Copy 784 pixels starting at offset into `out`, normalised to [0, 1].
+    let i: i32 = 0;
+    while (i < 784) {
+        let px: i32 = byte_at(img_buf, offset + i);
+        arr_f64_set(out, i, int_to_float(px) / 255.0);
+        i += 1;
+    }
+    return 0;
+}
+
+fn one_hot(label: i32, out: i32, n: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < n) { arr_f64_set(out, i, 0.0); i += 1; }
+    arr_f64_set(out, label, 1.0);
+    return 0;
+}
+
+fn argmax(buf: i32, n: i32) -> i32 {
+    let best_i: i32 = 0;
+    let best_v: f64 = arr_f64_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f64_get(buf, i);
+        if (v > best_v) { best_v = v; best_i = i; }
+        i += 1;
+    }
+    return best_i;
+}
+
+// Numerically stable scalar softmax that handles any n (the AVX2
+// arr_f64_softmax builtin requires n % 4 == 0; N_OUT = 10 here).
+fn softmax_n(buf: i32, n: i32) -> i32 {
+    let max_v: f64 = arr_f64_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f64_get(buf, i);
+        if (v > max_v) { max_v = v; }
+        i += 1;
+    }
+    let sum: f64 = 0.0;
+    i = 0;
+    while (i < n) {
+        let e: f64 = math_exp(arr_f64_get(buf, i) - max_v);
+        arr_f64_set(buf, i, e);
+        sum = sum + e;
+        i += 1;
+    }
+    let inv: f64 = 1.0 / sum;
+    i = 0;
+    while (i < n) {
+        arr_f64_set(buf, i, arr_f64_get(buf, i) * inv);
+        i += 1;
+    }
+    return 0;
+}
+
+// He-style weight init (fan_in drawn from the layer's input size).
+fn init_weights(buf: i32, fan_in: i32, seed_i: i32) -> i32 {
+    let s: i32 = seed_i;
+    let scale: f64 = math_sqrt(2.0 / int_to_float(fan_in));
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) {
+        // Simple LCG → [-scale, scale].
+        s = s * 1103515245 + 12345;
+        let r: f64 = int_to_float((s / 65536) - ((s / 65536) / 32768) * 32768);
+        arr_f64_set(buf, i, (r / 32768.0 - 0.5) * 2.0 * scale);
+        i += 1;
+    }
+    return 0;
+}
+
+fn zero_buf(buf: i32) -> i32 {
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) { arr_f64_set(buf, i, 0.0); i += 1; }
+    return 0;
+}
+
+fn main() -> i32 {
+    let N_TRAIN: i32 = 5000;
+    let N_TEST:  i32 = 1000;
+
+    // Paths are relative to the binary's CWD — run the binary from
+    // this directory.
+    let img_path:   i32 = str_new("train-images-idx3-ubyte");
+    let lbl_path:   i32 = str_new("train-labels-idx1-ubyte");
+    let t_img_path: i32 = str_new("t10k-images-idx3-ubyte");
+    let t_lbl_path: i32 = str_new("t10k-labels-idx1-ubyte");
+
+    // 16-byte header for image files, 8-byte for labels.
+    let train_img_buf: i32 = load_file(img_path,   N_TRAIN * 784 + 16);
+    let train_lbl_buf: i32 = load_file(lbl_path,   N_TRAIN + 8);
+    let test_img_buf:  i32 = load_file(t_img_path, N_TEST  * 784 + 16);
+    let test_lbl_buf:  i32 = load_file(t_lbl_path, N_TEST  + 8);
+
+    print_str("Loaded MNIST subset.");
+
+    // 784 → 128 → 10 MLP.
+    let N_IN:  i32 = 784;
+    let N_H:   i32 = 128;
+    let N_OUT: i32 = 10;
+
+    let W1: i32 = arr_f64_new(N_H  * N_IN);   // [128, 784]
+    let b1: i32 = arr_f64_new(N_H);
+    let W2: i32 = arr_f64_new(N_OUT * N_H);   // [10, 128]
+    let b2: i32 = arr_f64_new(N_OUT);
+
+    init_weights(W1, N_IN, 12345);
+    init_weights(W2, N_H,  67890);
+    zero_buf(b1);
+    zero_buf(b2);
+
+    // Scratch.
+    let x:  i32 = arr_f64_new(N_IN);
+    let h:  i32 = arr_f64_new(N_H);
+    let y:  i32 = arr_f64_new(N_OUT);
+    let t:  i32 = arr_f64_new(N_OUT);
+    let dy: i32 = arr_f64_new(N_OUT);
+    let dh: i32 = arr_f64_new(N_H);
+
+    // Gradients.
+    let dW1: i32 = arr_f64_new(N_H  * N_IN);
+    let db1: i32 = arr_f64_new(N_H);
+    let dW2: i32 = arr_f64_new(N_OUT * N_H);
+    let db2: i32 = arr_f64_new(N_OUT);
+
+    let lr: f64 = 0.05;
+    let N_EPOCH: i32 = 5;
+
+    let epoch: i32 = 0;
+    while (epoch < N_EPOCH) {
+        let loss_sum: f64 = 0.0;
+        let s: i32 = 0;
+        while (s < N_TRAIN) {
+            zero_buf(dW1); zero_buf(db1);
+            zero_buf(dW2); zero_buf(db2);
+
+            load_image_at(train_img_buf, 16 + s * 784, x);
+            let lbl: i32 = byte_at(train_lbl_buf, 8 + s);
+            one_hot(lbl, t, N_OUT);
+
+            // ── Forward ──
+            dense.dense_forward(W1, b1, x, h, N_IN, N_H);
+            arr_f64_relu(h);
+            dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
+            softmax_n(y, N_OUT);
+
+            // Negative log-likelihood (matches softmax+xent for one-hot).
+            loss_sum = loss_sum - math_log(arr_f64_get(y, lbl) + 0.000000000001);
+
+            // ── Backward — fused softmax+xent: dL/dy = y - t ──
+            loss.xent_backward(y, t, dy);
+            dense.dense_backward(W2, h, dy, dh, dW2, db2);
+            dense.dense_backward_relu(h, dh, N_H);
+            dense.dense_backward(W1, x, dh, 0, dW1, db1);
+
+            // SGD (batch = 1).
+            opt.sgd_update(W1, dW1, N_H * N_IN, lr);
+            opt.sgd_update(b1, db1, N_H, lr);
+            opt.sgd_update(W2, dW2, N_OUT * N_H, lr);
+            opt.sgd_update(b2, db2, N_OUT, lr);
+
+            s += 1;
+        }
+        print_str("epoch done, avg train NLL:");
+        print_f64(loss_sum / int_to_float(N_TRAIN), 4);
+
+        // ── Test accuracy ──
+        let correct: i32 = 0;
+        let i: i32 = 0;
+        while (i < N_TEST) {
+            load_image_at(test_img_buf, 16 + i * 784, x);
+            let lbl: i32 = byte_at(test_lbl_buf, 8 + i);
+            dense.dense_forward(W1, b1, x, h, N_IN, N_H);
+            arr_f64_relu(h);
+            dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
+            softmax_n(y, N_OUT);
+            if (argmax(y, N_OUT) == lbl) { correct += 1; }
+            i += 1;
+        }
+        print_str("test accuracy:");
+        print_f64(int_to_float(correct) / int_to_float(N_TEST), 4);
+
+        epoch += 1;
+    }
+
+    return 0;
+}
