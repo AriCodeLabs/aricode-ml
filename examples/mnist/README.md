@@ -47,10 +47,6 @@ laptop. Binary is ~21 KB.
 
 - Paths are resolved relative to the binary's CWD, so run it from
   this directory.
-- This demo uses the scalar `math_exp` + a hand-rolled `softmax_n`
-  instead of the AVX2 `arr_f64_softmax` builtin, because the
-  builtin requires `N % 4 == 0` and the label space here is 10.
-  A builtin with a scalar tail would let us drop the helper.
 - `byte_at(ptr, offset)` is unchecked — it's a raw `movzx` with no
   bounds check, so the caller owns validity. Meant for file-read
   buffers where the underlying `arr_new` length (in i64 slots) is

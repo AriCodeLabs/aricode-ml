@@ -60,33 +60,6 @@ fn argmax(buf: i32, n: i32) -> i32 {
     return best_i;
 }
 
-// Numerically stable scalar softmax that handles any n (the AVX2
-// arr_f64_softmax builtin requires n % 4 == 0; N_OUT = 10 here).
-fn softmax_n(buf: i32, n: i32) -> i32 {
-    let max_v: f64 = arr_f64_get(buf, 0);
-    let i: i32 = 1;
-    while (i < n) {
-        let v: f64 = arr_f64_get(buf, i);
-        if (v > max_v) { max_v = v; }
-        i += 1;
-    }
-    let sum: f64 = 0.0;
-    i = 0;
-    while (i < n) {
-        let e: f64 = math_exp(arr_f64_get(buf, i) - max_v);
-        arr_f64_set(buf, i, e);
-        sum = sum + e;
-        i += 1;
-    }
-    let inv: f64 = 1.0 / sum;
-    i = 0;
-    while (i < n) {
-        arr_f64_set(buf, i, arr_f64_get(buf, i) * inv);
-        i += 1;
-    }
-    return 0;
-}
-
 // He-style weight init (fan_in drawn from the layer's input size).
 fn init_weights(buf: i32, fan_in: i32, seed_i: i32) -> i32 {
     let s: i32 = seed_i;
@@ -177,7 +150,7 @@ fn main() -> i32 {
             dense.dense_forward(W1, b1, x, h, N_IN, N_H);
             arr_f64_relu(h);
             dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
-            softmax_n(y, N_OUT);
+            arr_f64_softmax(y);
 
             // Negative log-likelihood (matches softmax+xent for one-hot).
             loss_sum = loss_sum - math_log(arr_f64_get(y, lbl) + 0.000000000001);
@@ -208,7 +181,7 @@ fn main() -> i32 {
             dense.dense_forward(W1, b1, x, h, N_IN, N_H);
             arr_f64_relu(h);
             dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
-            softmax_n(y, N_OUT);
+            arr_f64_softmax(y);
             if (argmax(y, N_OUT) == lbl) { correct += 1; }
             i += 1;
         }
