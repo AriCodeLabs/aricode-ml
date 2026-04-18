@@ -1,10 +1,10 @@
-// aricode-stdlib: ml/test_dense.ari
+// aricode-ml: tests/test_dense.ari
 // Tests dense_forward, dense_apply_relu, and mse_loss.
 //
 // Shape: 2 inputs -> 3 outputs (dense layer).
 // Expected forward pass, verified by hand below.
 
-import "dense.ari" as dense;
+import "../dense.ari" as dense;
 
 fn main() -> i32 {
     let n_in: i32  = 2;

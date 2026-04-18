@@ -1,45 +1,75 @@
-# aricode-stdlib-ml
+# aricode-ml
 
-Machine learning primitives for Aricode -- dense layers, loss functions, and optimizers.
+Neural network primitives for the
+[aricode](https://github.com/Lynx-Boss/aricode) compiler: dense layers,
+stochastic gradient descent, and mean-squared-error loss.
 
-## Functions
+## Layout
+
+```
+aricode-ml/
+├── dense.ari         — dense_forward, dense_apply_relu, mse_loss
+├── optimizer.ari     — sgd_update, zero_gradients, clip_gradients
+├── examples/
+│   └── one_step.ari  — forward + manual grad + one SGD step
+└── tests/
+    ├── test_dense.ari
+    └── test_optimizer.ari
+```
+
+## Public API
 
 ### dense.ari
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `dense_forward` | `fn dense_forward(weights: i32, bias: i32, input: i32, output: i32, n_in: i32, n_out: i32) -> i32` | Forward pass for a fully connected layer |
-| `dense_apply_relu` | `fn dense_apply_relu(arr: i32, n: i32) -> i32` | In-place ReLU activation over an array |
-| `mse_loss` | `fn mse_loss(pred: i32, target: i32, n: i32) -> f64` | Mean Squared Error loss |
+| Function | Description |
+|----------|-------------|
+| `dense_forward(w, b, x, y, n_in, n_out)` | Fully-connected forward pass, `y = W·x + b`. Arrays are heap pointers returned by `arr_f64_new`. |
+| `dense_apply_relu(buf, n)` | In-place ReLU over a length-`n` f64 array. |
+| `mse_loss(pred, target, n) -> f64` | `(1/n) · Σ (pred - target)²`. |
 
 ### optimizer.ari
 
-| Function | Signature | Description |
-|----------|-----------|-------------|
-| `sgd_update` | `fn sgd_update(weights: i32, gradients: i32, n: i32, lr: f64) -> i32` | Stochastic Gradient Descent step |
-| `zero_gradients` | `fn zero_gradients(gradients: i32, n: i32) -> i32` | Zero out a gradient array |
-| `clip_gradients` | `fn clip_gradients(gradients: i32, n: i32, max_val: f64) -> i32` | Clamp gradients to [-max_val, max_val] |
+| Function | Description |
+|----------|-------------|
+| `sgd_update(w, g, n, lr)` | `w[i] -= lr · g[i]`. |
+| `zero_gradients(g, n)` | Reset gradient buffer. |
+| `clip_gradients(g, n, max)` | Clamp each entry to `[-max, max]`. |
 
 ## Usage
 
-```aricode
-import "ml/dense.ari";
-import "ml/optimizer.ari";
+```
+import "aricode-ml/dense.ari" as dense;
+import "aricode-ml/optimizer.ari" as opt;
 
 fn main() -> i32 {
     let w: i32 = arr_f64_new(6);
     let b: i32 = arr_f64_new(2);
-    let input: i32 = arr_f64_new(3);
-    let output: i32 = arr_f64_new(2);
+    let x: i32 = arr_f64_new(3);
+    let y: i32 = arr_f64_new(2);
 
-    dense_forward(w, b, input, output, 3, 2);
-    dense_apply_relu(output, 2);
+    dense.dense_forward(w, b, x, y, 3, 2);
+    dense.dense_apply_relu(y, 2);
 
-    let grad: i32 = arr_f64_new(6);
-    sgd_update(w, grad, 6, 0.01);
+    let g: i32 = arr_f64_new(6);
+    opt.sgd_update(w, g, 6, 0.01);
     return 0;
 }
 ```
+
+See [`examples/one_step.ari`](examples/one_step.ari) for a full training
+step with manual gradient computation.
+
+## Running the tests
+
+```
+aric tests/test_dense.ari     -o /tmp/test_dense     && /tmp/test_dense
+aric tests/test_optimizer.ari -o /tmp/test_optimizer && /tmp/test_optimizer
+```
+
+## Dependencies
+
+This module relies on the `arr_f64_*` heap-array builtins (`arr_f64_new`,
+`arr_f64_get`, `arr_f64_set`) provided by the aricode compiler.
 
 ## License
 

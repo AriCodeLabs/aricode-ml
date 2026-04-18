@@ -1,0 +1,57 @@
+// aricode-ml: examples/one_step.ari
+//
+// End-to-end: dense forward → compute loss → compute gradients (manual,
+// since we don't have a full autograd yet) → apply one SGD update step.
+//
+// Compile: aric examples/one_step.ari -o one_step
+// Run:     ./one_step
+
+import "../dense.ari" as dense;
+import "../optimizer.ari" as opt;
+
+fn main() -> i32 {
+    let n_in: i32  = 2;
+    let n_out: i32 = 1;
+
+    // Toy problem: learn y = 2*x0 + 3*x1 from a single sample.
+    let x: i32 = arr_f64_new(2);
+    arr_f64_set(x, 0, 1.0);
+    arr_f64_set(x, 1, 1.0);
+
+    let target: i32 = arr_f64_new(1);
+    arr_f64_set(target, 0, 5.0);      // 2*1 + 3*1
+
+    // Weights initialised to 0, no bias -> initial prediction 0.
+    let w: i32 = arr_f64_new(2);
+    arr_f64_set(w, 0, 0.0);
+    arr_f64_set(w, 1, 0.0);
+
+    let b: i32 = arr_f64_new(1);
+    arr_f64_set(b, 0, 0.0);
+
+    let y: i32 = arr_f64_new(1);
+
+    // --- forward pass ---
+    dense.dense_forward(w, b, x, y, n_in, n_out);
+    print_str("pred before:"); print_float(arr_f64_get(y, 0));   // 0
+    print_str("loss before:"); print_float(dense.mse_loss(y, target, n_out)); // 25
+
+    // --- manual gradient for one-sample MSE of a linear layer:
+    //     dL/dw_j = 2 * (pred - target) * x_j
+    let err: f64 = arr_f64_get(y, 0) - arr_f64_get(target, 0);
+    let g: i32 = arr_f64_new(2);
+    arr_f64_set(g, 0, 2.0 * err * arr_f64_get(x, 0));
+    arr_f64_set(g, 1, 2.0 * err * arr_f64_get(x, 1));
+
+    // --- SGD step ---
+    opt.sgd_update(w, g, 2, 0.1);
+
+    // --- forward again, loss should be lower ---
+    dense.dense_forward(w, b, x, y, n_in, n_out);
+    print_str("pred after:");  print_float(arr_f64_get(y, 0));   // ~2
+    print_str("loss after:");  print_float(dense.mse_loss(y, target, n_out));  // ~9
+
+    mem_free(x); mem_free(target); mem_free(w); mem_free(b);
+    mem_free(y); mem_free(g);
+    return 0;
+}

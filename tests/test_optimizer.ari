@@ -1,7 +1,7 @@
-// aricode-stdlib: ml/test_optimizer.ari
+// aricode-ml: tests/test_optimizer.ari
 // Tests sgd_update, zero_gradients, clip_gradients.
 
-import "optimizer.ari" as opt;
+import "../optimizer.ari" as opt;
 
 fn main() -> i32 {
     // SGD: w = [1.0, 2.0, 3.0], g = [0.1, 0.2, 0.3], lr = 0.5
