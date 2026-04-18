@@ -1,0 +1,40 @@
+// aricode-stdlib: ml/optimizer.ari
+// Gradient descent optimizers for neural network training.
+
+fn sgd_update(weights: i32, gradients: i32, n: i32, lr: f64) -> i32 {
+    // Stochastic Gradient Descent: w -= lr * grad
+    let i: i32 = 0;
+    while (i < n) {
+        let w: f64 = arr_f64_get(weights, i);
+        let g: f64 = arr_f64_get(gradients, i);
+        arr_f64_set(weights, i, w - lr * g);
+        i += 1;
+    }
+    return 0;
+}
+
+fn zero_gradients(gradients: i32, n: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < n) {
+        arr_f64_set(gradients, i, 0.0);
+        i += 1;
+    }
+    return 0;
+}
+
+fn clip_gradients(gradients: i32, n: i32, max_val: f64) -> i32 {
+    // Gradient clipping: clamp each gradient to [-max_val, max_val]
+    let i: i32 = 0;
+    while (i < n) {
+        let g: f64 = arr_f64_get(gradients, i);
+        if (g > max_val) {
+            arr_f64_set(gradients, i, max_val);
+        }
+        let neg_max: f64 = 0.0 - max_val;
+        if (g < neg_max) {
+            arr_f64_set(gradients, i, neg_max);
+        }
+        i += 1;
+    }
+    return 0;
+}
