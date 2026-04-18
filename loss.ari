@@ -1,0 +1,30 @@
+// aricode-ml: loss.ari
+// Loss functions + their gradients.
+//
+// Pairs with dense.ari — dense_backward expects dL/dy as the input,
+// so every loss here exposes a `_backward` that writes dL/dy directly
+// into a caller-provided buffer.
+
+// ----------------------------------------------------------------------
+// Softmax + cross-entropy classification head
+// ----------------------------------------------------------------------
+//
+// Stable algorithm: shift by max, exp, normalise.  The fused loss +
+// backward pair collapses to `probs - target_onehot` which is why
+// softmax-with-logits is the preferred output-layer training target.
+
+fn softmax(buf: i32) -> i32 {
+    // In-place: buf[i] = exp(buf[i] - max) / Σ exp(…).
+    arr_f64_softmax(buf);
+    return 0;
+}
+
+fn xent_backward(probs: i32, target_onehot: i32, dL_dlogits: i32) -> i32 {
+    // dL/dlogits = probs - target_onehot.
+    // This is the celebrated "softmax + cross-entropy" gradient — it
+    // collapses a 3-step pipeline into one elementwise subtraction
+    // precisely because the cross-entropy loss and softmax normalisation
+    // cancel in the derivative.
+    arr_f64_sub(dL_dlogits, probs, target_onehot);
+    return 0;
+}

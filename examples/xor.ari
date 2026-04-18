@@ -1,0 +1,131 @@
+// aricode-ml: examples/xor.ari
+//
+// Train a 2→4→1 MLP with sigmoid hidden layer and MSE loss to learn
+// the XOR function.  Acceptance test for the full forward + backward
+// + SGD stack (dense, loss, optimizer).
+//
+// Expected: loss drops from ~0.25 (random) to <0.05 within ~5000 epochs.
+//
+// Compile:  aric examples/xor.ari -o xor
+// Run:      ./xor
+
+import "../dense.ari"     as dense;
+import "../loss.ari"      as loss;
+import "../optimizer.ari" as opt;
+
+fn init_weight(buf: i32, scale: f64, seed_i: i32) -> i32 {
+    // Deterministic tiny init — no rand builtin yet, so use a simple LCG.
+    let s: i32 = seed_i;
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        let r: f64 = int_to_float((s / 65536) - ((s / 65536) / 32768) * 32768);
+        arr_f64_set(buf, i, (r / 32768.0 - 0.5) * 2.0 * scale);
+        i += 1;
+    }
+    return 0;
+}
+
+fn zero_buf(buf: i32) -> i32 {
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) { arr_f64_set(buf, i, 0.0); i += 1; }
+    return 0;
+}
+
+fn main() -> i32 {
+    // Architecture: 2 → 4 hidden → 1.  Sigmoid in the hidden layer, linear out.
+    let N_IN: i32 = 2;
+    let N_H : i32 = 4;
+    let N_OUT: i32 = 1;
+
+    let W1: i32 = arr_f64_new(N_H  * N_IN);   // [4,2]
+    let b1: i32 = arr_f64_new(N_H);
+    let W2: i32 = arr_f64_new(N_OUT * N_H);   // [1,4]
+    let b2: i32 = arr_f64_new(N_OUT);
+
+    init_weight(W1, 0.5, 12345);
+    init_weight(W2, 0.5, 67890);
+    zero_buf(b1);
+    zero_buf(b2);
+
+    // Scratch buffers (reused each sample).
+    let h : i32 = arr_f64_new(N_H);     // hidden activations
+    let y : i32 = arr_f64_new(N_OUT);   // output
+    let dy: i32 = arr_f64_new(N_OUT);   // dL/dy
+    let dh: i32 = arr_f64_new(N_H);     // dL/dh
+
+    // Gradient accumulators.
+    let dW1: i32 = arr_f64_new(N_H  * N_IN);
+    let db1: i32 = arr_f64_new(N_H);
+    let dW2: i32 = arr_f64_new(N_OUT * N_H);
+    let db2: i32 = arr_f64_new(N_OUT);
+
+    // XOR dataset (4 samples).
+    let x0: i32 = arr_f64_new(N_IN); arr_f64_set(x0, 0, 0.0); arr_f64_set(x0, 1, 0.0);
+    let x1: i32 = arr_f64_new(N_IN); arr_f64_set(x1, 0, 0.0); arr_f64_set(x1, 1, 1.0);
+    let x2: i32 = arr_f64_new(N_IN); arr_f64_set(x2, 0, 1.0); arr_f64_set(x2, 1, 0.0);
+    let x3: i32 = arr_f64_new(N_IN); arr_f64_set(x3, 0, 1.0); arr_f64_set(x3, 1, 1.0);
+    let t0: i32 = arr_f64_new(N_OUT); arr_f64_set(t0, 0, 0.0);
+    let t1: i32 = arr_f64_new(N_OUT); arr_f64_set(t1, 0, 1.0);
+    let t2: i32 = arr_f64_new(N_OUT); arr_f64_set(t2, 0, 1.0);
+    let t3: i32 = arr_f64_new(N_OUT); arr_f64_set(t3, 0, 0.0);
+
+    let lr: f64 = 0.1;
+
+    let epoch: i32 = 0;
+    while (epoch < 8000) {
+        zero_buf(dW1); zero_buf(db1);
+        zero_buf(dW2); zero_buf(db2);
+
+        let total_loss: f64 = 0.0;
+        let s: i32 = 0;
+        while (s < 4) {
+            let x: i32 = x0; let t: i32 = t0;
+            if (s == 1) { x = x1; t = t1; }
+            if (s == 2) { x = x2; t = t2; }
+            if (s == 3) { x = x3; t = t3; }
+
+            // Forward
+            dense.dense_forward(W1, b1, x, h, N_IN, N_H);
+            arr_f64_sigmoid(h);
+            dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
+
+            total_loss = total_loss + dense.mse_loss(y, t, N_OUT);
+
+            // Backward
+            dense.mse_backward(y, t, dy, N_OUT);
+            dense.dense_backward(W2, h, dy, dh, dW2, db2);
+            dense.dense_backward_sigmoid(h, dh, N_H);
+            // dL/dx for the first layer is unused (sentinel 0).
+            dense.dense_backward(W1, x, dh, 0, dW1, db1);
+
+            s += 1;
+        }
+
+        // Update — dW/db accumulated over all 4 samples, apply once.
+        opt.sgd_update(W1, dW1, N_H * N_IN, lr);
+        opt.sgd_update(b1, db1, N_H, lr);
+        opt.sgd_update(W2, dW2, N_OUT * N_H, lr);
+        opt.sgd_update(b2, db2, N_OUT, lr);
+
+        if (epoch == 0)    { print_str("epoch    0 loss:"); print_float(total_loss); }
+        if (epoch == 1000) { print_str("epoch 1000 loss:"); print_float(total_loss); }
+        if (epoch == 4000) { print_str("epoch 4000 loss:"); print_float(total_loss); }
+        if (epoch == 7999) { print_str("epoch 7999 loss:"); print_float(total_loss); }
+        epoch += 1;
+    }
+
+    // Final predictions.
+    print_str("final predictions (should be ~0, 1, 1, 0):");
+    dense.dense_forward(W1, b1, x0, h, N_IN, N_H); arr_f64_sigmoid(h);
+    dense.dense_forward(W2, b2, h,  y, N_H, N_OUT);  print_float(arr_f64_get(y, 0));
+    dense.dense_forward(W1, b1, x1, h, N_IN, N_H); arr_f64_sigmoid(h);
+    dense.dense_forward(W2, b2, h,  y, N_H, N_OUT);  print_float(arr_f64_get(y, 0));
+    dense.dense_forward(W1, b1, x2, h, N_IN, N_H); arr_f64_sigmoid(h);
+    dense.dense_forward(W2, b2, h,  y, N_H, N_OUT);  print_float(arr_f64_get(y, 0));
+    dense.dense_forward(W1, b1, x3, h, N_IN, N_H); arr_f64_sigmoid(h);
+    dense.dense_forward(W2, b2, h,  y, N_H, N_OUT);  print_float(arr_f64_get(y, 0));
+    return 0;
+}

@@ -5,25 +5,20 @@
 
 fn dense_forward(weights: i32, bias: i32, input: i32, output: i32, n_in: i32, n_out: i32) -> i32 {
     // output = weights · input + bias
-    // Compiler builtin: AVX2 FMA inner loop, ~4× faster than scalar.
     arr_f64_matvec(weights, input, bias, output, n_out, n_in);
     return 0;
 }
 
 fn dense_apply_relu(buf: i32, n: i32) -> i32 {
-    // In-place ReLU activation: f(x) = max(0, x)
-    // AVX2 vmaxpd via the arr_f64_relu compiler builtin — ~4× faster
-    // than the scalar loop, at Zen 3 peak throughput.  The `n` arg is
-    // kept for API compat but unused (length comes from the array header).
+    // In-place ReLU activation via AVX2 vmaxpd builtin.
     arr_f64_relu(buf);
     return 0;
 }
 
 fn mse_loss(pred: i32, target: i32, n: i32) -> f64 {
-    // Mean Squared Error: (1/n) · Σ (pred[i] - target[i])²
-    //
-    // Compiler path: we want dot(diff, diff) / n but diff needs to be
-    // materialised.  Keeping scalar until we add arr_f64_sub builtin.
+    // L = (1/n) · Σ (pred - target)²
+    // Mutates no inputs; uses a scratch via pred as sink + undo.
+    // Safer implementation uses arr_f64_sub into a temp + arr_f64_dot.
     let sum: f64 = 0.0;
     let i: i32 = 0;
     while (i < n) {
@@ -32,4 +27,78 @@ fn mse_loss(pred: i32, target: i32, n: i32) -> f64 {
         i += 1;
     }
     return sum / int_to_float(n);
+}
+
+// ----------------------------------------------------------------------
+// Backward pass
+// ----------------------------------------------------------------------
+
+fn mse_backward(pred: i32, target: i32, dL_dy: i32, n: i32) -> i32 {
+    // dL/dpred[i] = (2/n) · (pred[i] - target[i])
+    // PyTorch reduction='mean' convention.
+    arr_f64_sub(dL_dy, pred, target);
+    arr_f64_scale(dL_dy, 2.0 / int_to_float(n));
+    return 0;
+}
+
+fn dense_backward(weights: i32, input: i32,
+                  dL_dy: i32, dL_dx: i32,
+                  dW: i32, db: i32) -> i32 {
+    // Given dL/dy (length n_out), compute the three gradients:
+    //   dL/dx[i]   = Σ_j W[j,i] · dL/dy[j]     (matvec_T)
+    //   dL/dW[j,i] += dL/dy[j] · x[i]          (outer_accum)
+    //   dL/db[j]   += dL/dy[j]                 (copy / add)
+    //
+    // Dimensions are read from the array headers (len(input)=n_in,
+    // len(dL_dy)=n_out) to stay under aricode's 6-arg limit.
+    //
+    // `dL_dx` may be 0 (a null sentinel) if the caller doesn't need
+    // the input gradient (e.g. first layer of a network).
+    let n_in: i32  = arr_len(input);
+    let n_out: i32 = arr_len(dL_dy);
+    if (dL_dx != 0) {
+        arr_f64_matvec_T(weights, dL_dy, dL_dx, n_out, n_in);
+    }
+    arr_f64_outer_accum(dW, dL_dy, input, n_out, n_in);
+    // db += dL_dy  (one AVX2 broadcast-y pass — use add_scaled with α=1).
+    arr_f64_add_scaled(db, dL_dy, 1.0);
+    return 0;
+}
+
+fn dense_backward_relu(buf: i32, dL_dy: i32, n: i32) -> i32 {
+    // In-place ReLU backward: dL_dy[i] *= (buf[i] > 0 ? 1 : 0).
+    // Uses the saved POST-relu output `buf` (zero where the forward killed
+    // the signal).  Scalar — n is small inside each layer.
+    let i: i32 = 0;
+    while (i < n) {
+        if (arr_f64_get(buf, i) <= 0.0) {
+            arr_f64_set(dL_dy, i, 0.0);
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+fn dense_backward_sigmoid(y: i32, dL_dy: i32, n: i32) -> i32 {
+    // dL/dx[i] = dL/dy[i] · y[i] · (1 - y[i])     (derive from σ output)
+    let i: i32 = 0;
+    while (i < n) {
+        let yi: f64 = arr_f64_get(y, i);
+        let dy: f64 = arr_f64_get(dL_dy, i);
+        arr_f64_set(dL_dy, i, dy * yi * (1.0 - yi));
+        i += 1;
+    }
+    return 0;
+}
+
+fn dense_backward_tanh(y: i32, dL_dy: i32, n: i32) -> i32 {
+    // dL/dx[i] = dL/dy[i] · (1 - y[i]²)
+    let i: i32 = 0;
+    while (i < n) {
+        let yi: f64 = arr_f64_get(y, i);
+        let dy: f64 = arr_f64_get(dL_dy, i);
+        arr_f64_set(dL_dy, i, dy * (1.0 - yi * yi));
+        i += 1;
+    }
+    return 0;
 }
