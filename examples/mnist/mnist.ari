@@ -84,8 +84,8 @@ fn zero_buf(buf: i32) -> i32 {
 }
 
 fn main() -> i32 {
-    let N_TRAIN: i32 = 5000;
-    let N_TEST:  i32 = 1000;
+    let N_TRAIN: i32 = 60000;
+    let N_TEST:  i32 = 10000;
 
     // Paths are relative to the binary's CWD — run the binary from
     // this directory.
@@ -131,7 +131,8 @@ fn main() -> i32 {
     let dW2: i32 = arr_f64_new(N_OUT * N_H);
     let db2: i32 = arr_f64_new(N_OUT);
 
-    let lr: f64 = 0.05;
+    let lr: f64 = 0.1;
+    let N_BATCH: i32 = 64;
     let N_EPOCH: i32 = 5;
 
     let epoch: i32 = 0;
@@ -139,35 +140,49 @@ fn main() -> i32 {
         let loss_sum: f64 = 0.0;
         let s: i32 = 0;
         while (s < N_TRAIN) {
+            // Zero gradient accumulators once per mini-batch.
             zero_buf(dW1); zero_buf(db1);
             zero_buf(dW2); zero_buf(db2);
 
-            load_image_at(train_img_buf, 16 + s * 784, x);
-            let lbl: i32 = byte_at(train_lbl_buf, 8 + s);
-            one_hot(lbl, t, N_OUT);
+            // Accumulate gradients over N_BATCH samples (the dense_backward
+            // primitives add into dW/db, so we don't zero between samples).
+            let batch_end: i32 = s + N_BATCH;
+            if (batch_end > N_TRAIN) { batch_end = N_TRAIN; }
+            let batch_size: i32 = batch_end - s;
 
-            // ── Forward ──
-            dense.dense_forward(W1, b1, x, h, N_IN, N_H);
-            arr_f64_relu(h);
-            dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
-            arr_f64_softmax(y);
+            let si: i32 = s;
+            while (si < batch_end) {
+                load_image_at(train_img_buf, 16 + si * 784, x);
+                let lbl: i32 = byte_at(train_lbl_buf, 8 + si);
+                one_hot(lbl, t, N_OUT);
 
-            // Negative log-likelihood (matches softmax+xent for one-hot).
-            loss_sum = loss_sum - math_log(arr_f64_get(y, lbl) + 0.000000000001);
+                // ── Forward ──
+                dense.dense_forward(W1, b1, x, h, N_IN, N_H);
+                arr_f64_relu(h);
+                dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
+                arr_f64_softmax(y);
 
-            // ── Backward — fused softmax+xent: dL/dy = y - t ──
-            loss.xent_backward(y, t, dy);
-            dense.dense_backward(W2, h, dy, dh, dW2, db2);
-            dense.dense_backward_relu(h, dh, N_H);
-            dense.dense_backward(W1, x, dh, 0, dW1, db1);
+                // Negative log-likelihood (matches softmax+xent for one-hot).
+                loss_sum = loss_sum - math_log(arr_f64_get(y, lbl) + 0.000000000001);
 
-            // SGD (batch = 1).
-            opt.sgd_update(W1, dW1, N_H * N_IN, lr);
-            opt.sgd_update(b1, db1, N_H, lr);
-            opt.sgd_update(W2, dW2, N_OUT * N_H, lr);
-            opt.sgd_update(b2, db2, N_OUT, lr);
+                // ── Backward — fused softmax+xent: dL/dy = y - t ──
+                loss.xent_backward(y, t, dy);
+                dense.dense_backward(W2, h, dy, dh, dW2, db2);
+                dense.dense_backward_relu(h, dh, N_H);
+                dense.dense_backward(W1, x, dh, 0, dW1, db1);
 
-            s += 1;
+                si += 1;
+            }
+
+            // Apply the batched update: scale by lr/batch_size so we
+            // descend along the *mean* gradient, not the sum.
+            let eff_lr: f64 = lr / int_to_float(batch_size);
+            opt.sgd_update(W1, dW1, N_H * N_IN, eff_lr);
+            opt.sgd_update(b1, db1, N_H, eff_lr);
+            opt.sgd_update(W2, dW2, N_OUT * N_H, eff_lr);
+            opt.sgd_update(b2, db2, N_OUT, eff_lr);
+
+            s = batch_end;
         }
         print_str("epoch done, avg train NLL:");
         print_f64(loss_sum / int_to_float(N_TRAIN), 4);

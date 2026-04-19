@@ -11,8 +11,9 @@ test accuracy per epoch.
 - **Output**: 10-way softmax
 - **Loss**: cross-entropy (fused with softmax in the backward pass,
   so the gradient reduces to `probs - onehot`)
-- **Optimizer**: SGD, batch size 1, `lr = 0.05`
-- **Sample sizes**: 5 000 train / 1 000 test (from the full 60k/10k set)
+- **Optimizer**: mini-batch SGD, batch size 64, `lr = 0.1`
+  (mean-gradient scaling: effective per-sample lr = lr / batch_size)
+- **Training**: full 60 000 MNIST train / 10 000 test
 
 ## Usage
 
@@ -30,18 +31,30 @@ aric mnist.ari -o mnist
 ```
 Loaded MNIST subset.
 epoch done, avg train NLL:
-0.5810
+0.4139
 test accuracy:
-0.8810
-...
+0.9223
 epoch done, avg train NLL:
-0.1486
+0.2142
 test accuracy:
-0.9030
+0.9453
+epoch done, avg train NLL:
+0.1598
+test accuracy:
+0.9573
+epoch done, avg train NLL:
+0.1284
+test accuracy:
+0.9639
+epoch done, avg train NLL:
+0.1077
+test accuracy:
+0.9688
 ```
 
-~90% test accuracy after 5 epochs, in about 4.5 s on a Zen 3
-laptop. Binary is ~21 KB.
+~97 % test accuracy after 5 epochs, in about 17 s on a Zen 3
+laptop.  Binary is ~21 KB.  Dialling `N_EPOCH` up to 10-15 with
+a learning rate decay typically gets to ~98 %.
 
 ## Notes
 
