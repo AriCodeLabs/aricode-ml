@@ -12,8 +12,9 @@ test accuracy per epoch.
 - **Loss**: cross-entropy (fused with softmax in the backward pass,
   so the gradient reduces to `probs - onehot`)
 - **Optimizer**: mini-batch SGD, batch size 64, `lr = 0.1`
-  (mean-gradient scaling: effective per-sample lr = lr / batch_size)
-- **Training**: full 60 000 MNIST train / 10 000 test
+  (mean-gradient scaling: effective per-sample lr = lr / batch_size),
+  exponential decay of 0.85 per epoch
+- **Training**: full 60 000 MNIST train / 10 000 test, 10 epochs
 
 ## Usage
 
@@ -30,31 +31,21 @@ aric mnist.ari -o mnist
 
 ```
 Loaded MNIST subset.
-epoch done, avg train NLL:
+epoch done, avg train NLL:    (lr = 0.100)
 0.4139
 test accuracy:
 0.9223
-epoch done, avg train NLL:
-0.2142
+...
+epoch done, avg train NLL:    (lr = 0.020, after 9× decay)
+0.0885
 test accuracy:
-0.9453
-epoch done, avg train NLL:
-0.1598
-test accuracy:
-0.9573
-epoch done, avg train NLL:
-0.1284
-test accuracy:
-0.9639
-epoch done, avg train NLL:
-0.1077
-test accuracy:
-0.9688
+0.9715
 ```
 
-~97 % test accuracy after 5 epochs, in about 17 s on a Zen 3
-laptop.  Binary is ~21 KB.  Dialling `N_EPOCH` up to 10-15 with
-a learning rate decay typically gets to ~98 %.
+~97.15 % test accuracy after 10 epochs, in about 33 s on a Zen 3
+laptop.  Binary is ~21 KB.  Pushing past 98 % typically needs a
+larger hidden layer (256 or 512) or Adam with a warmup schedule —
+both wire in cleanly on top of this template.
 
 ## Notes
 

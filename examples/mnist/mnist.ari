@@ -133,7 +133,12 @@ fn main() -> i32 {
 
     let lr: f64 = 0.1;
     let N_BATCH: i32 = 64;
-    let N_EPOCH: i32 = 5;
+    let N_EPOCH: i32 = 10;
+
+    // Exponential learning-rate decay: lr *= decay per epoch.
+    // 0.85^10 ≈ 0.20, so final lr ≈ 0.02 — helps fine-tune after
+    // the initial gross weight updates.
+    let lr_decay: f64 = 0.85;
 
     let epoch: i32 = 0;
     while (epoch < N_EPOCH) {
@@ -202,6 +207,9 @@ fn main() -> i32 {
         }
         print_str("test accuracy:");
         print_f64(int_to_float(correct) / int_to_float(N_TEST), 4);
+
+        // Decay the learning rate for the next epoch.
+        lr = lr * lr_decay;
 
         epoch += 1;
     }
