@@ -8,19 +8,19 @@ Two variants ship side-by-side.  Same architecture, different
 optimisers + preprocessing — pick whichever makes the point you
 need.
 
-| Variant            | Preprocessing                       | Optimiser           | Final acc |
-|--------------------|-------------------------------------|---------------------|-----------|
-| `mnist.ari`        | `px / 255` ([0, 1])                 | SGD + lr decay 0.85 | 97.15 %   |
-| `mnist_adam.ari`   | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing   | **98.14 %** |
+| Variant            | Hidden | Preprocessing                       | Optimiser                  | Epochs | Final acc |
+|--------------------|-------:|-------------------------------------|----------------------------|-------:|-----------|
+| `mnist.ari`        | 128    | `px / 255` ([0, 1])                 | SGD + lr decay 0.85        |    10  | 97.15 %   |
+| `mnist_adam.ari`   | 256    | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    20  | **98.61 %** |
 
 ## Architecture (both variants)
 
 - **Input**: 28×28 grayscale
-- **Hidden**: 128 units, ReLU activation, He init
+- **Hidden**: ReLU activation, He init (size varies — see table above)
 - **Output**: 10-way softmax
 - **Loss**: cross-entropy (fused with softmax in the backward pass,
   so the gradient reduces to `probs − onehot`)
-- **Training**: full 60 000 train / 10 000 test, 10 epochs, batch 64
+- **Training**: full 60 000 train / 10 000 test, batch 64
 
 ## `mnist.ari` — SGD baseline
 
@@ -30,16 +30,20 @@ need.
 
 ## `mnist_adam.ari` — AdamW + full recipe
 
-Layers three standard tricks on top of the baseline:
+Layers the standard deep-learning hygiene on top of the baseline:
 
 - **Input standardisation**: `(px / 255 − 0.1307) / 0.3081` — MNIST's
   per-channel mean/std, the torchvision convention.
+- **Hidden width**: 256 units (vs 128 in the SGD baseline).
 - **Label smoothing** (α = 0.05): target label gets `1 − α`, the nine
   off labels share `α / 9`.  Keeps the softmax from over-saturating
   on clean training data.
-- **AdamW**: `lr = 1e-3`, β₁ = 0.9, β₂ = 0.999, ε = 1e-8,
+- **AdamW**: `lr_max = 1e-3`, β₁ = 0.9, β₂ = 0.999, ε = 1e-8,
   decoupled weight decay `wd = 1e-3` on weights only (not biases).
   Uses the AVX2 `arr_f64_adam_apply` fused kernel for the hot step.
+- **Cosine lr schedule**: glides from `lr_max = 1e-3` down to
+  `lr_min = 1e-5` over 20 epochs — lets the optimiser exploit a
+  large step size early and settle into a flat minimum at the end.
 
 ## Usage
 
@@ -62,16 +66,17 @@ aric mnist_adam.ari -o mnist_adam
 
 | Epoch | train NLL | test acc |
 |-------|-----------|----------|
-|   1   | 0.2926    | 95.98 %  |
-|   3   | 0.1335    | 97.50 %  |
-|   5   | 0.1070    | 97.99 %  |
-|   7   | 0.0944    | 98.06 %  |
-|  10   | 0.0846    | **98.14 %** |
+|   1   | 0.2658    | 96.75 %  |
+|   5   | 0.0910    | 98.32 %  |
+|  10   | 0.0697    | 98.41 %  |
+|  15   | 0.0637    | 98.53 %  |
+|  20   | 0.0619    | **98.61 %** |
 
-Test accuracy is still climbing at epoch 10 — adding epochs or a lr
-schedule would likely push past 98.3 %.  For higher ceilings the
-remaining knobs are a larger hidden layer or CNN builtins (conv2d
-+ max-pool), neither of which ship yet.
+137 s wall-clock, ~50 KB binary.  Still a slight climb at epoch 20,
+so more epochs + light augmentation (shifts, rotations) could keep
+pushing.  For a bigger jump the next step is CNN builtins
+(`arr_f64_conv2d` + `arr_f64_max_pool`), neither of which ship yet —
+those unlock ~99 % on MNIST.
 
 ## Notes
 

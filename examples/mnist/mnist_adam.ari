@@ -94,7 +94,7 @@ fn main() -> i32 {
     print_str("Loaded MNIST (standardized).");
 
     let N_IN:  i32 = 784;
-    let N_H:   i32 = 128;
+    let N_H:   i32 = 256;
     let N_OUT: i32 = 10;
 
     let W1: i32 = arr_f64_new(N_H  * N_IN);
@@ -142,20 +142,27 @@ fn main() -> i32 {
 
     // AdamW hyperparameters — defaults from the torch.optim.AdamW docs,
     // tuned down on weight decay since this is a shallow MLP.
-    let lr:    f64 = 0.001;          // 1e-3
-    let beta1: f64 = 0.9;
-    let beta2: f64 = 0.999;
-    let eps:   f64 = 0.00000001;     // 1e-8
-    let wd:    f64 = 0.001;          // 1e-3 (per-step factor is 1 − lr·wd)
+    let lr_max: f64 = 0.001;         // peak lr (cosine decays toward lr_min)
+    let lr_min: f64 = 0.00001;       // floor ≈ lr_max / 100
+    let beta1:  f64 = 0.9;
+    let beta2:  f64 = 0.999;
+    let eps:    f64 = 0.00000001;    // 1e-8
+    let wd:     f64 = 0.001;         // 1e-3 (per-step factor is 1 − lr·wd)
     let alpha_smooth: f64 = 0.05;
+    let pi:     f64 = 3.14159265358979;
 
     let N_BATCH: i32 = 64;
-    let N_EPOCH: i32 = 10;
+    let N_EPOCH: i32 = 20;
 
     let t: i32 = 0;                  // global step (for bias correction)
     let epoch: i32 = 0;
 
     while (epoch < N_EPOCH) {
+        // Cosine lr schedule: lr = lr_min + 0.5·(lr_max − lr_min)·(1 + cos(π·epoch/N_EPOCH)).
+        // Hits lr_max at epoch 0, glides to lr_min by the last epoch.
+        let frac: f64 = int_to_float(epoch) / int_to_float(N_EPOCH);
+        let lr: f64 = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math_cos(pi * frac));
+
         let loss_sum: f64 = 0.0;
         let s: i32 = 0;
         while (s < N_TRAIN) {
