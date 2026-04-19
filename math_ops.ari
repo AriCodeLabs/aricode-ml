@@ -4,15 +4,13 @@
 // loop calling the corresponding scalar builtin (math_log,
 // math_log1p, math_sqrt, math_abs).
 //
-// These are intentionally *not* AVX2 — the arr_f64_exp family uses a
-// shared vec-body for throughput, but log / log1p don't yet have an
-// equivalent.  A future arr_f64_log builtin (vec-log based on the
-// atanh series, 4-lane IEEE bit extraction) will drop in transparently
-// wherever these wrappers are used; the signatures already match.
-//
-// Adequate for the small output tensors typical of classification
-// (softmax over 10-1000 classes).  For large tensors in a hot loop
-// (>10K elements) expect ~5-10× overhead vs a true AVX2 builtin.
+// log / log1p additionally expose a `_fast` variant backed by the
+// AVX2 arr_f64_log / arr_f64_log1p compiler builtins.  Those run the
+// same 7-term atanh series 4-lane packed and are bit-exact with the
+// scalar runtime path in lane 0.  Callers who need full-precision log
+// (e.g., log1p for |x| << 1) should stick with the scalar variants;
+// the fast path assumes inputs are positive for log and > -1 for
+// log1p, and skips partial-length tails (caller pads n to mul-4).
 
 fn arr_f64_log_scalar(buf: i32) -> i32 {
     let i: i32 = 0;
@@ -31,6 +29,16 @@ fn arr_f64_log1p_scalar(buf: i32) -> i32 {
         arr_f64_set(buf, i, math_log1p(arr_f64_get(buf, i)));
         i = i + 1;
     }
+    return 0;
+}
+
+fn arr_f64_log_fast(buf: i32) -> i32 {
+    arr_f64_log(buf);
+    return 0;
+}
+
+fn arr_f64_log1p_fast(buf: i32) -> i32 {
+    arr_f64_log1p(buf);
     return 0;
 }
 
