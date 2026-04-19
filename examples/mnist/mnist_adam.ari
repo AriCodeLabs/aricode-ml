@@ -1,0 +1,251 @@
+// aricode-ml: examples/mnist/mnist_adam.ari
+//
+// Full AdamW recipe on the same 784→128→10 MLP as mnist.ari.
+// Goal: beat the SGD baseline (97.15 %) by layering
+//   - input standardization ((px/255 − 0.1307) / 0.3081)
+//   - label smoothing (α = 0.05)
+//   - AdamW (decoupled weight decay, weights only)
+//
+// Keep mnist.ari intact as the reproducible 97.15 % baseline.
+
+import "../../dense.ari"     as dense;
+import "../../loss.ari"      as loss;
+import "../../optimizer.ari" as opt;
+import "../../math_ops.ari"  as mo;
+
+fn load_file(path_str: i32, byte_count: i32) -> i32 {
+    let slots: i32 = (byte_count + 7) / 8;
+    let buf: i32 = arr_new(slots);
+    let fd: i32 = file_open(path_str, 0);
+    file_read(fd, buf, byte_count);
+    file_close(fd);
+    return buf;
+}
+
+// Standardized loader: map [0, 255] bytes to (px/255 − 0.1307) / 0.3081,
+// MNIST's per-channel mean/std.  Matches the torchvision convention.
+fn load_image_at(img_buf: i32, offset: i32, out: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 784) {
+        let px: i32 = byte_at(img_buf, offset + i);
+        let v: f64 = (int_to_float(px) / 255.0 - 0.1307) / 0.3081;
+        arr_f64_set(out, i, v);
+        i += 1;
+    }
+    return 0;
+}
+
+// Label smoothing: true class gets (1 − α), others share α / (n − 1).
+fn one_hot_smooth(label: i32, out: i32, n: i32, alpha: f64) -> i32 {
+    let off_val: f64 = alpha / int_to_float(n - 1);
+    let i: i32 = 0;
+    while (i < n) { arr_f64_set(out, i, off_val); i += 1; }
+    arr_f64_set(out, label, 1.0 - alpha);
+    return 0;
+}
+
+fn argmax(buf: i32, n: i32) -> i32 {
+    let best_i: i32 = 0;
+    let best_v: f64 = arr_f64_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f64_get(buf, i);
+        if (v > best_v) { best_v = v; best_i = i; }
+        i += 1;
+    }
+    return best_i;
+}
+
+fn init_weights(buf: i32, fan_in: i32, seed_i: i32) -> i32 {
+    let s: i32 = seed_i;
+    let scale: f64 = math_sqrt(2.0 / int_to_float(fan_in));
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        let r: f64 = int_to_float((s / 65536) - ((s / 65536) / 32768) * 32768);
+        arr_f64_set(buf, i, (r / 32768.0 - 0.5) * 2.0 * scale);
+        i += 1;
+    }
+    return 0;
+}
+
+fn zero_buf(buf: i32) -> i32 {
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) { arr_f64_set(buf, i, 0.0); i += 1; }
+    return 0;
+}
+
+fn main() -> i32 {
+    let N_TRAIN: i32 = 60000;
+    let N_TEST:  i32 = 10000;
+
+    let img_path:   i32 = str_new("train-images-idx3-ubyte");
+    let lbl_path:   i32 = str_new("train-labels-idx1-ubyte");
+    let t_img_path: i32 = str_new("t10k-images-idx3-ubyte");
+    let t_lbl_path: i32 = str_new("t10k-labels-idx1-ubyte");
+
+    let train_img_buf: i32 = load_file(img_path,   N_TRAIN * 784 + 16);
+    let train_lbl_buf: i32 = load_file(lbl_path,   N_TRAIN + 8);
+    let test_img_buf:  i32 = load_file(t_img_path, N_TEST  * 784 + 16);
+    let test_lbl_buf:  i32 = load_file(t_lbl_path, N_TEST  + 8);
+
+    print_str("Loaded MNIST (standardized).");
+
+    let N_IN:  i32 = 784;
+    let N_H:   i32 = 128;
+    let N_OUT: i32 = 10;
+
+    let W1: i32 = arr_f64_new(N_H  * N_IN);
+    let b1: i32 = arr_f64_new(N_H);
+    let W2: i32 = arr_f64_new(N_OUT * N_H);
+    let b2: i32 = arr_f64_new(N_OUT);
+
+    init_weights(W1, N_IN, 12345);
+    init_weights(W2, N_H,  67890);
+    zero_buf(b1);
+    zero_buf(b2);
+
+    // Scratch per sample.
+    let x:  i32 = arr_f64_new(N_IN);
+    let h:  i32 = arr_f64_new(N_H);
+    let y:  i32 = arr_f64_new(N_OUT);
+    let t_lbl: i32 = arr_f64_new(N_OUT);
+    let dy: i32 = arr_f64_new(N_OUT);
+    let dh: i32 = arr_f64_new(N_H);
+
+    // Gradient accumulators.
+    let dW1: i32 = arr_f64_new(N_H  * N_IN);
+    let db1: i32 = arr_f64_new(N_H);
+    let dW2: i32 = arr_f64_new(N_OUT * N_H);
+    let db2: i32 = arr_f64_new(N_OUT);
+
+    // Adam first/second moments, one pair per weight tensor.
+    let mW1: i32 = arr_f64_new(N_H  * N_IN);
+    let vW1: i32 = arr_f64_new(N_H  * N_IN);
+    let mb1: i32 = arr_f64_new(N_H);
+    let vb1: i32 = arr_f64_new(N_H);
+    let mW2: i32 = arr_f64_new(N_OUT * N_H);
+    let vW2: i32 = arr_f64_new(N_OUT * N_H);
+    let mb2: i32 = arr_f64_new(N_OUT);
+    let vb2: i32 = arr_f64_new(N_OUT);
+
+    zero_buf(mW1); zero_buf(vW1);
+    zero_buf(mb1); zero_buf(vb1);
+    zero_buf(mW2); zero_buf(vW2);
+    zero_buf(mb2); zero_buf(vb2);
+
+    // Shared scratch for g² during moment updates — sized to the
+    // largest weight tensor so every tensor can reuse it.
+    let tmp_g2: i32 = arr_f64_new(N_H * N_IN);
+
+    // AdamW hyperparameters — defaults from the torch.optim.AdamW docs,
+    // tuned down on weight decay since this is a shallow MLP.
+    let lr:    f64 = 0.001;          // 1e-3
+    let beta1: f64 = 0.9;
+    let beta2: f64 = 0.999;
+    let eps:   f64 = 0.00000001;     // 1e-8
+    let wd:    f64 = 0.001;          // 1e-3 (per-step factor is 1 − lr·wd)
+    let alpha_smooth: f64 = 0.05;
+
+    let N_BATCH: i32 = 64;
+    let N_EPOCH: i32 = 10;
+
+    let t: i32 = 0;                  // global step (for bias correction)
+    let epoch: i32 = 0;
+
+    while (epoch < N_EPOCH) {
+        let loss_sum: f64 = 0.0;
+        let s: i32 = 0;
+        while (s < N_TRAIN) {
+            zero_buf(dW1); zero_buf(db1);
+            zero_buf(dW2); zero_buf(db2);
+
+            let batch_end: i32 = s + N_BATCH;
+            if (batch_end > N_TRAIN) { batch_end = N_TRAIN; }
+            let batch_size: i32 = batch_end - s;
+
+            let si: i32 = s;
+            while (si < batch_end) {
+                load_image_at(train_img_buf, 16 + si * 784, x);
+                let lbl: i32 = byte_at(train_lbl_buf, 8 + si);
+                one_hot_smooth(lbl, t_lbl, N_OUT, alpha_smooth);
+
+                dense.dense_forward(W1, b1, x, h, N_IN, N_H);
+                arr_f64_relu(h);
+                dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
+                arr_f64_softmax(y);
+
+                loss_sum = loss_sum - math_log(arr_f64_get(y, lbl) + 0.000000000001);
+
+                loss.xent_backward(y, t_lbl, dy);
+                dense.dense_backward(W2, h, dy, dh, dW2, db2);
+                dense.dense_backward_relu(h, dh, N_H);
+                dense.dense_backward(W1, x, dh, 0, dW1, db1);
+
+                si += 1;
+            }
+
+            // Mean gradient over the batch — Adam expects per-sample
+            // averaged gradients, not summed.
+            let scale_inv: f64 = 1.0 / int_to_float(batch_size);
+            arr_f64_scale(dW1, scale_inv);
+            arr_f64_scale(db1, scale_inv);
+            arr_f64_scale(dW2, scale_inv);
+            arr_f64_scale(db2, scale_inv);
+
+            t += 1;
+
+            // Moment updates (AVX2 under the hood: scale + add_scaled + mul).
+            opt.adam_update_moments(dW1, mW1, vW1, tmp_g2, beta1, beta2);
+            opt.adam_update_moments(db1, mb1, vb1, tmp_g2, beta1, beta2);
+            opt.adam_update_moments(dW2, mW2, vW2, tmp_g2, beta1, beta2);
+            opt.adam_update_moments(db2, mb2, vb2, tmp_g2, beta1, beta2);
+
+            // Bias correction:
+            //   lr_final  = lr · √(1 − β₂ᵗ) / (1 − β₁ᵗ)
+            //   eps_final = eps · √(1 − β₂ᵗ)
+            let bc1: f64 = 1.0 - mo.math_pow_int(beta1, t);
+            let bc2: f64 = 1.0 - mo.math_pow_int(beta2, t);
+            let sqrt_bc2: f64 = math_sqrt(bc2);
+            let lr_final:  f64 = lr  * sqrt_bc2 / bc1;
+            let eps_final: f64 = eps * sqrt_bc2;
+
+            // AdamW decoupled weight decay — weights only, biases skip.
+            let wd_factor: f64 = 1.0 - lr * wd;
+            arr_f64_scale(W1, wd_factor);
+            arr_f64_scale(W2, wd_factor);
+
+            // Adam step — fused AVX2 kernel.
+            opt.adam_apply_fast(W1, mW1, vW1, lr_final, eps_final);
+            opt.adam_apply_fast(b1, mb1, vb1, lr_final, eps_final);
+            opt.adam_apply_fast(W2, mW2, vW2, lr_final, eps_final);
+            opt.adam_apply_fast(b2, mb2, vb2, lr_final, eps_final);
+
+            s = batch_end;
+        }
+        print_str("epoch done, avg train NLL:");
+        print_f64(loss_sum / int_to_float(N_TRAIN), 4);
+
+        // Test accuracy.
+        let correct: i32 = 0;
+        let i: i32 = 0;
+        while (i < N_TEST) {
+            load_image_at(test_img_buf, 16 + i * 784, x);
+            let lbl: i32 = byte_at(test_lbl_buf, 8 + i);
+            dense.dense_forward(W1, b1, x, h, N_IN, N_H);
+            arr_f64_relu(h);
+            dense.dense_forward(W2, b2, h, y, N_H, N_OUT);
+            arr_f64_softmax(y);
+            if (argmax(y, N_OUT) == lbl) { correct += 1; }
+            i += 1;
+        }
+        print_str("test accuracy:");
+        print_f64(int_to_float(correct) / int_to_float(N_TEST), 4);
+
+        epoch += 1;
+    }
+
+    return 0;
+}
