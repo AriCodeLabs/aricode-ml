@@ -55,6 +55,38 @@ fn arr_f64_abs_scalar(buf: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------
+// Scalar math_pow(x, y): x^y via x^y = exp(y · log(x)).
+//
+// Valid for x > 0 (natural log domain).  For x ≤ 0 the user gets a
+// NaN result (via log(≤0) → NaN, exp(NaN) → NaN), which is the same
+// behaviour C libm exposes via pow(-1, 0.5) = NaN.
+//
+// Typical uses: β^t bias-correction in Adam, learning-rate decay
+// functions like lr · 0.95^epoch, softmax temperature warm-up.
+// ---------------------------------------------------------------------
+
+fn math_pow(x: f64, y: f64) -> f64 {
+    return math_exp(y * math_log(x));
+}
+
+// Integer-exponent fast path — repeated squaring, O(log n) multiplies.
+// Handles any sign of x and y=0 correctly (x^0 = 1 by convention).
+fn math_pow_int(x: f64, n: i32) -> f64 {
+    let result: f64 = 1.0;
+    let base: f64 = x;
+    let e: i32 = n;
+    let is_neg: i32 = 0;
+    if (n < 0) { is_neg = 1; e = 0 - n; }
+    while (e > 0) {
+        if (e & 1 == 1) { result = result * base; }
+        base = base * base;
+        e = e >> 1;
+    }
+    if (is_neg == 1) { result = 1.0 / result; }
+    return result;
+}
+
+// ---------------------------------------------------------------------
 // Fused operations — these DO have AVX2 builtins available
 // (arr_f64_exp, arr_f64_expm1), exposed here as consistent-named
 // wrappers so call sites don't mix _scalar and direct-builtin styles.
