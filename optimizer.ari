@@ -9,6 +9,55 @@ fn sgd_update(weights: i32, gradients: i32, n: i32, lr: f64) -> i32 {
     return 0;
 }
 
+// Adam optimizer — Kingma & Ba 2014.
+//
+// Splits into two 6-arg-limit-safe pieces:
+//
+//   1. adam_update_moments(g, m, v, tmp_g2, beta1, beta2)
+//      - m ← β₁·m + (1−β₁)·g            (AVX2 scale + add_scaled)
+//      - v ← β₂·v + (1−β₂)·g²           (arr_f64_mul for g², then same)
+//
+//   2. adam_apply(w, m, v, lr_final, eps_final)
+//      - w ← w − lr_final · m / (√v + eps_final)
+//
+// Bias correction is folded into the caller: callers pass
+//   lr_final  = lr · √(1 − β₂ᵗ) / (1 − β₁ᵗ)
+//   eps_final = eps · √(1 − β₂ᵗ)
+// so the hot loop only needs a sqrt + div per element.  Moment
+// updates are all AVX2; only adam_apply is scalar for now.
+
+fn adam_update_moments(g: i32, m: i32, v: i32, tmp_g2: i32,
+                       beta1: f64, beta2: f64) -> i32 {
+    // m ← β₁·m + (1−β₁)·g
+    arr_f64_scale(m, beta1);
+    arr_f64_add_scaled(m, g, 1.0 - beta1);
+
+    // v ← β₂·v + (1−β₂)·g²  (tmp_g2 = g ∘ g)
+    arr_f64_mul(tmp_g2, g, g);
+    arr_f64_scale(v, beta2);
+    arr_f64_add_scaled(v, tmp_g2, 1.0 - beta2);
+    return 0;
+}
+
+fn adam_apply(w: i32, m: i32, v: i32,
+              lr_final: f64, eps_final: f64) -> i32 {
+    // Per-element update: w[i] -= lr_final · m[i] / (√v[i] + eps_final).
+    // Scalar loop — each step uses math_sqrt + divsd, which forces the
+    // caller out of xmm-safe hot-var mode.  For MNIST-scale tensors
+    // (100K floats max) this is under 2 ms per call and not the
+    // bottleneck.
+    let n: i32 = arr_len(w);
+    let i: i32 = 0;
+    while (i < n) {
+        let mi: f64 = arr_f64_get(m, i);
+        let vi: f64 = arr_f64_get(v, i);
+        let step_size: f64 = lr_final * mi / (math_sqrt(vi) + eps_final);
+        arr_f64_set(w, i, arr_f64_get(w, i) - step_size);
+        i += 1;
+    }
+    return 0;
+}
+
 fn zero_gradients(gradients: i32, n: i32) -> i32 {
     let i: i32 = 0;
     while (i < n) {
