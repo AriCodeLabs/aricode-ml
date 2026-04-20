@@ -1,0 +1,226 @@
+// aricode-ml: conv2d.ari
+//
+// Minimal CNN primitives, hardcoded to the MNIST-size config used by
+// examples/mnist/mnist_cnn.ari:
+//
+//   Input:   1 × 28 × 28   (flat, length 784)
+//   Kernel:  3 × 3, stride 1, pad 1  →  output spatial stays 28 × 28
+//   Output:  C_out × 28 × 28 channels
+//
+// The 6-argument limit on user functions is why we specialise here
+// instead of parameterising shape.  A generalised `arr_f64_conv2d`
+// compiler builtin is the next speed-up (iteration 2); this file is
+// the reference implementation that validates the math.
+//
+// Strategy: im2col + AVX2 add_scaled / dot / sum.
+//   - im2col lays out all 3×3 patches as 9 separate 784-long buffers,
+//     one per spatial neighbour.  Row k's buffer stores, for every
+//     output position (y, x), the value of the k'th kernel neighbour.
+//   - Forward then runs as 9 × arr_f64_add_scaled per output channel
+//     over 784 elements — fully AVX2, ~400 ns per call.
+//   - Backward dW[c, k] = dot(dout[c, :], im2col_row_k).
+//
+// Buffers that would blow past the 6-arg limit are packed into an
+// i32 handle array (im2col_rows[0..9]) and unpacked via arr_get.
+
+// ---------------------------------------------------------------------
+// Allocate the 9 per-row im2col buffers.  Caller stores the returned
+// handle array and passes it to im2col / forward / backward.
+// ---------------------------------------------------------------------
+fn conv2d_alloc_im2col() -> i32 {
+    let handles: i32 = arr_new(9);
+    let k: i32 = 0;
+    while (k < 9) {
+        arr_set(handles, k, arr_f64_new(784));
+        k += 1;
+    }
+    return handles;
+}
+
+// ---------------------------------------------------------------------
+// Populate the 9 im2col buffers from a 28×28 input (C_in = 1).
+// Row k (k = ky·3 + kx) holds, at index y·28 + x, the value of
+// input[y + ky − 1, x + kx − 1] (zero-padded at the border).
+// ---------------------------------------------------------------------
+fn conv2d_im2col(input: i32, im2col_rows: i32) -> i32 {
+    let k: i32 = 0;
+    while (k < 9) {
+        let buf: i32 = arr_get(im2col_rows, k);
+        let ky: i32 = k / 3;
+        let kx: i32 = k - ky * 3;
+        let y: i32 = 0;
+        while (y < 28) {
+            let iy: i32 = y + ky - 1;
+            let row_off: i32 = y * 28;
+            let x: i32 = 0;
+            if (iy < 0 || iy >= 28) {
+                while (x < 28) { arr_f64_set(buf, row_off + x, 0.0); x += 1; }
+            } else {
+                let in_row: i32 = iy * 28;
+                while (x < 28) {
+                    let ix: i32 = x + kx - 1;
+                    if (ix < 0 || ix >= 28) {
+                        arr_f64_set(buf, row_off + x, 0.0);
+                    } else {
+                        arr_f64_set(buf, row_off + x, arr_f64_get(input, in_row + ix));
+                    }
+                    x += 1;
+                }
+            }
+            y += 1;
+        }
+        k += 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// conv2d_forward (assumes im2col_rows already built for this input).
+//
+//   out[c, :] = bias[c] + Σₖ W[c, k] · im2col_rows[k][:]     (k = 0..8)
+//
+// W is [C_out, 9] flat (kernel pre-flattened).  Output is [C_out, 784].
+// scratch is a 784-long f64 buffer reused across channels.
+//
+// Hot loop: 9 × arr_f64_add_scaled over 784 → AVX2.
+// ---------------------------------------------------------------------
+fn conv2d_forward(im2col_rows: i32, weights: i32, bias: i32,
+                  output: i32, scratch: i32, C_out: i32) -> i32 {
+    let c: i32 = 0;
+    while (c < C_out) {
+        let b_val: f64 = arr_f64_get(bias, c);
+
+        // scratch = bias[c] · ones  (broadcast init).
+        let j: i32 = 0;
+        while (j < 784) { arr_f64_set(scratch, j, b_val); j += 1; }
+
+        // scratch += W[c, k] · im2col_rows[k] for k in 0..9.
+        let k: i32 = 0;
+        while (k < 9) {
+            let row: i32 = arr_get(im2col_rows, k);
+            let w_k: f64 = arr_f64_get(weights, c * 9 + k);
+            arr_f64_add_scaled(scratch, row, w_k);
+            k += 1;
+        }
+
+        // Copy scratch → output[c, :].
+        let out_off: i32 = c * 784;
+        let jj: i32 = 0;
+        while (jj < 784) {
+            arr_f64_set(output, out_off + jj, arr_f64_get(scratch, jj));
+            jj += 1;
+        }
+        c += 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// conv2d_backward_weights:  dW[c, k] = dout[c, :] · im2col_rows[k]
+//                           db[c]    = Σⱼ dout[c, j]
+//
+// We need a per-channel slice of dout for arr_f64_dot / arr_f64_sum.
+// To avoid pointer slicing (aricode has no views), the caller passes
+// a 784-long scratch buffer into which we copy dout[c, :] once per
+// channel and then run the AVX2 reductions.
+// ---------------------------------------------------------------------
+fn conv2d_backward_weights(dout: i32, im2col_rows: i32, dweights: i32,
+                           dbias: i32, scratch: i32, C_out: i32) -> i32 {
+    let c: i32 = 0;
+    while (c < C_out) {
+        let dout_off: i32 = c * 784;
+        let dw_off:   i32 = c * 9;
+
+        // scratch ← dout[c, :]
+        let j: i32 = 0;
+        while (j < 784) {
+            arr_f64_set(scratch, j, arr_f64_get(dout, dout_off + j));
+            j += 1;
+        }
+
+        // db[c] = Σⱼ scratch[j]     (AVX2 arr_f64_sum)
+        arr_f64_set(dbias, c, arr_f64_sum(scratch));
+
+        // dW[c, k] = dot(scratch, im2col_rows[k])    (AVX2 arr_f64_dot)
+        let k: i32 = 0;
+        while (k < 9) {
+            let row: i32 = arr_get(im2col_rows, k);
+            arr_f64_set(dweights, dw_off + k, arr_f64_dot(scratch, row));
+            k += 1;
+        }
+        c += 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// Max-pooling, 2×2 window, stride 2.
+//
+//   in:     [C, 28, 28]  (flat, length C · 784)
+//   out:    [C, 14, 14]  (flat, length C · 196)
+//   argmax: [C, 14, 14]  (f64 storing which of the 4 window cells
+//                         won: 0 = top-left, 1 = TR, 2 = BL, 3 = BR).
+// ---------------------------------------------------------------------
+fn maxpool_2x2_forward(input: i32, output: i32, argmax: i32, C: i32) -> i32 {
+    let c: i32 = 0;
+    while (c < C) {
+        let in_off:  i32 = c * 784;
+        let out_off: i32 = c * 196;
+        let y: i32 = 0;
+        while (y < 14) {
+            let x: i32 = 0;
+            while (x < 14) {
+                let i0: i32 = in_off + (2 * y) * 28 + 2 * x;
+                let v0: f64 = arr_f64_get(input, i0);
+                let v1: f64 = arr_f64_get(input, i0 + 1);
+                let v2: f64 = arr_f64_get(input, i0 + 28);
+                let v3: f64 = arr_f64_get(input, i0 + 29);
+                let best_v: f64 = v0;
+                let best_i: i32 = 0;
+                if (v1 > best_v) { best_v = v1; best_i = 1; }
+                if (v2 > best_v) { best_v = v2; best_i = 2; }
+                if (v3 > best_v) { best_v = v3; best_i = 3; }
+                let o_off: i32 = out_off + y * 14 + x;
+                arr_f64_set(output, o_off, best_v);
+                arr_f64_set(argmax, o_off, int_to_float(best_i));
+                x += 1;
+            }
+            y += 1;
+        }
+        c += 1;
+    }
+    return 0;
+}
+
+// Upsample dout back to input shape via argmax.  Non-winning positions
+// get zero; the winner inherits dout.
+fn maxpool_2x2_backward(dout: i32, argmax: i32, dinput: i32, C: i32) -> i32 {
+    let n: i32 = arr_len(dinput);
+    let i: i32 = 0;
+    while (i < n) { arr_f64_set(dinput, i, 0.0); i += 1; }
+
+    let c: i32 = 0;
+    while (c < C) {
+        let din_off:  i32 = c * 784;
+        let dout_off: i32 = c * 196;
+        let y: i32 = 0;
+        while (y < 14) {
+            let x: i32 = 0;
+            while (x < 14) {
+                let o_off: i32 = dout_off + y * 14 + x;
+                let g: f64 = arr_f64_get(dout, o_off);
+                let which: i32 = float_to_int(arr_f64_get(argmax, o_off));
+                let base: i32 = din_off + (2 * y) * 28 + 2 * x;
+                let target: i32 = base;
+                if (which == 1) { target = base + 1; }
+                if (which == 2) { target = base + 28; }
+                if (which == 3) { target = base + 29; }
+                arr_f64_set(dinput, target, g);
+                x += 1;
+            }
+            y += 1;
+        }
+        c += 1;
+    }
+    return 0;
+}

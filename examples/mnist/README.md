@@ -8,10 +8,11 @@ Two variants ship side-by-side.  Same architecture, different
 optimisers + preprocessing — pick whichever makes the point you
 need.
 
-| Variant            | Hidden | Preprocessing                       | Optimiser                  | Epochs | Final acc |
-|--------------------|-------:|-------------------------------------|----------------------------|-------:|-----------|
-| `mnist.ari`        | 128    | `px / 255` ([0, 1])                 | SGD + lr decay 0.85        |    10  | 97.15 %   |
-| `mnist_adam.ari`   | 256    | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    20  | **98.61 %** |
+| Variant            | Architecture                     | Preprocessing                       | Optimiser                  | Epochs | Final acc |
+|--------------------|----------------------------------|-------------------------------------|----------------------------|-------:|-----------|
+| `mnist.ari`        | MLP 784 → 128 → 10               | `px / 255` ([0, 1])                 | SGD + lr decay 0.85        |    10  | 97.15 %   |
+| `mnist_adam.ari`   | MLP 784 → 256 → 10               | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    20  | 98.61 %   |
+| `mnist_cnn.ari`    | Conv8 → Pool → FC 1568→64 → 10   | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    10  | **98.66 %** |
 
 ## Architecture (both variants)
 
@@ -54,15 +55,19 @@ Layers the standard deep-learning hygiene on top of the baseline:
 aric mnist.ari -o mnist
 ./mnist
 
-# AdamW variant (98.14 %, ~36 s):
+# AdamW MLP variant (98.61 %, ~137 s):
 aric mnist_adam.ari -o mnist_adam
 ./mnist_adam
+
+# CNN variant (98.66 %, ~124 s):
+aric mnist_cnn.ari -o mnist_cnn
+./mnist_cnn
 ```
 
 `get_data.sh` pulls from an S3 mirror since the canonical
 `yann.lecun.com` host is unreliable.
 
-## AdamW trajectory
+## AdamW trajectory (MLP)
 
 | Epoch | train NLL | test acc |
 |-------|-----------|----------|
@@ -72,11 +77,36 @@ aric mnist_adam.ari -o mnist_adam
 |  15   | 0.0637    | 98.53 %  |
 |  20   | 0.0619    | **98.61 %** |
 
-137 s wall-clock, ~50 KB binary.  Still a slight climb at epoch 20,
-so more epochs + light augmentation (shifts, rotations) could keep
-pushing.  For a bigger jump the next step is CNN builtins
-(`arr_f64_conv2d` + `arr_f64_max_pool`), neither of which ship yet —
-those unlock ~99 % on MNIST.
+137 s wall-clock, ~50 KB binary.
+
+## `mnist_cnn.ari` — one-conv CNN
+
+Adds spatial structure on top of the Adam recipe:
+
+- **Conv**: 1 → 8 channels, 3 × 3 kernel, pad 1, stride 1.
+  Preserves the 28 × 28 spatial resolution.
+- **ReLU** → **MaxPool 2 × 2, stride 2** → feature map 8 × 14 × 14.
+- **FC1**: 1568 → 64, ReLU.
+- **FC2**: 64 → 10, softmax.
+
+Same AdamW + label-smoothing + cosine schedule as the MLP variant.
+Convolution and pooling primitives are in `../../conv2d.ari` — a
+pure-`.ari` reference using AVX2 `arr_f64_add_scaled` / `dot` / `sum`
+for the hot arithmetic (im2col construction is still scalar).  A
+compiler-level `arr_f64_conv2d` builtin is the next speed-up.
+
+Trajectory (hyperparameters identical to `mnist_adam.ari`):
+
+| Epoch | train NLL | test acc |
+|-------|-----------|----------|
+|   1   | 0.2998    | 96.73 %  |
+|   5   | 0.1122    | 98.18 %  |
+|  10   | 0.0925    | **98.66 %** |
+
+124 s wall-clock, ~65 KB binary.  Beats the MLP at half the epoch
+budget and with ~2× fewer parameters (101 K vs 203 K).  Still a
+gentle upward slope at epoch 10 — more epochs or a wider conv (16
+channels, or two stacked conv layers) would push toward 99 %.
 
 ## Notes
 
