@@ -207,8 +207,10 @@ fn main() -> i32 {
                 one_hot_smooth(lbl, t_lbl, N_OUT, alpha_smooth);
 
                 // ── Forward ──
+                // im2col is built here because backward_weights needs it;
+                // the forward path itself goes through the AVX2 builtin.
                 conv.conv2d_im2col(x, im2col_rows);
-                conv.conv2d_forward_fast(x, W_conv, b_conv, conv_o, padded, C_OUT);
+                conv.conv2d_forward(x, W_conv, b_conv, conv_o, padded, C_OUT);
                 arr_f64_relu(conv_o);
                 conv.maxpool_2x2_forward(conv_o, pool_o, pool_a, C_OUT);
                 dense.dense_forward(W_fc1, b_fc1, pool_o, hid, FLAT, N_HID);
@@ -278,8 +280,8 @@ fn main() -> i32 {
         while (i < N_TEST) {
             load_image_at(test_img_buf, 16 + i * 784, x);
             let lbl: i32 = byte_at(test_lbl_buf, 8 + i);
-            conv.conv2d_im2col(x, im2col_rows);
-            conv.conv2d_forward(im2col_rows, W_conv, b_conv, conv_o, conv_scratch, C_OUT);
+            // Inference path: no backward → no im2col needed.
+            conv.conv2d_forward(x, W_conv, b_conv, conv_o, padded, C_OUT);
             arr_f64_relu(conv_o);
             conv.maxpool_2x2_forward(conv_o, pool_o, pool_a, C_OUT);
             dense.dense_forward(W_fc1, b_fc1, pool_o, hid, FLAT, N_HID);
