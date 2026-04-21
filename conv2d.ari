@@ -83,25 +83,34 @@ fn conv2d_im2col(input: i32, im2col_rows: i32) -> i32 {
         let buf: i32 = arr_get(im2col_rows, k);
         let ky: i32 = k / 3;
         let kx: i32 = k - ky * 3;
-        let y: i32 = 0;
-        while (y < 28) {
-            let iy: i32 = y + ky - 1;
-            let row_off: i32 = y * 28;
-            let x: i32 = 0;
-            if (iy < 0 || iy >= 28) {
-                while (x < 28) { arr_f64_set(buf, row_off + x, 0.0); x += 1; }
-            } else {
-                let in_row: i32 = iy * 28;
-                while (x < 28) {
-                    let ix: i32 = x + kx - 1;
-                    if (ix < 0 || ix >= 28) {
-                        arr_f64_set(buf, row_off + x, 0.0);
-                    } else {
-                        arr_f64_set(buf, row_off + x, arr_f64_get(input, in_row + ix));
-                    }
-                    x += 1;
-                }
-            }
+
+        // Zero the whole buffer; we'll overwrite the valid interior next.
+        // AVX2 broadcast-fill replaces a 784-iteration scalar set loop.
+        arr_f64_fill(buf, 0.0);
+
+        // Valid y range: drop the first row for ky=0 (top-of-image
+        // kernel neighbour is out of bounds on y=0) and the last row
+        // for ky=2.
+        let y_start: i32 = 0;
+        if (ky == 0) { y_start = 1; }
+        let y_end: i32 = 28;
+        if (ky == 2) { y_end = 27; }
+
+        // Valid x range — same logic on the column axis.
+        let x_start: i32 = 0;
+        if (kx == 0) { x_start = 1; }
+        let x_end: i32 = 28;
+        if (kx == 2) { x_end = 27; }
+        let count: i32 = x_end - x_start;
+
+        // Per valid row, one arr_f64_copy_slice call — AVX2 vmovupd
+        // over the 26-28 in-bounds columns.  Replaces the scalar
+        // per-pixel bounds check that dominated the old im2col.
+        let y: i32 = y_start;
+        while (y < y_end) {
+            let src_off: i32 = (y + ky - 1) * 28 + (x_start + kx - 1);
+            let dst_off: i32 = y * 28 + x_start;
+            arr_f64_copy_slice(input, src_off, buf, dst_off, count);
             y += 1;
         }
         k += 1;
