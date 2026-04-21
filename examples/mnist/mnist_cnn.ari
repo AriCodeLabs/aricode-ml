@@ -168,6 +168,7 @@ fn main() -> i32 {
     // Conv scratch.
     let im2col_rows: i32 = conv.conv2d_alloc_im2col();   // 9 handles of 784-f64 bufs
     let conv_scratch: i32 = arr_f64_new(784);
+    let padded: i32 = arr_f64_new(900);                  // 30×30 padded input for AVX2 builtin
 
     // AdamW hyperparameters.
     let lr_max: f64 = 0.001;
@@ -207,7 +208,7 @@ fn main() -> i32 {
 
                 // ── Forward ──
                 conv.conv2d_im2col(x, im2col_rows);
-                conv.conv2d_forward(im2col_rows, W_conv, b_conv, conv_o, conv_scratch, C_OUT);
+                conv.conv2d_forward_fast(x, W_conv, b_conv, conv_o, padded, C_OUT);
                 arr_f64_relu(conv_o);
                 conv.maxpool_2x2_forward(conv_o, pool_o, pool_a, C_OUT);
                 dense.dense_forward(W_fc1, b_fc1, pool_o, hid, FLAT, N_HID);

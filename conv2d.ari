@@ -24,6 +24,41 @@
 // i32 handle array (im2col_rows[0..9]) and unpacked via arr_get.
 
 // ---------------------------------------------------------------------
+// Zero-pad a 28×28 input (784 elements) into a 30×30 buffer (900
+// elements) with zero borders.  Required by the AVX2 builtin
+// `arr_f64_conv2d_3x3_p1` which assumes pre-padded input.  Scalar
+// code here — padding is a small, bandwidth-bound copy, not a compute
+// bottleneck in the CNN forward pass.
+// ---------------------------------------------------------------------
+fn conv2d_pad_28_to_30(input: i32, padded: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 900) { arr_f64_set(padded, i, 0.0); i += 1; }
+    let y: i32 = 0;
+    while (y < 28) {
+        let x: i32 = 0;
+        while (x < 28) {
+            arr_f64_set(padded, (y + 1) * 30 + (x + 1),
+                        arr_f64_get(input, y * 28 + x));
+            x += 1;
+        }
+        y += 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// conv2d_forward_fast: AVX2 fast path using the compiler builtin.
+// Takes raw 28×28 input; pads internally.  Caller provides a 900-wide
+// scratch buffer for the padded copy.
+// ---------------------------------------------------------------------
+fn conv2d_forward_fast(input: i32, weights: i32, bias: i32,
+                      output: i32, padded: i32, C_out: i32) -> i32 {
+    conv2d_pad_28_to_30(input, padded);
+    arr_f64_conv2d_3x3_p1(padded, weights, bias, output, C_out);
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // Allocate the 9 per-row im2col buffers.  Caller stores the returned
 // handle array and passes it to im2col / forward / backward.
 // ---------------------------------------------------------------------
