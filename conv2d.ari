@@ -160,6 +160,85 @@ fn conv2d_im2col(input: i32, im2col_rows: i32) -> i32 {
 }
 
 // ---------------------------------------------------------------------
+// conv2d_im2col_from_padded: build the 9 im2col rows from a single
+// channel of an already-padded input (`padded[c_in]`).  Simpler than
+// `conv2d_im2col` because the zero borders come from padding — no
+// per-pixel bounds check, just a flat row copy per kernel offset.
+//
+// im2col_rows[k][y*28 + x]  =  padded[c_in, y + k/3, x + k%3]
+//
+// Reused by conv2d_backward_weights_multi per input channel.
+// ---------------------------------------------------------------------
+fn conv2d_im2col_from_padded(padded: i32, c_in: i32, im2col_rows: i32) -> i32 {
+    let pad_base: i32 = c_in * 900;
+    let k: i32 = 0;
+    while (k < 9) {
+        let buf: i32 = arr_get(im2col_rows, k);
+        let ky: i32 = k / 3;
+        let kx: i32 = k - ky * 3;
+        let y: i32 = 0;
+        while (y < 28) {
+            arr_f64_copy_slice(padded,
+                               pad_base + (y + ky) * 30 + kx,
+                               buf,
+                               y * 28,
+                               28);
+            y += 1;
+        }
+        k += 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// conv2d_backward_weights_multi: gradient of loss wrt conv weights /
+// biases for a multi-channel 3×3 conv with pad 1, stride 1.
+//
+//   dW[c_out, c_in, k] = Σⱼ dout[c_out, j] · im2col_c_in[k][j]
+//   db[c_out]           = Σⱼ dout[c_out, j]
+//
+// Rebuilds im2col per input channel (reusing the caller's 9-handle
+// scratch) since we can't cheaply slice a padded multi-channel
+// tensor into 9 pre-computed rows for every c_in.  C_in is inferred
+// from arr_len(padded) / 900 to keep the signature at 6 args.
+// ---------------------------------------------------------------------
+fn conv2d_backward_weights_multi(padded: i32, dout: i32, dweights: i32,
+                                 dbias: i32, im2col_rows: i32,
+                                 C_out: i32) -> i32 {
+    let C_in: i32 = arr_len(padded) / 900;
+
+    // Biases only depend on dout — compute once per c_out up front.
+    let c_out: i32 = 0;
+    while (c_out < C_out) {
+        arr_f64_set(dbias, c_out, arr_f64_sum_range(dout, c_out * 784, 784));
+        c_out += 1;
+    }
+
+    // Weights loop — c_in outer, c_out inner so im2col is only built
+    // C_in times total (not C_in · C_out).
+    let c_in: i32 = 0;
+    while (c_in < C_in) {
+        conv2d_im2col_from_padded(padded, c_in, im2col_rows);
+
+        c_out = 0;
+        while (c_out < C_out) {
+            let dout_off: i32 = c_out * 784;
+            let dw_base:  i32 = (c_out * C_in + c_in) * 9;
+            let k: i32 = 0;
+            while (k < 9) {
+                let row: i32 = arr_get(im2col_rows, k);
+                arr_f64_set(dweights, dw_base + k,
+                            arr_f64_dot_range(dout, dout_off, row, 0, 784));
+                k += 1;
+            }
+            c_out += 1;
+        }
+        c_in += 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // conv2d_backward_weights:  dW[c, k] = dout[c, :] · im2col_rows[k]
 //                           db[c]    = Σⱼ dout[c, j]
 //
