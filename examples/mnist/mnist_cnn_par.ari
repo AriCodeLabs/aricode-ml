@@ -1,0 +1,398 @@
+// aricode-ml: examples/mnist/mnist_cnn_par.ari
+//
+// Parallel-eval variant of mnist_cnn.ari.  Training is unchanged (same
+// AdamW recipe, same ~98.6 % test accuracy) but the per-epoch test-set
+// evaluation is split across four worker threads using the
+// thread_spawn(func, arg) + atomic_add_i64 primitives.  Each worker
+// gets its own scratch buffers so there's no contention on activations;
+// the model weights are read-only during inference, so they're shared
+// by pointer under CLONE_VM.
+//
+// Correctness invariant: the final test accuracy must match the serial
+// build's 98.66 % (training is deterministic and eval is just a parallel
+// reduction of argmax comparisons, so the count is bit-identical).
+
+import "../../dense.ari"     as dense;
+import "../../loss.ari"      as loss;
+import "../../optimizer.ari" as opt;
+import "../../math_ops.ari"  as mo;
+import "../../conv2d.ari"    as conv;
+
+fn load_file(path_str: i32, byte_count: i32) -> i32 {
+    let slots: i32 = (byte_count + 7) / 8;
+    let buf: i32 = arr_new(slots);
+    let fd: i32 = file_open(path_str, 0);
+    file_read(fd, buf, byte_count);
+    file_close(fd);
+    return buf;
+}
+
+fn load_image_at(img_buf: i32, offset: i32, out: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 784) {
+        let px: i32 = byte_at(img_buf, offset + i);
+        arr_f64_set(out, i, (int_to_float(px) / 255.0 - 0.1307) / 0.3081);
+        i += 1;
+    }
+    return 0;
+}
+
+fn one_hot_smooth(label: i32, out: i32, n: i32, alpha: f64) -> i32 {
+    let off_val: f64 = alpha / int_to_float(n - 1);
+    let i: i32 = 0;
+    while (i < n) { arr_f64_set(out, i, off_val); i += 1; }
+    arr_f64_set(out, label, 1.0 - alpha);
+    return 0;
+}
+
+fn argmax(buf: i32, n: i32) -> i32 {
+    let best_i: i32 = 0;
+    let best_v: f64 = arr_f64_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f64_get(buf, i);
+        if (v > best_v) { best_v = v; best_i = i; }
+        i += 1;
+    }
+    return best_i;
+}
+
+fn init_weights(buf: i32, fan_in: i32, seed_i: i32) -> i32 {
+    let s: i32 = seed_i;
+    let scale: f64 = math_sqrt(2.0 / int_to_float(fan_in));
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        let r: f64 = int_to_float((s / 65536) - ((s / 65536) / 32768) * 32768);
+        arr_f64_set(buf, i, (r / 32768.0 - 0.5) * 2.0 * scale);
+        i += 1;
+    }
+    return 0;
+}
+
+fn zero_buf(buf: i32) -> i32 {
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) { arr_f64_set(buf, i, 0.0); i += 1; }
+    return 0;
+}
+
+// ------------------------------------------------------------
+// Parallel eval worker
+// ------------------------------------------------------------
+// One worker evaluates a contiguous range [i_start, i_end) of the test
+// set.  The descriptor (19 i32 slots) packs everything the worker needs
+// — aricode's thread_spawn passes only a single int arg, so we use an
+// arr_new'd array as a pointer-carrier.  Weights are shared (inference
+// only reads them), scratch buffers are per-worker so there's no
+// contention on activations.
+//
+// Layout:
+//    [0..5]   W_conv, b_conv, W_fc1, b_fc1, W_fc2, b_fc2    (shared read-only)
+//    [6..7]   test_img_buf, test_lbl_buf                    (shared read-only)
+//    [8..14]  x, conv_o, pool_o, pool_a, hid, y_out, padded (per-worker scratch)
+//    [15..16] i_start, i_end                                (this worker's slice)
+//    [17]     correct_ctr                                   (shared atomic counter)
+//    [18]     done_ctr                                      (shared atomic counter)
+fn eval_worker(desc: i32) -> i32 {
+    let W_conv: i32 = arr_get(desc, 0);
+    let b_conv: i32 = arr_get(desc, 1);
+    let W_fc1:  i32 = arr_get(desc, 2);
+    let b_fc1:  i32 = arr_get(desc, 3);
+    let W_fc2:  i32 = arr_get(desc, 4);
+    let b_fc2:  i32 = arr_get(desc, 5);
+    let test_img_buf: i32 = arr_get(desc, 6);
+    let test_lbl_buf: i32 = arr_get(desc, 7);
+    let x:      i32 = arr_get(desc, 8);
+    let conv_o: i32 = arr_get(desc, 9);
+    let pool_o: i32 = arr_get(desc, 10);
+    let pool_a: i32 = arr_get(desc, 11);
+    let hid:    i32 = arr_get(desc, 12);
+    let y_out:  i32 = arr_get(desc, 13);
+    let padded: i32 = arr_get(desc, 14);
+    let i_start: i32 = arr_get(desc, 15);
+    let i_end:   i32 = arr_get(desc, 16);
+    let correct_ctr: i32 = arr_get(desc, 17);
+    let done_ctr:    i32 = arr_get(desc, 18);
+
+    // These architectural constants are duplicated from main — aricode
+    // locals don't cross function boundaries.
+    let C_OUT: i32 = 8;
+    let FLAT:  i32 = 1568;
+    let N_HID: i32 = 64;
+    let N_OUT: i32 = 10;
+
+    // Accumulate this worker's correct count in a local, fold into the
+    // shared atomic ONCE at the end — a 10k-sample loop would otherwise
+    // stall 10k × 4 cores on lock xadd contention.
+    let local_correct: i32 = 0;
+    let i: i32 = i_start;
+    while (i < i_end) {
+        load_image_at(test_img_buf, 16 + i * 784, x);
+        let lbl: i32 = byte_at(test_lbl_buf, 8 + i);
+        conv.conv2d_forward(x, W_conv, b_conv, conv_o, padded, C_OUT);
+        arr_f64_relu(conv_o);
+        conv.maxpool_2x2_forward(conv_o, pool_o, pool_a, C_OUT);
+        dense.dense_forward(W_fc1, b_fc1, pool_o, hid, FLAT, N_HID);
+        arr_f64_relu(hid);
+        dense.dense_forward(W_fc2, b_fc2, hid, y_out, N_HID, N_OUT);
+        arr_f64_softmax(y_out);
+        if (argmax(y_out, N_OUT) == lbl) { local_correct += 1; }
+        i += 1;
+    }
+    atomic_add_i64(correct_ctr, 0, local_correct);
+    atomic_add_i64(done_ctr,    0, 1);
+    return 0;
+}
+
+fn main() -> i32 {
+    let N_TRAIN: i32 = 60000;
+    let N_TEST:  i32 = 10000;
+
+    let img_path:   i32 = str_new("train-images-idx3-ubyte");
+    let lbl_path:   i32 = str_new("train-labels-idx1-ubyte");
+    let t_img_path: i32 = str_new("t10k-images-idx3-ubyte");
+    let t_lbl_path: i32 = str_new("t10k-labels-idx1-ubyte");
+
+    let train_img_buf: i32 = load_file(img_path,   N_TRAIN * 784 + 16);
+    let train_lbl_buf: i32 = load_file(lbl_path,   N_TRAIN + 8);
+    let test_img_buf:  i32 = load_file(t_img_path, N_TEST  * 784 + 16);
+    let test_lbl_buf:  i32 = load_file(t_lbl_path, N_TEST  + 8);
+
+    print_str("Loaded MNIST (CNN, standardised).");
+
+    let N_OUT: i32 = 10;
+    let N_HID: i32 = 64;          // hidden FC size
+    let C_OUT: i32 = 8;           // conv output channels
+    let FLAT:  i32 = C_OUT * 196; // post-pool flat size = 8 · 14 · 14 = 1568
+
+    // Conv parameters.
+    let W_conv: i32 = arr_f64_new(C_OUT * 9);
+    let b_conv: i32 = arr_f64_new(C_OUT);
+    init_weights(W_conv, 9, 12345);
+    zero_buf(b_conv);
+
+    // FC1: FLAT → N_HID.
+    let W_fc1: i32 = arr_f64_new(N_HID * FLAT);
+    let b_fc1: i32 = arr_f64_new(N_HID);
+    init_weights(W_fc1, FLAT, 67890);
+    zero_buf(b_fc1);
+
+    // FC2: N_HID → N_OUT.
+    let W_fc2: i32 = arr_f64_new(N_OUT * N_HID);
+    let b_fc2: i32 = arr_f64_new(N_OUT);
+    init_weights(W_fc2, N_HID, 54321);
+    zero_buf(b_fc2);
+
+    // Gradient accumulators.
+    let dW_conv: i32 = arr_f64_new(C_OUT * 9);
+    let db_conv: i32 = arr_f64_new(C_OUT);
+    let dW_fc1:  i32 = arr_f64_new(N_HID * FLAT);
+    let db_fc1:  i32 = arr_f64_new(N_HID);
+    let dW_fc2:  i32 = arr_f64_new(N_OUT * N_HID);
+    let db_fc2:  i32 = arr_f64_new(N_OUT);
+
+    // Adam moments (six pairs).
+    let mW_conv: i32 = arr_f64_new(C_OUT * 9);
+    let vW_conv: i32 = arr_f64_new(C_OUT * 9);
+    let mb_conv: i32 = arr_f64_new(C_OUT);
+    let vb_conv: i32 = arr_f64_new(C_OUT);
+    let mW_fc1:  i32 = arr_f64_new(N_HID * FLAT);
+    let vW_fc1:  i32 = arr_f64_new(N_HID * FLAT);
+    let mb_fc1:  i32 = arr_f64_new(N_HID);
+    let vb_fc1:  i32 = arr_f64_new(N_HID);
+    let mW_fc2:  i32 = arr_f64_new(N_OUT * N_HID);
+    let vW_fc2:  i32 = arr_f64_new(N_OUT * N_HID);
+    let mb_fc2:  i32 = arr_f64_new(N_OUT);
+    let vb_fc2:  i32 = arr_f64_new(N_OUT);
+    zero_buf(mW_conv); zero_buf(vW_conv);
+    zero_buf(mb_conv); zero_buf(vb_conv);
+    zero_buf(mW_fc1);  zero_buf(vW_fc1);
+    zero_buf(mb_fc1);  zero_buf(vb_fc1);
+    zero_buf(mW_fc2);  zero_buf(vW_fc2);
+    zero_buf(mb_fc2);  zero_buf(vb_fc2);
+
+    // Shared tmp for Adam's g² step — sized to the largest param tensor.
+    let tmp_g2: i32 = arr_f64_new(N_HID * FLAT);
+
+    // Scratch / activation buffers.
+    let x:      i32 = arr_f64_new(784);           // input 28×28
+    let conv_o: i32 = arr_f64_new(C_OUT * 784);    // conv output 8×28×28
+    let pool_o: i32 = arr_f64_new(FLAT);           // pool output flattened
+    let pool_a: i32 = arr_f64_new(FLAT);           // argmax per pool cell
+    let hid:    i32 = arr_f64_new(N_HID);          // FC1 output (post-ReLU)
+    let y_out:  i32 = arr_f64_new(N_OUT);
+    let t_lbl:  i32 = arr_f64_new(N_OUT);
+    let dy:     i32 = arr_f64_new(N_OUT);
+    let dhid:   i32 = arr_f64_new(N_HID);          // grad wrt FC1 output
+    let dpool:  i32 = arr_f64_new(FLAT);           // grad wrt pool output
+    let dconv:  i32 = arr_f64_new(C_OUT * 784);    // grad wrt conv output (pre-ReLU)
+
+    // Conv scratch.
+    let im2col_rows: i32 = conv.conv2d_alloc_im2col();   // 9 handles of 784-f64 bufs
+    let padded: i32 = arr_f64_new(900);                  // 30×30 padded input for AVX2 builtin
+
+    // AdamW hyperparameters.
+    let lr_max: f64 = 0.001;
+    let lr_min: f64 = 0.00001;
+    let beta1:  f64 = 0.9;
+    let beta2:  f64 = 0.999;
+    let eps:    f64 = 0.00000001;
+    let wd:     f64 = 0.001;
+    let alpha_smooth: f64 = 0.05;
+    let pi:     f64 = 3.14159265358979;
+
+    let N_BATCH: i32 = 64;
+    let N_EPOCH: i32 = 10;
+
+    // ------------------------------------------------------------
+    // Parallel-eval setup — allocated ONCE, reused every epoch.
+    // ------------------------------------------------------------
+    // N_TEST = 10 000 splits evenly into 4 workers of 2500 each.  If
+    // you retune this, make sure N_WORKERS divides N_TEST cleanly or
+    // handle the tail.
+    let N_WORKERS:  i32 = 4;
+    let correct_ctr: i32 = arr_new(1);
+    let done_ctr:    i32 = arr_new(1);
+
+    // Build one descriptor per worker with its own scratch buffers.
+    // Shared pointers (weights, dataset) and atomic counters are
+    // duplicated across descriptors but point at the same memory.
+    let worker_descs: i32 = arr_new(N_WORKERS);
+    let wi: i32 = 0;
+    while (wi < N_WORKERS) {
+        let d: i32 = arr_new(19);
+        arr_set(d,  0, W_conv); arr_set(d,  1, b_conv);
+        arr_set(d,  2, W_fc1);  arr_set(d,  3, b_fc1);
+        arr_set(d,  4, W_fc2);  arr_set(d,  5, b_fc2);
+        arr_set(d,  6, test_img_buf);
+        arr_set(d,  7, test_lbl_buf);
+        arr_set(d,  8, arr_f64_new(784));
+        arr_set(d,  9, arr_f64_new(C_OUT * 784));
+        arr_set(d, 10, arr_f64_new(FLAT));
+        arr_set(d, 11, arr_f64_new(FLAT));
+        arr_set(d, 12, arr_f64_new(N_HID));
+        arr_set(d, 13, arr_f64_new(N_OUT));
+        arr_set(d, 14, arr_f64_new(900));
+        arr_set(d, 17, correct_ctr);
+        arr_set(d, 18, done_ctr);
+        arr_set(worker_descs, wi, d);
+        wi += 1;
+    }
+    let per_worker: i32 = N_TEST / N_WORKERS;
+
+    let t: i32 = 0;
+    let epoch: i32 = 0;
+    while (epoch < N_EPOCH) {
+        let frac: f64 = int_to_float(epoch) / int_to_float(N_EPOCH);
+        let lr: f64 = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math_cos(pi * frac));
+
+        let loss_sum: f64 = 0.0;
+        let s: i32 = 0;
+        while (s < N_TRAIN) {
+            zero_buf(dW_conv); zero_buf(db_conv);
+            zero_buf(dW_fc1);  zero_buf(db_fc1);
+            zero_buf(dW_fc2);  zero_buf(db_fc2);
+
+            let batch_end: i32 = s + N_BATCH;
+            if (batch_end > N_TRAIN) { batch_end = N_TRAIN; }
+            let batch_size: i32 = batch_end - s;
+
+            let si: i32 = s;
+            while (si < batch_end) {
+                load_image_at(train_img_buf, 16 + si * 784, x);
+                let lbl: i32 = byte_at(train_lbl_buf, 8 + si);
+                one_hot_smooth(lbl, t_lbl, N_OUT, alpha_smooth);
+
+                // ── Forward ──
+                // im2col is built here because backward_weights needs it;
+                // the forward path itself goes through the AVX2 builtin.
+                conv.conv2d_im2col(x, im2col_rows);
+                conv.conv2d_forward(x, W_conv, b_conv, conv_o, padded, C_OUT);
+                arr_f64_relu(conv_o);
+                conv.maxpool_2x2_forward(conv_o, pool_o, pool_a, C_OUT);
+                dense.dense_forward(W_fc1, b_fc1, pool_o, hid, FLAT, N_HID);
+                arr_f64_relu(hid);
+                dense.dense_forward(W_fc2, b_fc2, hid, y_out, N_HID, N_OUT);
+                arr_f64_softmax(y_out);
+
+                loss_sum = loss_sum - math_log(arr_f64_get(y_out, lbl) + 0.000000000001);
+
+                // ── Backward ──
+                loss.xent_backward(y_out, t_lbl, dy);
+                dense.dense_backward(W_fc2, hid, dy, dhid, dW_fc2, db_fc2);
+                dense.dense_backward_relu(hid, dhid, N_HID);
+                dense.dense_backward(W_fc1, pool_o, dhid, dpool, dW_fc1, db_fc1);
+                conv.maxpool_2x2_backward(dpool, pool_a, dconv, C_OUT);
+                dense.dense_backward_relu(conv_o, dconv, C_OUT * 784);
+                conv.conv2d_backward_weights(dconv, im2col_rows, dW_conv, db_conv, C_OUT);
+
+                si += 1;
+            }
+
+            // Mean gradient over the batch.
+            let scale_inv: f64 = 1.0 / int_to_float(batch_size);
+            arr_f64_scale(dW_conv, scale_inv);
+            arr_f64_scale(db_conv, scale_inv);
+            arr_f64_scale(dW_fc1,  scale_inv);
+            arr_f64_scale(db_fc1,  scale_inv);
+            arr_f64_scale(dW_fc2,  scale_inv);
+            arr_f64_scale(db_fc2,  scale_inv);
+
+            t += 1;
+
+            opt.adam_update_moments(dW_conv, mW_conv, vW_conv, tmp_g2, beta1, beta2);
+            opt.adam_update_moments(db_conv, mb_conv, vb_conv, tmp_g2, beta1, beta2);
+            opt.adam_update_moments(dW_fc1,  mW_fc1,  vW_fc1,  tmp_g2, beta1, beta2);
+            opt.adam_update_moments(db_fc1,  mb_fc1,  vb_fc1,  tmp_g2, beta1, beta2);
+            opt.adam_update_moments(dW_fc2,  mW_fc2,  vW_fc2,  tmp_g2, beta1, beta2);
+            opt.adam_update_moments(db_fc2,  mb_fc2,  vb_fc2,  tmp_g2, beta1, beta2);
+
+            let bc1: f64 = 1.0 - mo.math_pow_int(beta1, t);
+            let bc2: f64 = 1.0 - mo.math_pow_int(beta2, t);
+            let sqrt_bc2: f64 = math_sqrt(bc2);
+            let lr_final:  f64 = lr  * sqrt_bc2 / bc1;
+            let eps_final: f64 = eps * sqrt_bc2;
+
+            // AdamW decoupled weight decay (weights only).
+            let wd_factor: f64 = 1.0 - lr * wd;
+            arr_f64_scale(W_conv, wd_factor);
+            arr_f64_scale(W_fc1,  wd_factor);
+            arr_f64_scale(W_fc2,  wd_factor);
+
+            opt.adam_apply_fast(W_conv, mW_conv, vW_conv, lr_final, eps_final);
+            opt.adam_apply_fast(b_conv, mb_conv, vb_conv, lr_final, eps_final);
+            opt.adam_apply_fast(W_fc1,  mW_fc1,  vW_fc1,  lr_final, eps_final);
+            opt.adam_apply_fast(b_fc1,  mb_fc1,  vb_fc1,  lr_final, eps_final);
+            opt.adam_apply_fast(W_fc2,  mW_fc2,  vW_fc2,  lr_final, eps_final);
+            opt.adam_apply_fast(b_fc2,  mb_fc2,  vb_fc2,  lr_final, eps_final);
+
+            s = batch_end;
+        }
+        print_str("epoch done, avg train NLL:");
+        print_f64(loss_sum / int_to_float(N_TRAIN), 4);
+
+        // Parallel eval: fan out to N_WORKERS threads, spin-wait, tally.
+        arr_set(correct_ctr, 0, 0);
+        arr_set(done_ctr,    0, 0);
+        let w: i32 = 0;
+        while (w < N_WORKERS) {
+            let d: i32 = arr_get(worker_descs, w);
+            arr_set(d, 15, w * per_worker);
+            arr_set(d, 16, (w + 1) * per_worker);
+            let tid: i32 = thread_spawn(eval_worker, d);
+            w += 1;
+        }
+        while (arr_get(done_ctr, 0) < N_WORKERS) {
+            let pause: i32 = 0;
+            while (pause < 1000) { pause = pause + 1; }
+        }
+        print_str("test accuracy:");
+        print_f64(int_to_float(arr_get(correct_ctr, 0)) / int_to_float(N_TEST), 4);
+
+        epoch += 1;
+    }
+
+    return 0;
+}
