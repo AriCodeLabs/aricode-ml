@@ -1,0 +1,50 @@
+// Single-threaded reference for parallel_matvec.ari — same M, K, iter
+// count, same arithmetic.  Run with `time ./serial_matvec` and compare
+// `real` against the parallel build to see the multicore speedup.
+
+fn matvec_all(W: i32, x: i32, y: i32, M: i32) -> i32 {
+    let iter: i32 = 0;
+    while (iter < 10000) {
+        let r: i32 = 0;
+        while (r < M) {
+            let dp: f64 = arr_f64_dot_range(W, r * 512, x, 0, 512);
+            arr_f64_set(y, r, dp);
+            r = r + 1;
+        }
+        iter = iter + 1;
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    let M: i32 = 512;
+    let K: i32 = 512;
+
+    let W: i32 = arr_f64_new(M * K);
+    let x: i32 = arr_f64_new(K);
+    let y: i32 = arr_f64_new(M);
+
+    let i: i32 = 0;
+    while (i < M * K) {
+        let fi: f64 = int_to_float(i % 997) / 997.0;
+        arr_f64_set(W, i, fi - 0.5);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < K) {
+        arr_f64_set(x, i, int_to_float(i % 31) / 31.0);
+        i = i + 1;
+    }
+
+    matvec_all(W, x, y, M);
+
+    let sum: f64 = 0.0;
+    i = 0;
+    while (i < M) {
+        sum = sum + arr_f64_get(y, i);
+        i = i + 1;
+    }
+    print_str("checksum:");
+    print_f64(sum, 6);
+    return 0;
+}

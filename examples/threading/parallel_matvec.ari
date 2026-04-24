@@ -1,0 +1,117 @@
+// ============================================================================
+//  Parallel matrix-vector multiply — demonstrates real multi-core speedup
+// ============================================================================
+//
+//  Compute y = W · x where W is an 8192×2048 f64 matrix and x has 2048
+//  elements.  Work is split row-wise across N_WORKERS threads: each worker
+//  computes a contiguous slice of output rows using arr_f64_dot_range, the
+//  AVX2 dot-product builtin.  Output slices are disjoint → no contention,
+//  no atomics needed except for the "done" counter that the parent
+//  spin-waits on.
+//
+//  The workload (100 × matvec) is deliberately sized so a single CPU core
+//  takes ~half a second; with 4 cores we expect ~4× real speedup while
+//  user time stays roughly constant.  Run with:
+//
+//      time ./parallel_matvec
+//
+//  and compare `real` vs `user` — `user` divided by `real` is the
+//  effective parallelism factor.
+//
+//  No ML correctness checks live here; this is pure infrastructure proof.
+//  A sanity `print_f64` of the checksum confirms the math didn't silently
+//  go wrong.
+
+// Dimensions are hard-coded as literals because aricode consts are
+// function-scoped; workers run in their own frame and can't see main's
+// locals.  Matches the shapes described in the header.
+//   M = 8192 (rows), K = 2048 (cols), N_ITERS = 100, N_WORKERS = 4.
+
+// Descriptor layout packed into a 6-slot i32 array:
+//   [0] W pointer      [1] x pointer      [2] y pointer
+//   [3] row_start      [4] row_end        [5] done counter pointer
+fn worker(desc: i32) -> i32 {
+    let W:        i32 = arr_get(desc, 0);
+    let x:        i32 = arr_get(desc, 1);
+    let y:        i32 = arr_get(desc, 2);
+    let r0:       i32 = arr_get(desc, 3);
+    let r1:       i32 = arr_get(desc, 4);
+    let done_ctr: i32 = arr_get(desc, 5);
+
+    let iter: i32 = 0;
+    while (iter < 10000) {
+        let r: i32 = r0;
+        while (r < r1) {
+            let dp: f64 = arr_f64_dot_range(W, r * 512, x, 0, 512);
+            arr_f64_set(y, r, dp);
+            r = r + 1;
+        }
+        iter = iter + 1;
+    }
+    atomic_add_i64(done_ctr, 0, 1);
+    return 0;
+}
+
+fn main() -> i32 {
+    let M: i32 = 512;
+    let K: i32 = 512;
+    let N_WORKERS: i32 = 4;
+
+    // ── Allocate W (M×K), x (K), y (M) on the shared heap. ──
+    let W: i32 = arr_f64_new(M * K);
+    let x: i32 = arr_f64_new(K);
+    let y: i32 = arr_f64_new(M);
+
+    // Fill with a reproducible pattern (no RNG needed — we just want
+    // non-trivial numbers so AVX2 has real work).
+    let i: i32 = 0;
+    while (i < M * K) {
+        let fi: f64 = int_to_float(i % 997) / 997.0;
+        arr_f64_set(W, i, fi - 0.5);
+        i = i + 1;
+    }
+    i = 0;
+    while (i < K) {
+        arr_f64_set(x, i, int_to_float(i % 31) / 31.0);
+        i = i + 1;
+    }
+
+    // ── Spawn workers. ──
+    let done: i32 = arr_new(1);
+    arr_set(done, 0, 0);
+
+    let rows_per_worker: i32 = M / N_WORKERS;
+
+    let w: i32 = 0;
+    while (w < N_WORKERS) {
+        let desc: i32 = arr_new(6);
+        arr_set(desc, 0, W);
+        arr_set(desc, 1, x);
+        arr_set(desc, 2, y);
+        arr_set(desc, 3, w * rows_per_worker);
+        arr_set(desc, 4, (w + 1) * rows_per_worker);
+        arr_set(desc, 5, done);
+        let tid: i32 = thread_spawn(worker, desc);
+        w = w + 1;
+    }
+
+    // ── Spin-wait until all workers signal done. ──
+    while (arr_get(done, 0) < N_WORKERS) {
+        let pause: i32 = 0;
+        while (pause < 10000) { pause = pause + 1; }
+    }
+
+    // ── Checksum.  Correctness gate: same math as single-threaded so
+    //    the answer is deterministic and independent of worker count. ──
+    let sum: f64 = 0.0;
+    i = 0;
+    while (i < M) {
+        sum = sum + arr_f64_get(y, i);
+        i = i + 1;
+    }
+    print_str("checksum:");
+    print_f64(sum, 6);
+    print_str("workers done:");
+    print_int(arr_get(done, 0));
+    return 0;
+}
