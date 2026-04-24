@@ -61,6 +61,45 @@ fn conv2d_forward(input: i32, weights: i32, bias: i32,
 }
 
 // ---------------------------------------------------------------------
+// conv2d_pad_28_to_30_multi: pad a multi-channel 28×28 tensor into
+// a [C_in, 30, 30] layout with zero borders per channel.
+// C_in is derived from arr_len(input) / 784 so the signature stays
+// inside aricode's 6-argument limit when wrapped by callers.
+// ---------------------------------------------------------------------
+fn conv2d_pad_28_to_30_multi(input: i32, padded: i32) -> i32 {
+    arr_f64_fill(padded, 0.0);                       // zero whole padded buffer
+    let C_in: i32 = arr_len(input) / 784;
+    let c: i32 = 0;
+    while (c < C_in) {
+        let in_base: i32 = c * 784;
+        let pad_base: i32 = c * 900;
+        let y: i32 = 0;
+        while (y < 28) {
+            arr_f64_copy_slice(input, in_base + y * 28,
+                               padded, pad_base + (y + 1) * 30 + 1,
+                               28);
+            y += 1;
+        }
+        c += 1;
+    }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// conv2d_forward_multi: pad (multi-channel) + AVX2 compiler builtin.
+// Feed this after a conv1 + ReLU to build a stacked CNN — both
+// layers use the same kernel-3 / pad-1 / stride-1 geometry.  C_in
+// is derived from the input length (C_in · 784).
+// ---------------------------------------------------------------------
+fn conv2d_forward_multi(input: i32, weights: i32, bias: i32,
+                        output: i32, padded: i32, C_out: i32) -> i32 {
+    conv2d_pad_28_to_30_multi(input, padded);
+    let C_in: i32 = arr_len(input) / 784;
+    arr_f64_conv2d_3x3_p1_multi(padded, C_in, weights, bias, output, C_out);
+    return 0;
+}
+
+// ---------------------------------------------------------------------
 // Allocate the 9 per-row im2col buffers.  Caller stores the returned
 // handle array and passes it to im2col / forward / backward.
 // ---------------------------------------------------------------------
