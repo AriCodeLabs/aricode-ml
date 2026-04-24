@@ -24,11 +24,11 @@
 // i32 handle array (im2col_rows[0..9]) and unpacked via arr_get.
 
 // ---------------------------------------------------------------------
-// Zero-pad a 28×28 input (784 elements) into a 30×30 buffer (900
-// elements) with zero borders.  Required by the AVX2 builtin
-// `arr_f64_conv2d_3x3_p1` which assumes pre-padded input.  Scalar
-// code here — padding is a small, bandwidth-bound copy, not a compute
-// bottleneck in the CNN forward pass.
+// conv2d_pad_28_to_30: zero-pad a single 28×28 input (784 elements)
+// into a 30×30 buffer (900 elements).  Used internally by the
+// single-channel `conv2d_forward`; exposed in case a caller wants to
+// amortise padding across multiple kernel applications on the same
+// input.  See `conv2d_pad_28_to_30_multi` for the C_in > 1 variant.
 // ---------------------------------------------------------------------
 fn conv2d_pad_28_to_30(input: i32, padded: i32) -> i32 {
     let i: i32 = 0;
@@ -156,6 +156,67 @@ fn conv2d_im2col(input: i32, im2col_rows: i32) -> i32 {
         }
         k += 1;
     }
+    return 0;
+}
+
+// ---------------------------------------------------------------------
+// conv2d_backward_input_multi: gradient of loss wrt conv input for a
+// multi-channel 3×3 / pad 1 / stride 1 conv layer.
+//
+//   dinput[c_in, p, q] = Σ_{c_out, ky, kx}  dout[c_out, p+ky-1, q+kx-1]
+//                                           · W[c_out, c_in, 2-ky, 2-kx]
+//
+// This is the math of a *transposed convolution*, which is just a
+// forward convolution with the kernel flipped on both spatial axes
+// and the in/out channel axes swapped.  So we reuse the existing
+// `arr_f64_conv2d_3x3_p1_multi` builtin at the price of:
+//   1. A scalar pass that writes weights_flipped[c_in, c_out, ky, kx]
+//      = weights[c_out, c_in, 2-ky, 2-kx].  Cheap: 9·C_in·C_out scalar
+//      stores, far smaller than the 196·C_in·C_out FMA accumulators
+//      the forward kernel does.
+//   2. Padding dout (size [C_out, 30, 30]) via conv2d_pad_28_to_30_multi.
+//   3. A zero bias vector (dinput must not inherit a bias offset).
+//
+// Signatures fit 6 args because C_out is inferred from
+// arr_len(dout) / 784; caller supplies the scratch buffers.
+// ---------------------------------------------------------------------
+fn conv2d_backward_input_multi(dout: i32, weights: i32, dinput: i32,
+                               padded_dout: i32, weights_flipped: i32,
+                               C_in: i32) -> i32 {
+    let C_out: i32 = arr_len(dout) / 784;
+
+    // (1) Flip the kernel and transpose the channel axes.
+    let c_out: i32 = 0;
+    while (c_out < C_out) {
+        let c_in: i32 = 0;
+        while (c_in < C_in) {
+            let ky: i32 = 0;
+            while (ky < 3) {
+                let kx: i32 = 0;
+                while (kx < 3) {
+                    let src: i32 = c_out * C_in * 9 + c_in * 9 + ky * 3 + kx;
+                    let dst: i32 = c_in * C_out * 9 + c_out * 9
+                                 + (2 - ky) * 3 + (2 - kx);
+                    arr_f64_set(weights_flipped, dst, arr_f64_get(weights, src));
+                    kx += 1;
+                }
+                ky += 1;
+            }
+            c_in += 1;
+        }
+        c_out += 1;
+    }
+
+    // (2) Pad dout to [C_out, 30, 30].  Multi-channel helper infers
+    //     its own C_in from arr_len(dout).
+    conv2d_pad_28_to_30_multi(dout, padded_dout);
+
+    // (3) Transpose-conv is a forward-conv with C_out→C_in direction.
+    //     Zero bias so dinput = pure convolution result.  arr_f64_new
+    //     already zero-initialises.
+    let zero_bias: i32 = arr_f64_new(C_in);
+    arr_f64_conv2d_3x3_p1_multi(padded_dout, C_out, weights_flipped,
+                                zero_bias, dinput, C_in);
     return 0;
 }
 
