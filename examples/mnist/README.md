@@ -8,13 +8,14 @@ Two variants ship side-by-side.  Same architecture, different
 optimisers + preprocessing — pick whichever makes the point you
 need.
 
-| Variant            | Architecture                     | Preprocessing                       | Optimiser                  | Epochs | Final acc |
-|--------------------|----------------------------------|-------------------------------------|----------------------------|-------:|-----------|
-| `mnist.ari`        | MLP 784 → 128 → 10               | `px / 255` ([0, 1])                 | SGD + lr decay 0.85        |    10  | 97.15 %   |
-| `mnist_adam.ari`   | MLP 784 → 256 → 10               | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    20  | 98.61 %   |
-| `mnist_cnn.ari`    | Conv8 → Pool → FC 1568→64 → 10   | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    10  | **98.66 %** |
+| Variant            | Architecture                                     | Preprocessing                       | Optimiser                  | Epochs | Final acc |
+|--------------------|--------------------------------------------------|-------------------------------------|----------------------------|-------:|-----------|
+| `mnist.ari`        | MLP 784 → 128 → 10                               | `px / 255` ([0, 1])                 | SGD + lr decay 0.85        |    10  | 97.15 %   |
+| `mnist_adam.ari`   | MLP 784 → 256 → 10                               | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    20  | 98.61 %   |
+| `mnist_cnn.ari`    | Conv8 → Pool → FC 1568→64 → 10                   | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    10  | **98.66 %** |
+| `mnist_lenet.ari`  | Conv8 → Conv16 → Pool → FC 3136→64 → 10          | `(px / 255 − 0.1307) / 0.3081`      | AdamW + smoothing + cosine |    10  | 98.60 %   |
 
-## Architecture (both variants)
+## Architecture (all variants)
 
 - **Input**: 28×28 grayscale
 - **Hidden**: ReLU activation, He init (size varies — see table above)
@@ -107,6 +108,37 @@ Trajectory (hyperparameters identical to `mnist_adam.ari`):
 budget and with ~2× fewer parameters (101 K vs 203 K).  Still a
 gentle upward slope at epoch 10 — more epochs or a wider conv (16
 channels, or two stacked conv layers) would push toward 99 %.
+
+## `mnist_lenet.ari` — stacked 2-conv CNN
+
+First demo to exercise the full multi-channel convolution path:
+
+- **Conv1**: 1 → 8 ch, 3 × 3, pad 1  → 8 × 28 × 28
+- **ReLU**
+- **Conv2**: 8 → 16 ch, 3 × 3, pad 1  → 16 × 28 × 28   (multi-channel builtin)
+- **ReLU**
+- **MaxPool 2 × 2** → 16 × 14 × 14  (= 3136 flat)
+- **FC1**: 3136 → 64 + ReLU
+- **FC2**: 64 → 10
+
+Forward uses `arr_f64_conv2d_3x3_p1` for the first layer and
+`arr_f64_conv2d_3x3_p1_multi` for the second.  Backward runs the
+standard single-channel weight gradient on conv1, the multi-channel
+weight gradient on conv2, and — critically — the transpose-conv
+input gradient from conv2 back into conv1 so conv1 trains too.
+
+| Epoch | train NLL | test acc |
+|-------|-----------|----------|
+|   1   | 0.2695    | 96.97 %  |
+|   5   | 0.1100    | 98.27 %  |
+|  10   | 0.0935    | **98.60 %** |
+
+440 s wall-clock, ~202 K parameters.  Comparable accuracy to
+`mnist_cnn.ari` at the same 10-epoch budget; the point of this
+demo is to exercise the full multi-channel forward / backward stack
+end-to-end, not to set a MNIST record.  Data augmentation or more
+epochs with a retuned lr schedule are the natural next steps toward
+99 %+.
 
 ## Notes
 
