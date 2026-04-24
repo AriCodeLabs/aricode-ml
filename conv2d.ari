@@ -124,29 +124,25 @@ fn conv2d_im2col(input: i32, im2col_rows: i32) -> i32 {
 // conv2d_backward_weights:  dW[c, k] = dout[c, :] · im2col_rows[k]
 //                           db[c]    = Σⱼ dout[c, j]
 //
-// We need a per-channel slice of dout for arr_f64_dot / arr_f64_sum.
-// To avoid pointer slicing (aricode has no views), the caller passes
-// a 784-long scratch buffer into which we copy dout[c, :] once per
-// channel and then run the AVX2 reductions.
+// Reads dout's per-channel slice directly via AVX2
+// arr_f64_sum_range / arr_f64_dot_range — no scratch buffer needed.
 // ---------------------------------------------------------------------
 fn conv2d_backward_weights(dout: i32, im2col_rows: i32, dweights: i32,
-                           dbias: i32, scratch: i32, C_out: i32) -> i32 {
+                           dbias: i32, C_out: i32) -> i32 {
     let c: i32 = 0;
     while (c < C_out) {
         let dw_off: i32 = c * 9;
+        let dout_off: i32 = c * 784;
 
-        // scratch ← dout[c, :]  — AVX2 vmovupd copy (4× faster than
-        // the scalar get/set loop this replaced).
-        arr_f64_copy_at(dout, c * 784, scratch);
+        // db[c] = Σⱼ dout[c, j]
+        arr_f64_set(dbias, c, arr_f64_sum_range(dout, dout_off, 784));
 
-        // db[c] = Σⱼ scratch[j]     (AVX2 arr_f64_sum)
-        arr_f64_set(dbias, c, arr_f64_sum(scratch));
-
-        // dW[c, k] = dot(scratch, im2col_rows[k])    (AVX2 arr_f64_dot)
+        // dW[c, k] = Σⱼ dout[c, j] · im2col_rows[k][j]
         let k: i32 = 0;
         while (k < 9) {
             let row: i32 = arr_get(im2col_rows, k);
-            arr_f64_set(dweights, dw_off + k, arr_f64_dot(scratch, row));
+            arr_f64_set(dweights, dw_off + k,
+                        arr_f64_dot_range(dout, dout_off, row, 0, 784));
             k += 1;
         }
         c += 1;

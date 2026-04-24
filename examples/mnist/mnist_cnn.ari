@@ -167,7 +167,6 @@ fn main() -> i32 {
 
     // Conv scratch.
     let im2col_rows: i32 = conv.conv2d_alloc_im2col();   // 9 handles of 784-f64 bufs
-    let conv_scratch: i32 = arr_f64_new(784);
     let padded: i32 = arr_f64_new(900);                  // 30×30 padded input for AVX2 builtin
 
     // AdamW hyperparameters.
@@ -227,8 +226,7 @@ fn main() -> i32 {
                 dense.dense_backward(W_fc1, pool_o, dhid, dpool, dW_fc1, db_fc1);
                 conv.maxpool_2x2_backward(dpool, pool_a, dconv, C_OUT);
                 dense.dense_backward_relu(conv_o, dconv, C_OUT * 784);
-                conv.conv2d_backward_weights(dconv, im2col_rows, dW_conv, db_conv,
-                                             conv_scratch, C_OUT);
+                conv.conv2d_backward_weights(dconv, im2col_rows, dW_conv, db_conv, C_OUT);
 
                 si += 1;
             }
