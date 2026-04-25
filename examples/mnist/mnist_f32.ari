@@ -1,0 +1,242 @@
+// aricode-ml: examples/mnist/mnist_f32.ari
+//
+// Same 784 → 128 → 10 SGD MLP as mnist.ari, but every weight, grad,
+// activation and intermediate runs in single precision.  All twelve
+// of today's f32 builtins (matvec / matvec_T / outer_accum / relu /
+// add_scaled / scale / fill / sum / dot / new / get / set) are
+// exercised end-to-end.
+//
+// softmax + cross-entropy backward + ReLU backward stay in user-space
+// scalar code (small per-call cost — 10 elements for softmax, 128 for
+// ReLU backward).  AdamW + AVX2 softmax in f32 are Phase A.5.
+
+fn load_file(path_str: i32, byte_count: i32) -> i32 {
+    let slots: i32 = (byte_count + 7) / 8;
+    let buf: i32 = arr_new(slots);
+    let fd: i32 = file_open(path_str, 0);
+    file_read(fd, buf, byte_count);
+    file_close(fd);
+    return buf;
+}
+
+fn load_image_at(img_buf: i32, offset: i32, out: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 784) {
+        let px: i32 = byte_at(img_buf, offset + i);
+        arr_f32_set(out, i, int_to_float(px) / 255.0);
+        i += 1;
+    }
+    return 0;
+}
+
+fn one_hot(label: i32, out: i32, n: i32) -> i32 {
+    arr_f32_fill(out, 0.0);
+    arr_f32_set(out, label, 1.0);
+    return 0;
+}
+
+fn argmax_f32(buf: i32, n: i32) -> i32 {
+    let best_i: i32 = 0;
+    let best_v: f64 = arr_f32_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f32_get(buf, i);
+        if (v > best_v) { best_v = v; best_i = i; }
+        i += 1;
+    }
+    return best_i;
+}
+
+// He-style init.  RNG accumulator stays in i32 LCG; values written
+// as f32 via the standard f64-arg arr_f32_set boundary.
+fn init_weights_f32(buf: i32, fan_in: i32, seed_i: i32) -> i32 {
+    let s: i32 = seed_i;
+    let scale: f64 = math_sqrt(2.0 / int_to_float(fan_in));
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        let r: f64 = int_to_float((s / 65536) - ((s / 65536) / 32768) * 32768);
+        arr_f32_set(buf, i, (r / 32768.0 - 0.5) * 2.0 * scale);
+        i += 1;
+    }
+    return 0;
+}
+
+// Stable softmax: subtract max, exp, normalise.  10 elements per call
+// for MNIST output → user-space scalar overhead is ~30 µs/call.
+fn softmax_f32(buf: i32) -> i32 {
+    let n: i32 = arr_len(buf);
+    let m: f64 = arr_f32_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f32_get(buf, i);
+        if (v > m) { m = v; }
+        i += 1;
+    }
+    let s: f64 = 0.0;
+    i = 0;
+    while (i < n) {
+        let e: f64 = math_exp(arr_f32_get(buf, i) - m);
+        arr_f32_set(buf, i, e);
+        s = s + e;
+        i += 1;
+    }
+    arr_f32_scale(buf, 1.0 / s);
+    return 0;
+}
+
+// Fused softmax + cross-entropy backward: dL/dy = y - t  (both f32).
+fn xent_backward_f32(y: i32, t: i32, dy: i32) -> i32 {
+    let n: i32 = arr_len(y);
+    let i: i32 = 0;
+    while (i < n) {
+        arr_f32_set(dy, i, arr_f32_get(y, i) - arr_f32_get(t, i));
+        i += 1;
+    }
+    return 0;
+}
+
+// In-place ReLU backward: zero out gradient where the forward output
+// was non-positive (post-ReLU, so equivalent to pre-ReLU < 0).
+fn relu_backward_f32(post_relu: i32, dh: i32, n: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < n) {
+        if (arr_f32_get(post_relu, i) <= 0.0) {
+            arr_f32_set(dh, i, 0.0);
+        }
+        i += 1;
+    }
+    return 0;
+}
+
+// Dense layer backward: dx (optional, pass 0 to skip) + dW + db.
+// Mirrors the f64 dense_backward in the stdlib.  6 args is the
+// aricode max.
+fn dense_backward_f32(W: i32, input: i32,
+                      dy: i32, dx: i32,
+                      dW: i32, db: i32) -> i32 {
+    let n_in:  i32 = arr_len(input);
+    let n_out: i32 = arr_len(dy);
+    if (dx != 0) {
+        arr_f32_matvec_T(W, dy, dx, n_out, n_in);
+    }
+    arr_f32_outer_accum(dW, dy, input, n_out, n_in);
+    arr_f32_add_scaled(db, dy, 1.0);
+    return 0;
+}
+
+fn main() -> i32 {
+    let N_TRAIN: i32 = 60000;
+    let N_TEST:  i32 = 10000;
+
+    let img_path:   i32 = str_new("train-images-idx3-ubyte");
+    let lbl_path:   i32 = str_new("train-labels-idx1-ubyte");
+    let t_img_path: i32 = str_new("t10k-images-idx3-ubyte");
+    let t_lbl_path: i32 = str_new("t10k-labels-idx1-ubyte");
+
+    let train_img_buf: i32 = load_file(img_path,   N_TRAIN * 784 + 16);
+    let train_lbl_buf: i32 = load_file(lbl_path,   N_TRAIN + 8);
+    let test_img_buf:  i32 = load_file(t_img_path, N_TEST  * 784 + 16);
+    let test_lbl_buf:  i32 = load_file(t_lbl_path, N_TEST  + 8);
+
+    print_str("Loaded MNIST (f32 SGD MLP).");
+
+    let N_IN:  i32 = 784;
+    let N_H:   i32 = 128;
+    let N_OUT: i32 = 10;
+
+    let W1: i32 = arr_f32_new(N_H  * N_IN);
+    let b1: i32 = arr_f32_new(N_H);
+    let W2: i32 = arr_f32_new(N_OUT * N_H);
+    let b2: i32 = arr_f32_new(N_OUT);
+    init_weights_f32(W1, N_IN, 12345);
+    init_weights_f32(W2, N_H,  67890);
+    arr_f32_fill(b1, 0.0);
+    arr_f32_fill(b2, 0.0);
+
+    let x:  i32 = arr_f32_new(N_IN);
+    let h:  i32 = arr_f32_new(N_H);
+    let y:  i32 = arr_f32_new(N_OUT);
+    let t:  i32 = arr_f32_new(N_OUT);
+    let dy: i32 = arr_f32_new(N_OUT);
+    let dh: i32 = arr_f32_new(N_H);
+
+    let dW1: i32 = arr_f32_new(N_H  * N_IN);
+    let db1: i32 = arr_f32_new(N_H);
+    let dW2: i32 = arr_f32_new(N_OUT * N_H);
+    let db2: i32 = arr_f32_new(N_OUT);
+
+    let lr: f64 = 0.1;
+    let lr_decay: f64 = 0.85;
+    let N_BATCH: i32 = 64;
+    let N_EPOCH: i32 = 10;
+
+    let epoch: i32 = 0;
+    while (epoch < N_EPOCH) {
+        let loss_sum: f64 = 0.0;
+        let s: i32 = 0;
+        while (s < N_TRAIN) {
+            arr_f32_fill(dW1, 0.0); arr_f32_fill(db1, 0.0);
+            arr_f32_fill(dW2, 0.0); arr_f32_fill(db2, 0.0);
+
+            let batch_end: i32 = s + N_BATCH;
+            if (batch_end > N_TRAIN) { batch_end = N_TRAIN; }
+            let batch_size: i32 = batch_end - s;
+
+            let si: i32 = s;
+            while (si < batch_end) {
+                load_image_at(train_img_buf, 16 + si * 784, x);
+                let lbl: i32 = byte_at(train_lbl_buf, 8 + si);
+                one_hot(lbl, t, N_OUT);
+
+                // Forward
+                arr_f32_matvec(W1, x, b1, h, N_H, N_IN);
+                arr_f32_relu(h);
+                arr_f32_matvec(W2, h, b2, y, N_OUT, N_H);
+                softmax_f32(y);
+
+                loss_sum = loss_sum - math_log(arr_f32_get(y, lbl) + 0.000000000001);
+
+                // Backward
+                xent_backward_f32(y, t, dy);
+                dense_backward_f32(W2, h, dy, dh, dW2, db2);
+                relu_backward_f32(h, dh, N_H);
+                dense_backward_f32(W1, x, dh, 0, dW1, db1);
+
+                si += 1;
+            }
+
+            // SGD update: W -= (lr/batch) · dW
+            let neg_eff_lr: f64 = 0.0 - (lr / int_to_float(batch_size));
+            arr_f32_add_scaled(W1, dW1, neg_eff_lr);
+            arr_f32_add_scaled(b1, db1, neg_eff_lr);
+            arr_f32_add_scaled(W2, dW2, neg_eff_lr);
+            arr_f32_add_scaled(b2, db2, neg_eff_lr);
+
+            s = batch_end;
+        }
+        print_str("epoch done, avg train NLL:");
+        print_f64(loss_sum / int_to_float(N_TRAIN), 4);
+
+        let correct: i32 = 0;
+        let i: i32 = 0;
+        while (i < N_TEST) {
+            load_image_at(test_img_buf, 16 + i * 784, x);
+            let lbl: i32 = byte_at(test_lbl_buf, 8 + i);
+            arr_f32_matvec(W1, x, b1, h, N_H, N_IN);
+            arr_f32_relu(h);
+            arr_f32_matvec(W2, h, b2, y, N_OUT, N_H);
+            softmax_f32(y);
+            if (argmax_f32(y, N_OUT) == lbl) { correct += 1; }
+            i += 1;
+        }
+        print_str("test accuracy:");
+        print_f64(int_to_float(correct) / int_to_float(N_TEST), 4);
+
+        lr = lr * lr_decay;
+        epoch += 1;
+    }
+
+    return 0;
+}
