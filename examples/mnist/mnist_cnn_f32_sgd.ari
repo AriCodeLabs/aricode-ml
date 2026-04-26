@@ -4,13 +4,13 @@
 // Architecture: 1 → 8 ch conv (3×3 pad 1) + ReLU + 2×2 maxpool +
 // FC 1568 → 64 + ReLU + FC 64 → 10 + softmax + xent.
 //
-// Test trajectory on Ryzen 7 5800X:
-//   epoch 1:  94.82 %    (NLL 0.3628)
-//   epoch 5:  97.60 %    (NLL 0.1283)
-//   epoch 10: 98.22 %    (NLL 0.1095)   ← final
-//   wall:     ~2m47s     (conv backward weights uses scalar dot
-//                         loops; arr_f32_dot_range AVX2 builtin
-//                         would cut this to ~30 s — Phase A.8 work)
+// Test trajectory on Ryzen 7 5800X (after arr_f32_dot_range AVX2):
+//   epoch 1:  94.82 %    (NLL 0.36)
+//   epoch 5:  97.60 %    (NLL 0.13)
+//   epoch 10: 98.24 %    (NLL 0.11)   ← final
+//   wall:     ~1m16 s    (down from 2m47 s pre-dot_range; the
+//                         conv2d_backward_weights_f32 loop went from
+//                         scalar to AVX2 8-lane vfmadd231ps)
 //
 // Companion file: mnist_cnn_f32.ari (AdamW variant) currently
 // diverges to NLL ≈ -2127 / acc 9.8 % — the bug is somewhere in

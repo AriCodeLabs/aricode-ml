@@ -103,7 +103,13 @@ fn conv2d_backward_weights_f32(dout: i32, im2col_rows: i32, dweights: i32,
         let dw_off: i32 = c * 9;
         let dout_off: i32 = c * 784;
 
-        // db[c] = Σⱼ dout[c, j]  — scalar accumulator over 784.
+        // db[c] = Σⱼ dout[c, j]  — AVX2 dot_range with all-ones is just sum,
+        // so use dot_range against the constant-1 row.  We don't have an
+        // arr_f32_sum_range yet; emulate via dot_range against im2col_rows[k=4]
+        // (the centre row, which equals the input itself when ky=kx=1) — wait,
+        // not all-ones.  Fall back to a scalar loop here; cost is 784 scalar
+        // adds per channel × 8 channels per sample = 6272 ops, negligible vs
+        // 9 × 784-element dot products.
         let bsum: f64 = 0.0;
         let j: i32 = 0;
         while (j < 784) {
@@ -112,16 +118,13 @@ fn conv2d_backward_weights_f32(dout: i32, im2col_rows: i32, dweights: i32,
         }
         arr_f32_set(dbias, c, bsum);
 
-        // dW[c, k] = Σⱼ dout[c, j] · im2col_rows[k][j]
+        // dW[c, k] = Σⱼ dout[c, j] · im2col_rows[k][j]   — AVX2 dot_range
+        // covers the 784-wide reduction with 8-lane vfmadd231ps, replacing
+        // the previous scalar loop that dominated training time.
         let k: i32 = 0;
         while (k < 9) {
             let row: i32 = arr_get(im2col_rows, k);
-            let dp: f64 = 0.0;
-            j = 0;
-            while (j < 784) {
-                dp = dp + arr_f32_get(dout, dout_off + j) * arr_f32_get(row, j);
-                j += 1;
-            }
+            let dp: f64 = arr_f32_dot_range(dout, dout_off, row, 0, 784);
             arr_f32_set(dweights, dw_off + k, dp);
             k += 1;
         }
