@@ -269,6 +269,36 @@ def gen_main(arch, args, out_name, embed_dir):
     body += load
     body += act_decls
     body.append("")
+
+    if args.input_format == "stdin":
+        # Single-shot CLI: read n_in raw bytes from stdin, run one forward
+        # pass, print the predicted class to stdout.  No batch loop, no
+        # external image files — the binary is fully self-contained.
+        slots = (n_in + 7) // 8
+        body.append(f"    let inbuf: i32 = arr_new({slots});")
+        body.append(f"    file_read(0, inbuf, {n_in});")
+        body.append("    let i: i32 = 0;")
+        body.append(f"    while (i < {n_in}) {{")
+        body.append("        let px: i32 = byte_at(inbuf, i);")
+        body.append(f"        arr_f32_set(a0, i, (int_to_float(px) / 255.0 - {args.mean}) / {args.std});")
+        body.append("        i = i + 1;")
+        body.append("    }")
+        body += [("    " + l.lstrip()) for l in fwd]
+        if not args.no_argmax:
+            body.append(f"    print_int(argmax_f32(a{last}, {n_out}));")
+        else:
+            body.append(f"    let i2: i32 = 0;")
+            body.append(f"    while (i2 < {n_out}) {{")
+            body.append(f"        print_f64(arr_f32_get(a{last}, i2), 6);")
+            body.append("        i2 = i2 + 1;")
+            body.append("    }")
+        body.append("    return 0;")
+        body.append("}")
+        return "\n".join(body)
+
+    # mnist mode: batch over the test set, report accuracy.
+    if not args.input_images or not args.input_labels:
+        raise SystemExit("--input-format mnist requires --input-images and --input-labels.")
     body.append(f"    let img_path: i32 = str_new(\"{args.input_images}\");")
     body.append(f"    let lbl_path: i32 = str_new(\"{args.input_labels}\");")
     body.append(f"    let imgs: i32 = load_byte_file(img_path, {args.n_test} * {n_in} + 16);")
@@ -309,10 +339,13 @@ def parse_args():
                    help="state_dict key template.  {idx} = layer index "
                         "(0-based), {idx_plus_1} = 1-based, {kind} = "
                         "weight|bias.  Default: fc{idx_plus_1}.{kind}.")
-    p.add_argument("--input-format", choices=("mnist",), default="mnist")
-    p.add_argument("--input-images", required=True)
-    p.add_argument("--input-labels", required=True)
-    p.add_argument("--n-test", type=int, default=10000)
+    p.add_argument("--input-format", choices=("mnist", "stdin"), default="mnist")
+    p.add_argument("--input-images", default=None,
+                   help="Path to raw MNIST images file (mnist mode only).")
+    p.add_argument("--input-labels", default=None,
+                   help="Path to raw MNIST labels file (mnist mode only).")
+    p.add_argument("--n-test", type=int, default=10000,
+                   help="Number of test samples to score in mnist mode.")
     p.add_argument("--mean", type=float, default=0.1307)
     p.add_argument("--std",  type=float, default=0.3081)
     p.add_argument("--no-argmax", action="store_true",
