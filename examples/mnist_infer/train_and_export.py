@@ -100,6 +100,11 @@ def main():
     n_floats = W1.size + b1.size + W2.size + b2.size
     print(f"wrote {WEIGHTS}  ({n_floats} f32, {n_floats*4} bytes)")
 
+    # Also save the state_dict so aricode-pack can pick it up.
+    state_path = HERE / "mlp_784_64_10.pt"
+    torch.save(model.state_dict(), state_path)
+    print(f"wrote {state_path}")
+
 
 if __name__ == "__main__":
     main()
