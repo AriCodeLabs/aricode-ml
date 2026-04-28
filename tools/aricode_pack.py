@@ -177,34 +177,44 @@ def collect_weights(arch, sd, key_pattern):
     return out
 
 
-def gen_decls(arch):
-    """Allocations for weight tensors and per-layer activation buffers.
-
-    We allocate one activation buffer per *shape-changing* step (the
-    input + the output of every Linear).  ReLU / sigmoid / tanh /
-    softmax all act in-place, so they reuse the previous buffer.
-    """
+def gen_weight_decls(arch, embed):
+    """Either pre-allocated empty tensors (filled by file_read later) or
+    nothing (embed_file inside gen_load declares the let bindings)."""
+    if embed:
+        return []
     lines = []
     for idx, in_f, out_f in linear_layers(arch):
         lines.append(f"    let W{idx}: i32 = arr_f32_new({out_f * in_f});")
         lines.append(f"    let b{idx}: i32 = arr_f32_new({out_f});")
+    return lines
 
+
+def gen_act_decls(arch):
+    """One activation buffer per shape-changing step (input + each Linear's
+    output).  Returns the source lines and the sizes list for downstream
+    code that wants to know the activation widths."""
     if not arch or arch[0][0] != "linear":
         raise ValueError("arch must start with a Linear layer.")
-
-    sizes = [arch[0][1]]   # a0 = input buffer (input dim of first Linear)
+    sizes = [arch[0][1]]
     for kind, *args in arch:
         if kind == "linear":
             sizes.append(args[1])
-        # in-place activations don't add buffers
-    for i, sz in enumerate(sizes):
-        lines.append(f"    let a{i}: i32 = arr_f32_new({sz});")
+    lines = [f"    let a{i}: i32 = arr_f32_new({sz});"
+             for i, sz in enumerate(sizes)]
     return lines, sizes
 
 
-def gen_load(arch):
-    """Sequential file_read calls in arch order."""
-    lines = ["    let weight_path: i32 = str_new(\"{out}.f32\");",
+def gen_load(arch, embed_dir, out_name, embed):
+    """Either runtime `file_read` calls (embed=False, single .f32 sidecar)
+    or compile-time `embed_file` calls (embed=True, weights baked into the
+    binary)."""
+    if embed:
+        lines = []
+        for idx, in_f, out_f in linear_layers(arch):
+            lines.append(f"    let W{idx}: i32 = embed_file(\"{embed_dir}/{out_name}_W{idx}.f32\");")
+            lines.append(f"    let b{idx}: i32 = embed_file(\"{embed_dir}/{out_name}_b{idx}.f32\");")
+        return lines
+    lines = [f"    let weight_path: i32 = str_new(\"{out_name}.f32\");",
              "    let _wfd: i32 = file_open(weight_path, 0);"]
     for idx, in_f, out_f in linear_layers(arch):
         lines.append(f"    file_read(_wfd, W{idx}, {out_f * in_f * 4});")
@@ -244,9 +254,10 @@ def gen_forward(arch):
     return lines, cur_a
 
 
-def gen_main(arch, args, out_name):
-    decls, _ = gen_decls(arch)
-    load = gen_load(arch)
+def gen_main(arch, args, out_name, embed_dir):
+    weight_decls = gen_weight_decls(arch, args.embed)
+    act_decls, _ = gen_act_decls(arch)
+    load = gen_load(arch, embed_dir, out_name, args.embed)
     fwd, last = gen_forward(arch)
 
     n_in  = arch[0][1]
@@ -254,8 +265,9 @@ def gen_main(arch, args, out_name):
 
     body = []
     body.append(f"fn main() -> i32 {{")
-    body += decls
-    body += [l.replace("{out}", out_name) for l in load]
+    body += weight_decls
+    body += load
+    body += act_decls
     body.append("")
     body.append(f"    let img_path: i32 = str_new(\"{args.input_images}\");")
     body.append(f"    let lbl_path: i32 = str_new(\"{args.input_labels}\");")
@@ -307,8 +319,17 @@ def parse_args():
                    help="Skip argmax + accuracy reporting (e.g. when the "
                         "model isn't a classifier).")
     p.add_argument("--out", required=True,
-                   help="Output base name.  <out>.ari and <out>.f32 are "
-                        "written next to it.")
+                   help="Output base name.  <out>.ari is always written.  "
+                        "Without --embed, a single <out>.f32 sidecar is "
+                        "written too; with --embed, per-tensor "
+                        "<out>_W{i}.f32 / <out>_b{i}.f32 staging files are "
+                        "produced (the compiler bakes them into the binary "
+                        "and they're no longer needed at runtime).")
+    p.add_argument("--embed", action="store_true",
+                   help="Emit a single self-contained binary: weights "
+                        "embedded inline via embed_file, no runtime file "
+                        "I/O for the model.  The MNIST images / labels "
+                        "still come from disk.")
     return p.parse_args()
 
 
@@ -374,12 +395,34 @@ def main():
             li += 1
 
     out_base = Path(args.out)
-    blob_path = out_base.with_suffix(".f32")
     src_path  = out_base.with_suffix(".ari")
+    embed_dir = str(out_base.parent.resolve())
 
-    with open(blob_path, "wb") as f:
-        for arr in weights_blob:
-            arr.tofile(f)
+    if args.embed:
+        # One .f32 per tensor, in W0/b0/W1/b1/... order.  embed_file
+        # consumes them at compile time and bakes the bytes into the .text
+        # section; they're not needed at runtime.
+        wrote = []
+        li = 0
+        for kind, *largs in arch:
+            if kind != "linear":
+                continue
+            W, b = weights_blob[2 * li], weights_blob[2 * li + 1]
+            wp = out_base.parent / f"{out_base.name}_W{li}.f32"
+            bp = out_base.parent / f"{out_base.name}_b{li}.f32"
+            with open(wp, "wb") as f: W.tofile(f)
+            with open(bp, "wb") as f: b.tofile(f)
+            wrote.extend([wp, bp])
+            li += 1
+        print("wrote per-tensor staging files:")
+        for p in wrote:
+            print(f"  {p}")
+    else:
+        blob_path = out_base.with_suffix(".f32")
+        with open(blob_path, "wb") as f:
+            for arr in weights_blob:
+                arr.tofile(f)
+        print(f"wrote {blob_path}")
 
     src = (
         PROLOGUE.format(model_name=out_base.name,
@@ -390,14 +433,16 @@ def main():
                               mean=args.mean,
                               std=args.std)
         + "\n"
-        + gen_main(arch, args, out_base.name)
+        + gen_main(arch, args, out_base.name, embed_dir)
         + "\n"
     )
     src_path.write_text(src)
 
     n_floats = sum(a.size for a in weights_blob)
-    print(f"wrote {src_path}  +  {blob_path} ({n_floats} f32, {n_floats * 4} bytes)")
+    print(f"wrote {src_path}  ({n_floats} f32 of weights total, {n_floats * 4} bytes)")
     print(f"build:  aric {src_path.name} -o {out_base.name}")
+    if args.embed:
+        print(f"        (after build, the per-tensor .f32 staging files can be deleted)")
     print(f"run:    ./{out_base.name}")
 
 
