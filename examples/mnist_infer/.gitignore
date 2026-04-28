@@ -1,0 +1,7 @@
+.venv/
+mnist_data/
+mnist_infer
+mlp_*.f32
+t10k-*-ubyte
+train-*-ubyte
+__pycache__/

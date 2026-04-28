@@ -1,0 +1,114 @@
+// aricode-ml: examples/mnist_infer/mnist_infer.ari
+//
+// Inference-only demo: load a 784 → 64 → 10 ReLU MLP trained in
+// PyTorch (GPU), serve it from a static aricode binary.  No training,
+// no autograd — just the forward pass over the MNIST test set with
+// the weights aricode loads from a raw f32 blob.
+//
+// This is the deployment niche where aricode actually has an edge
+// over the PyTorch stack: a ~70 KB static binary with no runtime
+// linker dependencies, no Python interpreter, no CUDA libs, just
+// AVX2 inner loops doing the matvecs.
+//
+// Pre-requisite: run `train_and_export.py` first to produce
+// mlp_784_64_10.f32 in this directory and to materialise the MNIST
+// test files (t10k-images-idx3-ubyte / t10k-labels-idx1-ubyte) via
+// the symlinks shipped alongside.
+
+fn arr_f32_from_file(path_str: i32, n: i32) -> i32 {
+    let buf: i32 = arr_f32_new(n);
+    let fd: i32 = file_open(path_str, 0);
+    file_read(fd, buf, n * 4);
+    file_close(fd);
+    return buf;
+}
+
+fn load_byte_file(path_str: i32, byte_count: i32) -> i32 {
+    let slots: i32 = (byte_count + 7) / 8;
+    let buf: i32 = arr_new(slots);
+    let fd: i32 = file_open(path_str, 0);
+    file_read(fd, buf, byte_count);
+    file_close(fd);
+    return buf;
+}
+
+fn load_image_at(img_buf: i32, offset: i32, out: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 784) {
+        let px: i32 = byte_at(img_buf, offset + i);
+        // PyTorch trained with the same standardisation aricode demos
+        // use: x = (px / 255 − 0.1307) / 0.3081.
+        arr_f32_set(out, i, (int_to_float(px) / 255.0 - 0.1307) / 0.3081);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn argmax_f32(buf: i32, n: i32) -> i32 {
+    let best_i: i32 = 0;
+    let best_v: f64 = arr_f32_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f32_get(buf, i);
+        if (v > best_v) { best_v = v; best_i = i; }
+        i = i + 1;
+    }
+    return best_i;
+}
+
+fn main() -> i32 {
+    let N_IN:  i32 = 784;
+    let N_HID: i32 = 64;
+    let N_OUT: i32 = 10;
+    let N_TEST: i32 = 10000;
+
+    print_str("Loading PyTorch-trained weights...");
+
+    // Open weight file and read the four tensors in order.  Each
+    // arr_f32_from_file call advances the fd by its own n*4 bytes,
+    // so we keep the fd manually here to do all four reads in one
+    // open.
+    let weight_path: i32 = str_new("mlp_784_64_10.f32");
+    let fd: i32 = file_open(weight_path, 0);
+
+    let W1: i32 = arr_f32_new(N_HID * N_IN);   // 64 × 784
+    let b1: i32 = arr_f32_new(N_HID);
+    let W2: i32 = arr_f32_new(N_OUT * N_HID);  // 10 × 64
+    let b2: i32 = arr_f32_new(N_OUT);
+    file_read(fd, W1, N_HID * N_IN * 4);
+    file_read(fd, b1, N_HID * 4);
+    file_read(fd, W2, N_OUT * N_HID * 4);
+    file_read(fd, b2, N_OUT * 4);
+    file_close(fd);
+
+    print_str("Loading MNIST test set...");
+    let img_path: i32 = str_new("t10k-images-idx3-ubyte");
+    let lbl_path: i32 = str_new("t10k-labels-idx1-ubyte");
+    let test_imgs: i32 = load_byte_file(img_path, N_TEST * 784 + 16);
+    let test_lbls: i32 = load_byte_file(lbl_path, N_TEST + 8);
+
+    let x:     i32 = arr_f32_new(N_IN);
+    let hid:   i32 = arr_f32_new(N_HID);
+    let y_out: i32 = arr_f32_new(N_OUT);
+
+    print_str("Running inference over 10,000 test images...");
+    let correct: i32 = 0;
+    let i: i32 = 0;
+    while (i < N_TEST) {
+        load_image_at(test_imgs, 16 + i * 784, x);
+        let lbl: i32 = byte_at(test_lbls, 8 + i);
+
+        // hid = W1 · x + b1
+        arr_f32_matvec(W1, x, b1, hid, N_HID, N_IN);
+        arr_f32_relu(hid);
+        // y = W2 · hid + b2
+        arr_f32_matvec(W2, hid, b2, y_out, N_OUT, N_HID);
+
+        if (argmax_f32(y_out, N_OUT) == lbl) { correct = correct + 1; }
+        i = i + 1;
+    }
+
+    print_str("Test accuracy:");
+    print_f64(int_to_float(correct) / int_to_float(N_TEST), 4);
+    return 0;
+}
