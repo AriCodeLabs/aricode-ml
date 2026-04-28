@@ -188,6 +188,7 @@ fn eval_worker_f32(desc: i32) -> i32 {
     }
     atomic_add_i64(correct_ctr, 0, local_correct);
     atomic_add_i64(done_ctr,    0, 1);
+    futex_wake(done_ctr, 0, 1);
     return 0;
 }
 
@@ -274,6 +275,7 @@ fn train_worker_f32(desc: i32) -> i32 {
 
     atomic_add_f64(loss_ctr, 0, local_loss);
     atomic_add_i64(done_ctr, 0, 1);
+    futex_wake(done_ctr, 0, 1);
     return 0;
 }
 
@@ -474,8 +476,8 @@ fn main() -> i32 {
             }
 
             while (arr_get(done_ctr, 0) < N_WORKERS) {
-                let pause: i32 = 0;
-                while (pause < 100) { pause = pause + 1; }
+                let cur: i32 = arr_get(done_ctr, 0);
+                if (cur < N_WORKERS) { futex_wait(done_ctr, 0, cur); }
             }
 
             // Reduce worker[1..N-1] grads into worker[0]'s buffers.
@@ -548,8 +550,8 @@ fn main() -> i32 {
             w += 1;
         }
         while (arr_get(done_ctr, 0) < N_WORKERS) {
-            let pause: i32 = 0;
-            while (pause < 1000) { pause = pause + 1; }
+            let cur: i32 = arr_get(done_ctr, 0);
+            if (cur < N_WORKERS) { futex_wait(done_ctr, 0, cur); }
         }
         print_str("test accuracy:");
         print_f64(int_to_float(arr_get(correct_ctr, 0)) / int_to_float(N_TEST), 4);
