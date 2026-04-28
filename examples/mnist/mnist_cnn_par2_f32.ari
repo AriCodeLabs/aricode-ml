@@ -1,0 +1,561 @@
+// aricode-ml: examples/mnist/mnist_cnn_par2_f32.ari
+//
+// Fully-parallel f32 CNN with AdamW + label smoothing + cosine lr —
+// the f32 mirror of mnist_cnn_par2.ari.  Same parent/worker pattern:
+//
+//   1. Parent zeros every worker's per-thread gradient buffers.
+//   2. Each worker processes its slice of the batch, accumulating into
+//      its OWN copy of dW_* / db_* (zero contention).
+//   3. Workers fold partial NLL into a shared f64 atomic counter (loss
+//      stays in f64 — only the parameters & gradients move to f32).
+//   4. Parent reduces worker[1..N]'s grads into worker[0]'s buffers
+//      (arr_f32_add_scaled with α=1) then runs AdamW + weight decay
+//      against the combined grad.
+//
+// All weight tensors / activations / gradients / Adam moments live in
+// f32.  Loss accumulation stays f64 because atomic_add_f64 already
+// exists and bottom-of-the-batch precision is what hurts small-NLL
+// tracking.  Eval pass also fans out to N_WORKERS threads.
+//
+// Expected: ~98.6 % test accuracy in roughly half the wall-clock of
+// the single-threaded mnist_cnn_f32.
+
+import "../../conv2d_f32.ari" as conv;
+
+fn load_file(path_str: i32, byte_count: i32) -> i32 {
+    let slots: i32 = (byte_count + 7) / 8;
+    let buf: i32 = arr_new(slots);
+    let fd: i32 = file_open(path_str, 0);
+    file_read(fd, buf, byte_count);
+    file_close(fd);
+    return buf;
+}
+
+fn load_image_at(img_buf: i32, offset: i32, out: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < 784) {
+        let px: i32 = byte_at(img_buf, offset + i);
+        arr_f32_set(out, i, (int_to_float(px) / 255.0 - 0.1307) / 0.3081);
+        i += 1;
+    }
+    return 0;
+}
+
+fn one_hot_smooth_f32(label: i32, out: i32, n: i32, alpha: f64) -> i32 {
+    let off_val: f64 = alpha / int_to_float(n - 1);
+    arr_f32_fill(out, off_val);
+    arr_f32_set(out, label, 1.0 - alpha);
+    return 0;
+}
+
+fn argmax_f32(buf: i32, n: i32) -> i32 {
+    let best_i: i32 = 0;
+    let best_v: f64 = arr_f32_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f32_get(buf, i);
+        if (v > best_v) { best_v = v; best_i = i; }
+        i += 1;
+    }
+    return best_i;
+}
+
+fn init_weights_f32(buf: i32, fan_in: i32, seed_i: i32) -> i32 {
+    let s: i32 = seed_i;
+    let scale: f64 = math_sqrt(2.0 / int_to_float(fan_in));
+    let i: i32 = 0;
+    let n: i32 = arr_len(buf);
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        let r: f64 = int_to_float((s / 65536) - ((s / 65536) / 32768) * 32768);
+        arr_f32_set(buf, i, (r / 32768.0 - 0.5) * 2.0 * scale);
+        i += 1;
+    }
+    return 0;
+}
+
+fn softmax_f32(buf: i32) -> i32 {
+    let n: i32 = arr_len(buf);
+    let m: f64 = arr_f32_get(buf, 0);
+    let i: i32 = 1;
+    while (i < n) {
+        let v: f64 = arr_f32_get(buf, i);
+        if (v > m) { m = v; }
+        i += 1;
+    }
+    let s: f64 = 0.0;
+    i = 0;
+    while (i < n) {
+        let e: f64 = math_exp(arr_f32_get(buf, i) - m);
+        arr_f32_set(buf, i, e);
+        s = s + e;
+        i += 1;
+    }
+    arr_f32_scale(buf, 1.0 / s);
+    return 0;
+}
+
+fn xent_backward_f32(y: i32, t: i32, dy: i32) -> i32 {
+    let n: i32 = arr_len(y);
+    let i: i32 = 0;
+    while (i < n) {
+        arr_f32_set(dy, i, arr_f32_get(y, i) - arr_f32_get(t, i));
+        i += 1;
+    }
+    return 0;
+}
+
+fn relu_backward_f32(post_relu: i32, dh: i32, n: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < n) {
+        if (arr_f32_get(post_relu, i) <= 0.0) { arr_f32_set(dh, i, 0.0); }
+        i += 1;
+    }
+    return 0;
+}
+
+fn dense_backward_f32(W: i32, input: i32,
+                      dy: i32, dx: i32,
+                      dW: i32, db: i32) -> i32 {
+    let n_in:  i32 = arr_len(input);
+    let n_out: i32 = arr_len(dy);
+    if (dx != 0) { arr_f32_matvec_T(W, dy, dx, n_out, n_in); }
+    arr_f32_outer_accum(dW, dy, input, n_out, n_in);
+    arr_f32_add_scaled(db, dy, 1.0);
+    return 0;
+}
+
+fn adam_update_moments_f32(g: i32, m: i32, v: i32, tmp_g2: i32,
+                           beta1: f64, beta2: f64) -> i32 {
+    arr_f32_scale(m, beta1);
+    arr_f32_add_scaled(m, g, 1.0 - beta1);
+    arr_f32_mul(tmp_g2, g, g);
+    arr_f32_scale(v, beta2);
+    arr_f32_add_scaled(v, tmp_g2, 1.0 - beta2);
+    return 0;
+}
+
+// ------------------------------------------------------------
+// Parallel eval worker (f32)
+// ------------------------------------------------------------
+// Descriptor (19 slots):
+//   [0..5]   W_conv, b_conv, W_fc1, b_fc1, W_fc2, b_fc2  (shared read)
+//   [6..7]   test_img_buf, test_lbl_buf                  (shared read)
+//   [8..14]  x, conv_o, pool_o, pool_a, hid, y_out, padded (per-worker)
+//   [15..16] i_start, i_end                              (this worker's slice)
+//   [17]     correct_ctr (shared atomic i64 slot)
+//   [18]     done_ctr    (shared atomic i64 slot)
+fn eval_worker_f32(desc: i32) -> i32 {
+    let W_conv: i32 = arr_get(desc, 0);
+    let b_conv: i32 = arr_get(desc, 1);
+    let W_fc1:  i32 = arr_get(desc, 2);
+    let b_fc1:  i32 = arr_get(desc, 3);
+    let W_fc2:  i32 = arr_get(desc, 4);
+    let b_fc2:  i32 = arr_get(desc, 5);
+    let test_img_buf: i32 = arr_get(desc, 6);
+    let test_lbl_buf: i32 = arr_get(desc, 7);
+    let x:      i32 = arr_get(desc, 8);
+    let conv_o: i32 = arr_get(desc, 9);
+    let pool_o: i32 = arr_get(desc, 10);
+    let pool_a: i32 = arr_get(desc, 11);
+    let hid:    i32 = arr_get(desc, 12);
+    let y_out:  i32 = arr_get(desc, 13);
+    let padded: i32 = arr_get(desc, 14);
+    let i_start: i32 = arr_get(desc, 15);
+    let i_end:   i32 = arr_get(desc, 16);
+    let correct_ctr: i32 = arr_get(desc, 17);
+    let done_ctr:    i32 = arr_get(desc, 18);
+
+    let C_OUT: i32 = 8;
+    let FLAT:  i32 = 1568;
+    let N_HID: i32 = 64;
+    let N_OUT: i32 = 10;
+
+    let local_correct: i32 = 0;
+    let i: i32 = i_start;
+    while (i < i_end) {
+        load_image_at(test_img_buf, 16 + i * 784, x);
+        let lbl: i32 = byte_at(test_lbl_buf, 8 + i);
+        conv.conv2d_forward_f32(x, W_conv, b_conv, conv_o, padded, C_OUT);
+        arr_f32_relu(conv_o);
+        conv.maxpool_2x2_forward_f32(conv_o, pool_o, pool_a, C_OUT);
+        arr_f32_matvec(W_fc1, pool_o, b_fc1, hid, N_HID, FLAT);
+        arr_f32_relu(hid);
+        arr_f32_matvec(W_fc2, hid, b_fc2, y_out, N_OUT, N_HID);
+        softmax_f32(y_out);
+        if (argmax_f32(y_out, N_OUT) == lbl) { local_correct += 1; }
+        i += 1;
+    }
+    atomic_add_i64(correct_ctr, 0, local_correct);
+    atomic_add_i64(done_ctr,    0, 1);
+    return 0;
+}
+
+// ------------------------------------------------------------
+// Parallel training worker (f32)
+// ------------------------------------------------------------
+// Descriptor (31 slots):
+//   [0..5]   W_conv, b_conv, W_fc1, b_fc1, W_fc2, b_fc2     (shared read)
+//   [6..7]   train_img_buf, train_lbl_buf                   (shared read)
+//   [8..14]  x, conv_o, pool_o, pool_a, hid, y_out, padded  (per-worker)
+//   [15..19] t_lbl, dy, dhid, dpool, dconv                  (per-worker)
+//   [20..25] dW_conv, db_conv, dW_fc1, db_fc1, dW_fc2, db_fc2 (per-worker grads)
+//   [26]     im2col_rows                                     (per-worker)
+//   [27]     loss_ctr (shared f64 slot)
+//   [28]     done_ctr (shared i64 slot)
+//   [29]     s_start  [30] s_end                             (this worker's range)
+fn train_worker_f32(desc: i32) -> i32 {
+    let W_conv: i32 = arr_get(desc, 0);
+    let b_conv: i32 = arr_get(desc, 1);
+    let W_fc1:  i32 = arr_get(desc, 2);
+    let b_fc1:  i32 = arr_get(desc, 3);
+    let W_fc2:  i32 = arr_get(desc, 4);
+    let b_fc2:  i32 = arr_get(desc, 5);
+    let train_img_buf: i32 = arr_get(desc, 6);
+    let train_lbl_buf: i32 = arr_get(desc, 7);
+    let x:      i32 = arr_get(desc, 8);
+    let conv_o: i32 = arr_get(desc, 9);
+    let pool_o: i32 = arr_get(desc, 10);
+    let pool_a: i32 = arr_get(desc, 11);
+    let hid:    i32 = arr_get(desc, 12);
+    let y_out:  i32 = arr_get(desc, 13);
+    let padded: i32 = arr_get(desc, 14);
+    let t_lbl:  i32 = arr_get(desc, 15);
+    let dy:     i32 = arr_get(desc, 16);
+    let dhid:   i32 = arr_get(desc, 17);
+    let dpool:  i32 = arr_get(desc, 18);
+    let dconv:  i32 = arr_get(desc, 19);
+    let dW_conv: i32 = arr_get(desc, 20);
+    let db_conv: i32 = arr_get(desc, 21);
+    let dW_fc1:  i32 = arr_get(desc, 22);
+    let db_fc1:  i32 = arr_get(desc, 23);
+    let dW_fc2:  i32 = arr_get(desc, 24);
+    let db_fc2:  i32 = arr_get(desc, 25);
+    let im2col_rows: i32 = arr_get(desc, 26);
+    let loss_ctr: i32 = arr_get(desc, 27);
+    let done_ctr: i32 = arr_get(desc, 28);
+    let s_start:  i32 = arr_get(desc, 29);
+    let s_end:    i32 = arr_get(desc, 30);
+
+    let C_OUT: i32 = 8;
+    let FLAT:  i32 = 1568;
+    let N_HID: i32 = 64;
+    let N_OUT: i32 = 10;
+    let alpha_smooth: f64 = 0.05;
+
+    let local_loss: f64 = 0.0;
+    let si: i32 = s_start;
+    while (si < s_end) {
+        load_image_at(train_img_buf, 16 + si * 784, x);
+        let lbl: i32 = byte_at(train_lbl_buf, 8 + si);
+        one_hot_smooth_f32(lbl, t_lbl, N_OUT, alpha_smooth);
+
+        conv.conv2d_im2col_f32(x, im2col_rows);
+        conv.conv2d_forward_f32(x, W_conv, b_conv, conv_o, padded, C_OUT);
+        arr_f32_relu(conv_o);
+        conv.maxpool_2x2_forward_f32(conv_o, pool_o, pool_a, C_OUT);
+        arr_f32_matvec(W_fc1, pool_o, b_fc1, hid, N_HID, FLAT);
+        arr_f32_relu(hid);
+        arr_f32_matvec(W_fc2, hid, b_fc2, y_out, N_OUT, N_HID);
+        softmax_f32(y_out);
+
+        local_loss = local_loss - math_log(arr_f32_get(y_out, lbl) + 0.000000000001);
+
+        xent_backward_f32(y_out, t_lbl, dy);
+        dense_backward_f32(W_fc2, hid, dy, dhid, dW_fc2, db_fc2);
+        relu_backward_f32(hid, dhid, N_HID);
+        dense_backward_f32(W_fc1, pool_o, dhid, dpool, dW_fc1, db_fc1);
+        conv.maxpool_2x2_backward_f32(dpool, pool_a, dconv, C_OUT);
+        relu_backward_f32(conv_o, dconv, C_OUT * 784);
+        conv.conv2d_backward_weights_f32(dconv, im2col_rows, dW_conv, db_conv, C_OUT);
+
+        si += 1;
+    }
+
+    atomic_add_f64(loss_ctr, 0, local_loss);
+    atomic_add_i64(done_ctr, 0, 1);
+    return 0;
+}
+
+fn main() -> i32 {
+    let N_TRAIN: i32 = 60000;
+    let N_TEST:  i32 = 10000;
+
+    let img_path:   i32 = str_new("train-images-idx3-ubyte");
+    let lbl_path:   i32 = str_new("train-labels-idx1-ubyte");
+    let t_img_path: i32 = str_new("t10k-images-idx3-ubyte");
+    let t_lbl_path: i32 = str_new("t10k-labels-idx1-ubyte");
+
+    let train_img_buf: i32 = load_file(img_path,   N_TRAIN * 784 + 16);
+    let train_lbl_buf: i32 = load_file(lbl_path,   N_TRAIN + 8);
+    let test_img_buf:  i32 = load_file(t_img_path, N_TEST  * 784 + 16);
+    let test_lbl_buf:  i32 = load_file(t_lbl_path, N_TEST  + 8);
+
+    print_str("Loaded MNIST (CNN par2 f32, standardised).");
+
+    let N_OUT: i32 = 10;
+    let N_HID: i32 = 64;
+    let C_OUT: i32 = 8;
+    let FLAT:  i32 = C_OUT * 196;
+
+    let W_conv: i32 = arr_f32_new(C_OUT * 9);
+    let b_conv: i32 = arr_f32_new(C_OUT);
+    init_weights_f32(W_conv, 9, 12345);
+    arr_f32_fill(b_conv, 0.0);
+
+    let W_fc1: i32 = arr_f32_new(N_HID * FLAT);
+    let b_fc1: i32 = arr_f32_new(N_HID);
+    init_weights_f32(W_fc1, FLAT, 67890);
+    arr_f32_fill(b_fc1, 0.0);
+
+    let W_fc2: i32 = arr_f32_new(N_OUT * N_HID);
+    let b_fc2: i32 = arr_f32_new(N_OUT);
+    init_weights_f32(W_fc2, N_HID, 54321);
+    arr_f32_fill(b_fc2, 0.0);
+
+    // Adam moments (six pairs, all f32).
+    let mW_conv: i32 = arr_f32_new(C_OUT * 9);    let vW_conv: i32 = arr_f32_new(C_OUT * 9);
+    let mb_conv: i32 = arr_f32_new(C_OUT);         let vb_conv: i32 = arr_f32_new(C_OUT);
+    let mW_fc1:  i32 = arr_f32_new(N_HID * FLAT);  let vW_fc1:  i32 = arr_f32_new(N_HID * FLAT);
+    let mb_fc1:  i32 = arr_f32_new(N_HID);         let vb_fc1:  i32 = arr_f32_new(N_HID);
+    let mW_fc2:  i32 = arr_f32_new(N_OUT * N_HID); let vW_fc2:  i32 = arr_f32_new(N_OUT * N_HID);
+    let mb_fc2:  i32 = arr_f32_new(N_OUT);         let vb_fc2:  i32 = arr_f32_new(N_OUT);
+    arr_f32_fill(mW_conv, 0.0); arr_f32_fill(vW_conv, 0.0);
+    arr_f32_fill(mb_conv, 0.0); arr_f32_fill(vb_conv, 0.0);
+    arr_f32_fill(mW_fc1, 0.0);  arr_f32_fill(vW_fc1, 0.0);
+    arr_f32_fill(mb_fc1, 0.0);  arr_f32_fill(vb_fc1, 0.0);
+    arr_f32_fill(mW_fc2, 0.0);  arr_f32_fill(vW_fc2, 0.0);
+    arr_f32_fill(mb_fc2, 0.0);  arr_f32_fill(vb_fc2, 0.0);
+
+    // Parent-only Adam g² scratch — sized to the largest param tensor.
+    let tmp_g2: i32 = arr_f32_new(N_HID * FLAT);
+
+    let lr_max: f64 = 0.001;
+    let lr_min: f64 = 0.00001;
+    let beta1:  f64 = 0.9;
+    let beta2:  f64 = 0.999;
+    let eps:    f64 = 0.00000001;
+    let wd:     f64 = 0.001;
+    let pi:     f64 = 3.14159265358979;
+
+    let N_BATCH: i32 = 64;
+    let N_EPOCH: i32 = 10;
+    let N_WORKERS: i32 = 4;
+
+    // Shared atomic counters reused across train + eval.
+    let correct_ctr: i32 = arr_new(1);
+    let loss_ctr:    i32 = arr_f64_new(1);
+    let done_ctr:    i32 = arr_new(1);
+
+    let train_descs: i32 = arr_new(N_WORKERS);
+    let eval_descs:  i32 = arr_new(N_WORKERS);
+    let wi: i32 = 0;
+    while (wi < N_WORKERS) {
+        let x:      i32 = arr_f32_new(784);
+        let conv_o: i32 = arr_f32_new(C_OUT * 784);
+        let pool_o: i32 = arr_f32_new(FLAT);
+        let pool_a: i32 = arr_f32_new(FLAT);
+        let hid:    i32 = arr_f32_new(N_HID);
+        let y_out:  i32 = arr_f32_new(N_OUT);
+        let padded: i32 = arr_f32_new(900);
+
+        let t_lbl:  i32 = arr_f32_new(N_OUT);
+        let dy:     i32 = arr_f32_new(N_OUT);
+        let dhid:   i32 = arr_f32_new(N_HID);
+        let dpool:  i32 = arr_f32_new(FLAT);
+        let dconv:  i32 = arr_f32_new(C_OUT * 784);
+        let im2col: i32 = conv.conv2d_alloc_im2col_f32();
+
+        let dW_conv_w: i32 = arr_f32_new(C_OUT * 9);
+        let db_conv_w: i32 = arr_f32_new(C_OUT);
+        let dW_fc1_w:  i32 = arr_f32_new(N_HID * FLAT);
+        let db_fc1_w:  i32 = arr_f32_new(N_HID);
+        let dW_fc2_w:  i32 = arr_f32_new(N_OUT * N_HID);
+        let db_fc2_w:  i32 = arr_f32_new(N_OUT);
+
+        let td: i32 = arr_new(31);
+        arr_set(td,  0, W_conv); arr_set(td,  1, b_conv);
+        arr_set(td,  2, W_fc1);  arr_set(td,  3, b_fc1);
+        arr_set(td,  4, W_fc2);  arr_set(td,  5, b_fc2);
+        arr_set(td,  6, train_img_buf);
+        arr_set(td,  7, train_lbl_buf);
+        arr_set(td,  8, x);
+        arr_set(td,  9, conv_o);
+        arr_set(td, 10, pool_o);
+        arr_set(td, 11, pool_a);
+        arr_set(td, 12, hid);
+        arr_set(td, 13, y_out);
+        arr_set(td, 14, padded);
+        arr_set(td, 15, t_lbl);
+        arr_set(td, 16, dy);
+        arr_set(td, 17, dhid);
+        arr_set(td, 18, dpool);
+        arr_set(td, 19, dconv);
+        arr_set(td, 20, dW_conv_w);
+        arr_set(td, 21, db_conv_w);
+        arr_set(td, 22, dW_fc1_w);
+        arr_set(td, 23, db_fc1_w);
+        arr_set(td, 24, dW_fc2_w);
+        arr_set(td, 25, db_fc2_w);
+        arr_set(td, 26, im2col);
+        arr_set(td, 27, loss_ctr);
+        arr_set(td, 28, done_ctr);
+        arr_set(train_descs, wi, td);
+
+        let ed: i32 = arr_new(19);
+        arr_set(ed,  0, W_conv); arr_set(ed,  1, b_conv);
+        arr_set(ed,  2, W_fc1);  arr_set(ed,  3, b_fc1);
+        arr_set(ed,  4, W_fc2);  arr_set(ed,  5, b_fc2);
+        arr_set(ed,  6, test_img_buf);
+        arr_set(ed,  7, test_lbl_buf);
+        arr_set(ed,  8, x);
+        arr_set(ed,  9, conv_o);
+        arr_set(ed, 10, pool_o);
+        arr_set(ed, 11, pool_a);
+        arr_set(ed, 12, hid);
+        arr_set(ed, 13, y_out);
+        arr_set(ed, 14, padded);
+        arr_set(ed, 17, correct_ctr);
+        arr_set(ed, 18, done_ctr);
+        arr_set(eval_descs, wi, ed);
+
+        wi += 1;
+    }
+    let per_worker: i32 = N_TEST / N_WORKERS;
+
+    // Worker-0's grad buffers double as the reduced batch grad after fold.
+    let td0: i32 = arr_get(train_descs, 0);
+    let dW_conv: i32 = arr_get(td0, 20);
+    let db_conv: i32 = arr_get(td0, 21);
+    let dW_fc1:  i32 = arr_get(td0, 22);
+    let db_fc1:  i32 = arr_get(td0, 23);
+    let dW_fc2:  i32 = arr_get(td0, 24);
+    let db_fc2:  i32 = arr_get(td0, 25);
+
+    let t: i32 = 0;
+    let epoch: i32 = 0;
+    while (epoch < N_EPOCH) {
+        let frac: f64 = int_to_float(epoch) / int_to_float(N_EPOCH);
+        let lr: f64 = lr_min + 0.5 * (lr_max - lr_min) * (1.0 + math_cos(pi * frac));
+
+        let loss_sum: f64 = 0.0;
+        let s: i32 = 0;
+        while (s < N_TRAIN) {
+            let batch_end: i32 = s + N_BATCH;
+            if (batch_end > N_TRAIN) { batch_end = N_TRAIN; }
+            let batch_size: i32 = batch_end - s;
+
+            // Zero all per-worker gradient buffers.
+            let zi: i32 = 0;
+            while (zi < N_WORKERS) {
+                let tdz: i32 = arr_get(train_descs, zi);
+                arr_f32_fill(arr_get(tdz, 20), 0.0); arr_f32_fill(arr_get(tdz, 21), 0.0);
+                arr_f32_fill(arr_get(tdz, 22), 0.0); arr_f32_fill(arr_get(tdz, 23), 0.0);
+                arr_f32_fill(arr_get(tdz, 24), 0.0); arr_f32_fill(arr_get(tdz, 25), 0.0);
+                zi += 1;
+            }
+            arr_f64_set(loss_ctr, 0, 0.0);
+            arr_set(done_ctr,     0, 0);
+
+            // Distribute samples; remainder to low-index workers.
+            let per_w:  i32 = batch_size / N_WORKERS;
+            let remain: i32 = batch_size - per_w * N_WORKERS;
+            let ws: i32 = s;
+            let sw: i32 = 0;
+            while (sw < N_WORKERS) {
+                let cnt: i32 = per_w;
+                if (sw < remain) { cnt = cnt + 1; }
+                let tdw: i32 = arr_get(train_descs, sw);
+                arr_set(tdw, 29, ws);
+                arr_set(tdw, 30, ws + cnt);
+                ws = ws + cnt;
+                let tid: i32 = thread_spawn(train_worker_f32, tdw);
+                sw += 1;
+            }
+
+            while (arr_get(done_ctr, 0) < N_WORKERS) {
+                let pause: i32 = 0;
+                while (pause < 100) { pause = pause + 1; }
+            }
+
+            // Reduce worker[1..N-1] grads into worker[0]'s buffers.
+            let ri: i32 = 1;
+            while (ri < N_WORKERS) {
+                let tdr: i32 = arr_get(train_descs, ri);
+                arr_f32_add_scaled(dW_conv, arr_get(tdr, 20), 1.0);
+                arr_f32_add_scaled(db_conv, arr_get(tdr, 21), 1.0);
+                arr_f32_add_scaled(dW_fc1,  arr_get(tdr, 22), 1.0);
+                arr_f32_add_scaled(db_fc1,  arr_get(tdr, 23), 1.0);
+                arr_f32_add_scaled(dW_fc2,  arr_get(tdr, 24), 1.0);
+                arr_f32_add_scaled(db_fc2,  arr_get(tdr, 25), 1.0);
+                ri += 1;
+            }
+            loss_sum = loss_sum + arr_f64_get(loss_ctr, 0);
+
+            // Mean gradient over the batch.
+            let scale_inv: f64 = 1.0 / int_to_float(batch_size);
+            arr_f32_scale(dW_conv, scale_inv);
+            arr_f32_scale(db_conv, scale_inv);
+            arr_f32_scale(dW_fc1,  scale_inv);
+            arr_f32_scale(db_fc1,  scale_inv);
+            arr_f32_scale(dW_fc2,  scale_inv);
+            arr_f32_scale(db_fc2,  scale_inv);
+
+            t += 1;
+
+            adam_update_moments_f32(dW_conv, mW_conv, vW_conv, tmp_g2, beta1, beta2);
+            adam_update_moments_f32(db_conv, mb_conv, vb_conv, tmp_g2, beta1, beta2);
+            adam_update_moments_f32(dW_fc1,  mW_fc1,  vW_fc1,  tmp_g2, beta1, beta2);
+            adam_update_moments_f32(db_fc1,  mb_fc1,  vb_fc1,  tmp_g2, beta1, beta2);
+            adam_update_moments_f32(dW_fc2,  mW_fc2,  vW_fc2,  tmp_g2, beta1, beta2);
+            adam_update_moments_f32(db_fc2,  mb_fc2,  vb_fc2,  tmp_g2, beta1, beta2);
+
+            let bc1_p: f64 = beta1; let bc2_p: f64 = beta2;
+            let kk: i32 = 1;
+            while (kk < t) { bc1_p = bc1_p * beta1; bc2_p = bc2_p * beta2; kk += 1; }
+            let bc1: f64 = 1.0 - bc1_p;
+            let bc2: f64 = 1.0 - bc2_p;
+            let sqrt_bc2: f64 = math_sqrt(bc2);
+            let lr_final:  f64 = lr  * sqrt_bc2 / bc1;
+            let eps_final: f64 = eps * sqrt_bc2;
+
+            let wd_factor: f64 = 1.0 - lr * wd;
+            arr_f32_scale(W_conv, wd_factor);
+            arr_f32_scale(W_fc1,  wd_factor);
+            arr_f32_scale(W_fc2,  wd_factor);
+
+            arr_f32_adam_apply(W_conv, mW_conv, vW_conv, lr_final, eps_final);
+            arr_f32_adam_apply(b_conv, mb_conv, vb_conv, lr_final, eps_final);
+            arr_f32_adam_apply(W_fc1,  mW_fc1,  vW_fc1,  lr_final, eps_final);
+            arr_f32_adam_apply(b_fc1,  mb_fc1,  vb_fc1,  lr_final, eps_final);
+            arr_f32_adam_apply(W_fc2,  mW_fc2,  vW_fc2,  lr_final, eps_final);
+            arr_f32_adam_apply(b_fc2,  mb_fc2,  vb_fc2,  lr_final, eps_final);
+
+            s = batch_end;
+        }
+        print_str("epoch done, avg train NLL:");
+        print_f64(loss_sum / int_to_float(N_TRAIN), 4);
+
+        // Parallel eval: fan out, spin-wait, tally.
+        arr_set(correct_ctr, 0, 0);
+        arr_set(done_ctr,    0, 0);
+        let w: i32 = 0;
+        while (w < N_WORKERS) {
+            let d: i32 = arr_get(eval_descs, w);
+            arr_set(d, 15, w * per_worker);
+            arr_set(d, 16, (w + 1) * per_worker);
+            let tid: i32 = thread_spawn(eval_worker_f32, d);
+            w += 1;
+        }
+        while (arr_get(done_ctr, 0) < N_WORKERS) {
+            let pause: i32 = 0;
+            while (pause < 1000) { pause = pause + 1; }
+        }
+        print_str("test accuracy:");
+        print_f64(int_to_float(arr_get(correct_ctr, 0)) / int_to_float(N_TEST), 4);
+
+        epoch += 1;
+    }
+
+    return 0;
+}
