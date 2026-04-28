@@ -160,21 +160,37 @@ fn load_image_at(img_buf: i32, offset: i32, out: i32) -> i32 {{
 """
 
 
-def linear_layers(arch):
-    """Yield (idx, in_f, out_f) for every Linear in the arch order."""
-    li = 0
+def weighted_layers(arch):
+    """Yield (kind, idx_within_kind, *args) for every layer that has its
+    own weights/biases (Linear and Conv2d so far).  Used to enumerate
+    the W/b naming order in both the source and the staging files."""
+    li = 0   # linear index
+    ci = 0   # conv index
     for kind, *args in arch:
         if kind == "linear":
-            yield li, args[0], args[1]
+            yield ("linear", li, *args)
             li += 1
+        elif kind == "conv2d_3x3_p1":
+            yield ("conv2d_3x3_p1", ci, *args)
+            ci += 1
 
 
-def collect_weights(arch, sd, key_pattern):
-    """Return a flat list of f32 numpy arrays, in load order."""
-    out = []
-    for idx, in_f, out_f in linear_layers(arch):
-        out.extend(linear_weights(idx, in_f, out_f, sd, key_pattern))
-    return out
+def linear_layers(arch):
+    """Yield (idx, in_f, out_f) for every Linear in the arch order."""
+    for kind, idx, *rest in weighted_layers(arch):
+        if kind == "linear":
+            yield idx, rest[0], rest[1]
+
+
+def weight_size(kind, *args):
+    """Number of f32 elements for a weighted layer (W) and (b)."""
+    if kind == "linear":
+        in_f, out_f = args
+        return out_f * in_f, out_f
+    if kind == "conv2d_3x3_p1":
+        c_in, c_out = args
+        return c_out * c_in * 9, c_out
+    raise ValueError(f"weight_size: no weights for {kind!r}")
 
 
 def gen_weight_decls(arch, embed):
@@ -183,25 +199,71 @@ def gen_weight_decls(arch, embed):
     if embed:
         return []
     lines = []
-    for idx, in_f, out_f in linear_layers(arch):
-        lines.append(f"    let W{idx}: i32 = arr_f32_new({out_f * in_f});")
-        lines.append(f"    let b{idx}: i32 = arr_f32_new({out_f});")
+    for kind, idx, *rest in weighted_layers(arch):
+        nw, nb = weight_size(kind, *rest)
+        if kind == "linear":
+            wname, bname = f"W{idx}", f"b{idx}"
+        else:  # conv2d_3x3_p1
+            wname, bname = f"Wc{idx}", f"bc{idx}"
+        lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
+        lines.append(f"    let {bname}: i32 = arr_f32_new({nb});")
     return lines
 
 
 def gen_act_decls(arch):
-    """One activation buffer per shape-changing step (input + each Linear's
-    output).  Returns the source lines and the sizes list for downstream
-    code that wants to know the activation widths."""
-    if not arch or arch[0][0] != "linear":
-        raise ValueError("arch must start with a Linear layer.")
-    sizes = [arch[0][1]]
+    """One activation buffer per shape-changing step.  Tracks size in
+    elements; spatial vs flat is implicit in how the next layer reads
+    it.  Returns (decl_lines, sizes_list)."""
+    if not arch:
+        raise ValueError("empty arch")
+    first = arch[0]
+    if first[0] == "linear":
+        sizes = [first[1]]
+    elif first[0] == "conv2d_3x3_p1":
+        c_in, _ = first[1], first[2]
+        sizes = [c_in * 28 * 28]
+    else:
+        raise ValueError(f"first layer must be linear or conv2d_3x3_p1, got {first[0]!r}")
+
     for kind, *args in arch:
         if kind == "linear":
             sizes.append(args[1])
+        elif kind == "conv2d_3x3_p1":
+            c_in, c_out = args
+            sizes.append(c_out * 28 * 28)
+        elif kind == "maxpool_2x2":
+            c = args[0]
+            sizes.append(c * 14 * 14)
+        elif kind == "flatten":
+            # No size change, just shape interpretation.  Reuse same buffer.
+            pass
+        # in-place activations: same buffer
+
     lines = [f"    let a{i}: i32 = arr_f32_new({sz});"
              for i, sz in enumerate(sizes)]
     return lines, sizes
+
+
+def gen_scratch(arch):
+    """Extra scratch buffers needed by spatial layers."""
+    lines = []
+    if any(layer[0] == "conv2d_3x3_p1" for layer in arch):
+        lines.append("    let padded: i32 = arr_f32_new(900);  // 30×30 zero-padded")
+    pi = 0
+    for kind, *args in arch:
+        if kind == "maxpool_2x2":
+            c = args[0]
+            lines.append(f"    let pool_a{pi}: i32 = arr_f32_new({c * 14 * 14});")
+            pi += 1
+    return lines
+
+
+def names_for(kind, idx):
+    if kind == "linear":
+        return f"W{idx}", f"b{idx}"
+    if kind == "conv2d_3x3_p1":
+        return f"Wc{idx}", f"bc{idx}"
+    raise ValueError(f"names_for: no weights for {kind!r}")
 
 
 def gen_load(arch, embed_dir, out_name, embed):
@@ -210,15 +272,18 @@ def gen_load(arch, embed_dir, out_name, embed):
     binary)."""
     if embed:
         lines = []
-        for idx, in_f, out_f in linear_layers(arch):
-            lines.append(f"    let W{idx}: i32 = embed_file(\"{embed_dir}/{out_name}_W{idx}.f32\");")
-            lines.append(f"    let b{idx}: i32 = embed_file(\"{embed_dir}/{out_name}_b{idx}.f32\");")
+        for kind, idx, *rest in weighted_layers(arch):
+            wname, bname = names_for(kind, idx)
+            lines.append(f"    let {wname}: i32 = embed_file(\"{embed_dir}/{out_name}_{wname}.f32\");")
+            lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
         return lines
     lines = [f"    let weight_path: i32 = str_new(\"{out_name}.f32\");",
              "    let _wfd: i32 = file_open(weight_path, 0);"]
-    for idx, in_f, out_f in linear_layers(arch):
-        lines.append(f"    file_read(_wfd, W{idx}, {out_f * in_f * 4});")
-        lines.append(f"    file_read(_wfd, b{idx}, {out_f * 4});")
+    for kind, idx, *rest in weighted_layers(arch):
+        wname, bname = names_for(kind, idx)
+        nw, nb = weight_size(kind, *rest)
+        lines.append(f"    file_read(_wfd, {wname}, {nw * 4});")
+        lines.append(f"    file_read(_wfd, {bname}, {nb * 4});")
     lines.append("    file_close(_wfd);")
     return lines
 
@@ -227,12 +292,15 @@ def gen_forward(arch):
     """Emit the per-sample forward pass on activation buffers a0..aN.
 
     cur_a tracks which activation buffer holds the running tensor.
-    Linear creates a new shape ⇒ advance to the next buffer.  ReLU /
-    sigmoid / tanh / softmax run in-place ⇒ keep the same buffer.
+    Layers that change the size advance to the next buffer; in-place
+    activations and `flatten` (which is just a reshape) keep the same
+    buffer.
     """
     lines = []
     cur_a = 0
     li = 0
+    ci = 0
+    pi = 0
     for kind, *args in arch:
         if kind == "linear":
             in_f, out_f = args
@@ -241,6 +309,60 @@ def gen_forward(arch):
             lines += emit_linear(li, in_f, out_f, src, dst, f"W{li}", f"b{li}")
             cur_a += 1
             li += 1
+        elif kind == "conv2d_3x3_p1":
+            c_in, c_out = args
+            if c_in != 1:
+                raise ValueError(
+                    "v0.4 supports conv2d_3x3_p1 with C_in=1 only "
+                    "(arr_f32_conv2d_3x3_p1 builtin is single-channel input)."
+                )
+            src = f"a{cur_a}"
+            dst = f"a{cur_a + 1}"
+            # Pad → call the AVX2 builtin.
+            lines.append(f"    arr_f32_fill(padded, 0.0);")
+            lines.append(f"    let _y{ci}: i32 = 0;")
+            lines.append(f"    while (_y{ci} < 28) {{")
+            lines.append(f"        arr_f32_copy_slice({src}, _y{ci} * 28, padded, (_y{ci} + 1) * 30 + 1, 28);")
+            lines.append(f"        _y{ci} = _y{ci} + 1;")
+            lines.append(f"    }}")
+            lines.append(f"    arr_f32_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out});")
+            cur_a += 1
+            ci += 1
+        elif kind == "maxpool_2x2":
+            c = args[0]
+            src = f"a{cur_a}"
+            dst = f"a{cur_a + 1}"
+            argmax_buf = f"pool_a{pi}"
+            # 2×2 max pooling kernel — inlined from conv2d_f32.ari.
+            lines.append(f"    let _c{pi}: i32 = 0;")
+            lines.append(f"    while (_c{pi} < {c}) {{")
+            lines.append(f"        let _ino{pi}: i32 = _c{pi} * 784;")
+            lines.append(f"        let _outo{pi}: i32 = _c{pi} * 196;")
+            lines.append(f"        let _y{pi}: i32 = 0;")
+            lines.append(f"        while (_y{pi} < 14) {{")
+            lines.append(f"            let _x{pi}: i32 = 0;")
+            lines.append(f"            while (_x{pi} < 14) {{")
+            lines.append(f"                let _i0{pi}: i32 = _ino{pi} + (2 * _y{pi}) * 28 + 2 * _x{pi};")
+            lines.append(f"                let _v0{pi}: f64 = arr_f32_get({src}, _i0{pi});")
+            lines.append(f"                let _v1{pi}: f64 = arr_f32_get({src}, _i0{pi} + 1);")
+            lines.append(f"                let _v2{pi}: f64 = arr_f32_get({src}, _i0{pi} + 28);")
+            lines.append(f"                let _v3{pi}: f64 = arr_f32_get({src}, _i0{pi} + 29);")
+            lines.append(f"                let _bv{pi}: f64 = _v0{pi};")
+            lines.append(f"                if (_v1{pi} > _bv{pi}) {{ _bv{pi} = _v1{pi}; }}")
+            lines.append(f"                if (_v2{pi} > _bv{pi}) {{ _bv{pi} = _v2{pi}; }}")
+            lines.append(f"                if (_v3{pi} > _bv{pi}) {{ _bv{pi} = _v3{pi}; }}")
+            lines.append(f"                arr_f32_set({dst}, _outo{pi} + _y{pi} * 14 + _x{pi}, _bv{pi});")
+            lines.append(f"                _x{pi} = _x{pi} + 1;")
+            lines.append(f"            }}")
+            lines.append(f"            _y{pi} = _y{pi} + 1;")
+            lines.append(f"        }}")
+            lines.append(f"        _c{pi} = _c{pi} + 1;")
+            lines.append(f"    }}")
+            cur_a += 1
+            pi += 1
+        elif kind == "flatten":
+            # Reshape only — same buffer holds the data.  No code emitted.
+            pass
         elif kind == "relu":
             lines += emit_relu(f"a{cur_a}")
         elif kind == "sigmoid":
@@ -256,11 +378,13 @@ def gen_forward(arch):
 
 def gen_main(arch, args, out_name, embed_dir):
     weight_decls = gen_weight_decls(arch, args.embed)
-    act_decls, _ = gen_act_decls(arch)
+    act_decls, sizes = gen_act_decls(arch)
     load = gen_load(arch, embed_dir, out_name, args.embed)
     fwd, last = gen_forward(arch)
 
-    n_in  = arch[0][1]
+    # n_in = the *size in elements* of the input buffer a0.  For an MLP
+    # this is the first layer's in_features; for a CNN it's c_in*28*28.
+    n_in  = sizes[0]
     n_out = next(i for i in reversed(arch) if i[0] == "linear")[2]
 
     body = []
@@ -268,6 +392,7 @@ def gen_main(arch, args, out_name, embed_dir):
     body += weight_decls
     body += load
     body += act_decls
+    body += gen_scratch(arch)
     body.append("")
 
     if args.input_format == "stdin":
@@ -373,6 +498,17 @@ def expand_keys(template):
     return keys
 
 
+def sd_lookup(sd, candidates):
+    """Return the first key in `candidates` that's present in `sd`,
+    or None if none match.  Used for conv weights where the natural
+    state_dict key (conv.weight) doesn't share the linear naming
+    template."""
+    for k in candidates:
+        if k in sd:
+            return k
+    return None
+
+
 def main():
     args = parse_args()
 
@@ -404,8 +540,11 @@ def main():
             resolved[("bias",   li)] = keys(li, "bias")
             li += 1
 
-    weights_blob = []
+    # Collect (kind, idx, W, b) tuples in arch order so the staging-file
+    # writer can name them consistently.
+    collected = []   # list of (kind, idx, W_array, b_array)
     li = 0
+    ci = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -423,30 +562,59 @@ def main():
                     f"linear #{li}: shape mismatch.  expected ({out_f},{in_f}) "
                     f"+ ({out_f},); got {tuple(W.shape)} + {tuple(b.shape)}."
                 )
-            weights_blob.append(W)
-            weights_blob.append(b)
+            collected.append(("linear", li, W, b))
             li += 1
+        elif kind == "conv2d_3x3_p1":
+            c_in, c_out = largs
+            # Conv keys default to {idx_plus_1}.weight; if the user kept
+            # PyTorch's natural `conv.weight` naming, --keys can be
+            # remapped per call.  By default the same template is shared
+            # — works for the demo where the conv's index_plus_1 = 1
+            # (i.e. "1.weight") doesn't clash with fc names.  Real users
+            # can pass --conv-keys later; v0.4 supports the simple case.
+            wkey = sd_lookup(sd, ["conv.weight",
+                                  f"layers.{ci}.weight",
+                                  keys(ci, "weight")])
+            bkey = sd_lookup(sd, ["conv.bias",
+                                  f"layers.{ci}.bias",
+                                  keys(ci, "bias")])
+            if wkey is None or bkey is None:
+                raise SystemExit(
+                    f"conv2d_3x3_p1 #{ci}: cannot find weight/bias in "
+                    f"checkpoint.  Tried: conv.weight / layers.{ci}.weight / "
+                    f"{keys(ci, 'weight')}.  Available: {sorted(sd.keys())}"
+                )
+            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            b = sd[bkey].detach().cpu().numpy().astype("float32")
+            if W.shape != (c_out, c_in, 3, 3) or b.shape != (c_out,):
+                raise SystemExit(
+                    f"conv2d_3x3_p1 #{ci}: shape mismatch.  expected "
+                    f"({c_out},{c_in},3,3) + ({c_out},); got "
+                    f"{tuple(W.shape)} + {tuple(b.shape)}."
+                )
+            # Flatten (C_out, C_in, 3, 3) → (C_out, C_in*9) row-major to
+            # match arr_f32_conv2d_3x3_p1's expected weight layout.
+            W = W.reshape(c_out, c_in * 9)
+            collected.append(("conv2d_3x3_p1", ci, W, b))
+            ci += 1
+    weights_blob = [a for (_, _, W, b) in collected for a in (W, b)]
 
     out_base = Path(args.out)
     src_path  = out_base.with_suffix(".ari")
     embed_dir = str(out_base.parent.resolve())
 
     if args.embed:
-        # One .f32 per tensor, in W0/b0/W1/b1/... order.  embed_file
-        # consumes them at compile time and bakes the bytes into the .text
-        # section; they're not needed at runtime.
+        # One .f32 per tensor, in arch order.  embed_file consumes them at
+        # compile time and bakes the bytes into the .text section; they're
+        # not needed at runtime.
         wrote = []
-        li = 0
-        for kind, *largs in arch:
-            if kind != "linear":
-                continue
-            W, b = weights_blob[2 * li], weights_blob[2 * li + 1]
-            wp = out_base.parent / f"{out_base.name}_W{li}.f32"
-            bp = out_base.parent / f"{out_base.name}_b{li}.f32"
+        for kind, idx, W, b in collected:
+            wname, bname = names_for(kind, idx)
+            wp = out_base.parent / f"{out_base.name}_{wname}.f32"
+            bp = out_base.parent / f"{out_base.name}_{bname}.f32"
             with open(wp, "wb") as f: W.tofile(f)
             with open(bp, "wb") as f: b.tofile(f)
             wrote.extend([wp, bp])
-            li += 1
         print("wrote per-tensor staging files:")
         for p in wrote:
             print(f"  {p}")
@@ -457,12 +625,16 @@ def main():
                 arr.tofile(f)
         print(f"wrote {blob_path}")
 
+    # The activation buffer a0 is sized in elements; that's also the
+    # number of input bytes per MNIST sample (1 byte per pixel).
+    _, sizes = gen_act_decls(arch)
+    n_in_elements = sizes[0]
     src = (
         PROLOGUE.format(model_name=out_base.name,
                         arch_repr=arch,
                         loader=args.input_format)
         + "\n"
-        + MNIST_LOADER.format(n_in=arch[0][1],
+        + MNIST_LOADER.format(n_in=n_in_elements,
                               mean=args.mean,
                               std=args.std)
         + "\n"
