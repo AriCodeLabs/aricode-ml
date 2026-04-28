@@ -1,0 +1,174 @@
+// aricode-ml: attention_f32.ari
+//
+// Single-head scaled dot-product attention forward, f32 throughout.
+// Built on the F1 primitives — arr_f32_matvec / matvec_T, transpose,
+// layernorm, softmax-with-tail.
+//
+// Layout convention (row-major, contiguous along the last dim):
+//   X         : [seq, d_in]           input activations
+//   W_Q W_K W_V : [d_head, d_in]      projection weights (matvec layout)
+//   b_Q b_K b_V : [d_head]            per-output biases (zero is fine)
+//   Q  K  V   : [seq, d_head]         scratch for projected tensors
+//   scores    : [seq, seq]            scratch for attention probs
+//   out       : [seq, d_head]         output
+//
+// aricode caps function args at 6 (System V passes the first 6 in
+// registers; we don't spill beyond that), so attention takes a
+// descriptor array with all the buffers and dimensions packed in.
+//
+// Descriptor layout (24 slots):
+//   [ 0]  X       (input activation)
+//   [ 1]  W_Q     [ 2] b_Q
+//   [ 3]  W_K     [ 4] b_K
+//   [ 5]  W_V     [ 6] b_V
+//   [ 7]  Q       [ 8] K       [ 9] V
+//   [10]  scores
+//   [11]  out
+//   [12]  row_in       — d_in scratch (one input row at a time)
+//   [13]  row_qkv      — d_head scratch (projected row)
+//   [14]  row_score    — seq scratch (one row of scores)
+//   [15]  zero_bias_seq — seq-length zeros (matvec bias arg)
+//   [16]  seq
+//   [17]  d_in
+//   [18]  d_head
+//   [19]  causal       — non-zero ⇒ apply triangular mask
+//   [20..23] reserved for future use (mask buffer, dropout state, …)
+//
+// `attn_alloc_desc_f32(seq, d_in, d_head, causal)` builds and returns
+// a populated descriptor with all scratch buffers allocated; the
+// caller fills in the X / W_* / b_* / out slots before invoking
+// `attention_forward_f32`.
+
+// ----------------------------------------------------------------------
+// Descriptor allocator: caller fills slots [0..6] (X + weights/biases)
+// and slot [11] (out) afterwards.
+// ----------------------------------------------------------------------
+fn attn_alloc_desc_f32(seq: i32, d_in: i32, d_head: i32, causal: i32) -> i32 {
+    let d: i32 = arr_new(24);
+    arr_set(d,  7, arr_f32_new(seq * d_head));     // Q
+    arr_set(d,  8, arr_f32_new(seq * d_head));     // K
+    arr_set(d,  9, arr_f32_new(seq * d_head));     // V
+    arr_set(d, 10, arr_f32_new(seq * seq));        // scores
+    arr_set(d, 12, arr_f32_new(d_in));             // row_in
+    arr_set(d, 13, arr_f32_new(d_head));           // row_qkv
+    arr_set(d, 14, arr_f32_new(seq));              // row_score
+    let zb: i32 = arr_f32_new(seq);
+    arr_f32_fill(zb, 0.0);
+    arr_set(d, 15, zb);                            // zero_bias_seq
+    arr_set(d, 16, seq);
+    arr_set(d, 17, d_in);
+    arr_set(d, 18, d_head);
+    arr_set(d, 19, causal);
+    return d;
+}
+
+// ----------------------------------------------------------------------
+// Project: Q[i] = W_Q · X[i] + b_Q  (similarly for K, V).
+// ----------------------------------------------------------------------
+fn attn_project_qkv_f32(desc: i32) -> i32 {
+    let X: i32      = arr_get(desc,  0);
+    let W_Q: i32    = arr_get(desc,  1);  let b_Q: i32 = arr_get(desc,  2);
+    let W_K: i32    = arr_get(desc,  3);  let b_K: i32 = arr_get(desc,  4);
+    let W_V: i32    = arr_get(desc,  5);  let b_V: i32 = arr_get(desc,  6);
+    let Q: i32      = arr_get(desc,  7);
+    let K: i32      = arr_get(desc,  8);
+    let V: i32      = arr_get(desc,  9);
+    let row_in: i32 = arr_get(desc, 12);
+    let row_qkv: i32= arr_get(desc, 13);
+    let seq: i32    = arr_get(desc, 16);
+    let d_in: i32   = arr_get(desc, 17);
+    let d_head: i32 = arr_get(desc, 18);
+
+    let i: i32 = 0;
+    while (i < seq) {
+        arr_f32_copy_slice(X, i * d_in, row_in, 0, d_in);
+
+        arr_f32_matvec(W_Q, row_in, b_Q, row_qkv, d_head, d_in);
+        arr_f32_copy_slice(row_qkv, 0, Q, i * d_head, d_head);
+
+        arr_f32_matvec(W_K, row_in, b_K, row_qkv, d_head, d_in);
+        arr_f32_copy_slice(row_qkv, 0, K, i * d_head, d_head);
+
+        arr_f32_matvec(W_V, row_in, b_V, row_qkv, d_head, d_in);
+        arr_f32_copy_slice(row_qkv, 0, V, i * d_head, d_head);
+
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// Scores + softmax (one row at a time): scores[i, j] = Q[i]·K[j] / √d_head,
+// optionally causal-masked, softmaxed over j.
+// ----------------------------------------------------------------------
+fn attn_scores_softmax_f32(desc: i32) -> i32 {
+    let Q: i32         = arr_get(desc,  7);
+    let K: i32         = arr_get(desc,  8);
+    let scores: i32    = arr_get(desc, 10);
+    let row_qkv: i32   = arr_get(desc, 13);
+    let row_score: i32 = arr_get(desc, 14);
+    let zero_bias: i32 = arr_get(desc, 15);
+    let seq: i32       = arr_get(desc, 16);
+    let d_head: i32    = arr_get(desc, 18);
+    let causal: i32    = arr_get(desc, 19);
+
+    let inv_sqrt_dh: f64 = 1.0 / math_sqrt(int_to_float(d_head));
+    // Mask sentinel.  The vec_exp body builds 2^k from a 32-bit integer
+    // round(x · log2e); for |x| ≳ 1e8 the round() saturates and the
+    // 2^k bit-build wraps, so −1e9 returned garbage.  −60 is plenty:
+    // exp(−60) ≈ 1e-26, well below f32 epsilon — softmax treats those
+    // logits as effectively zero contribution.
+    let neg_big: f64 = 0.0 - 60.0;
+
+    let i: i32 = 0;
+    while (i < seq) {
+        arr_f32_copy_slice(Q, i * d_head, row_qkv, 0, d_head);
+        arr_f32_matvec(K, row_qkv, zero_bias, row_score, seq, d_head);
+        arr_f32_scale(row_score, inv_sqrt_dh);
+
+        if (causal != 0) {
+            let j: i32 = i + 1;
+            while (j < seq) {
+                arr_f32_set(row_score, j, neg_big);
+                j = j + 1;
+            }
+        }
+
+        arr_f32_softmax(row_score);
+        arr_f32_copy_slice(row_score, 0, scores, i * seq, seq);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// Combine: out[i, :] = sum_j scores[i, j] · V[j, :] = Vᵀ · scores[i, :]
+// ----------------------------------------------------------------------
+fn attn_combine_f32(desc: i32) -> i32 {
+    let V: i32         = arr_get(desc,  9);
+    let scores: i32    = arr_get(desc, 10);
+    let out: i32       = arr_get(desc, 11);
+    let row_qkv: i32   = arr_get(desc, 13);
+    let row_score: i32 = arr_get(desc, 14);
+    let seq: i32       = arr_get(desc, 16);
+    let d_head: i32    = arr_get(desc, 18);
+
+    let i: i32 = 0;
+    while (i < seq) {
+        arr_f32_copy_slice(scores, i * seq, row_score, 0, seq);
+        arr_f32_matvec_T(V, row_score, row_qkv, seq, d_head);
+        arr_f32_copy_slice(row_qkv, 0, out, i * d_head, d_head);
+        i = i + 1;
+    }
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// One-shot single-head attention forward (project → scores → combine).
+// ----------------------------------------------------------------------
+fn attention_forward_f32(desc: i32) -> i32 {
+    attn_project_qkv_f32(desc);
+    attn_scores_softmax_f32(desc);
+    attn_combine_f32(desc);
+    return 0;
+}
