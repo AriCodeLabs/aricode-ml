@@ -81,9 +81,23 @@ def linear_weights(idx: int, in_f: int, out_f: int, sd, key_pattern: str):
     return [W, b]
 
 
-def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var):
+def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
+                quant_scale=None):
+    """Emit a Linear-layer forward.
+
+    `quant_scale` is None for the f32 path (default, single arr_f32_matvec
+    call) or a Python float when the weights are int8.  In the int8 case
+    we use the native arr_i8_matvec_f32 builtin, then arr_f32_add_scaled
+    to fuse in the f32 bias — two calls vs one on the f32 path, but the
+    weights stay int8 in RAM so RAM usage on a 200 KB FC layer drops to
+    50 KB and we skip the startup dequant pass entirely."""
+    if quant_scale is None:
+        return [
+            f"    arr_f32_matvec({w_var}, {src_var}, {b_var}, {dst_var}, {out_f}, {in_f});",
+        ]
     return [
-        f"    arr_f32_matvec({w_var}, {src_var}, {b_var}, {dst_var}, {out_f}, {in_f});",
+        f"    arr_i8_matvec_f32({w_var}, {src_var}, {dst_var}, {out_f}, {quant_scale!r});",
+        f"    arr_f32_add_scaled({dst_var}, {b_var}, 1.0);",
     ]
 
 
@@ -305,20 +319,29 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
     main() when --quantize int8 is in effect; ignored otherwise.
     """
     if embed and quantize == "int8":
+        # Linear: weights stay int8 in RAM (used directly by arr_i8_matvec_f32);
+        #         biases remain f32 (small, no quantisation benefit).
+        # Conv:   weights are int8 in the binary but dequantised to f32 at
+        #         startup (the conv builtin only takes f32); biases f32.
         lines = []
         for kind, idx, *rest in weighted_layers(arch):
             wname, bname = names_for(kind, idx)
             nw, nb = weight_size(kind, *rest)
             scale_w = scales[(kind, idx, "W")]
-            scale_b = scales[(kind, idx, "b")]
-            # Embed int8 staging blobs.
-            lines.append(f"    let _q_{wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
-            lines.append(f"    let _q_{bname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{bname}.i8\");")
-            # Allocate f32 buffers + dequantise once at startup.
-            lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
-            lines.append(f"    dequant_int8_to_f32(_q_{wname}, {wname}, {nw}, {scale_w!r});")
-            lines.append(f"    let {bname}: i32 = arr_f32_new({nb});")
-            lines.append(f"    dequant_int8_to_f32(_q_{bname}, {bname}, {nb}, {scale_b!r});")
+            if kind == "linear":
+                # Weights: int8 in binary AND in RAM; matvec uses them direct.
+                lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                # Bias: f32 sidecar (no quantisation).
+                lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
+            else:
+                # Conv path: quantised weights need dequant to f32 because
+                # arr_f32_conv2d_3x3_p1 only consumes f32.  Tiny tensors (a
+                # 16-channel 3×3 kernel is 1152 bytes) so the dequant pass
+                # is essentially free.
+                lines.append(f"    let _q_{wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
+                lines.append(f"    dequant_int8_to_f32(_q_{wname}, {wname}, {nw}, {scale_w!r});")
+                lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
         return lines
     if embed:
         lines = []
@@ -338,13 +361,17 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
     return lines
 
 
-def gen_forward(arch):
+def gen_forward(arch, scales=None):
     """Emit the per-sample forward pass on activation buffers a0..aN.
 
     cur_a tracks which activation buffer holds the running tensor.
     Layers that change the size advance to the next buffer; in-place
     activations and `flatten` (which is just a reshape) keep the same
     buffer.
+
+    `scales` is a {(kind, idx, "W"|"b") → float} dict populated when
+    --quantize int8 is in effect; emit_linear will switch to the native
+    int8 matvec path when it sees a scale for its layer.
     """
     lines = []
     cur_a = 0
@@ -356,7 +383,9 @@ def gen_forward(arch):
             in_f, out_f = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            lines += emit_linear(li, in_f, out_f, src, dst, f"W{li}", f"b{li}")
+            sc = scales.get(("linear", li, "W")) if scales else None
+            lines += emit_linear(li, in_f, out_f, src, dst,
+                                 f"W{li}", f"b{li}", quant_scale=sc)
             cur_a += 1
             li += 1
         elif kind == "conv2d_3x3_p1":
@@ -472,7 +501,7 @@ def gen_main(arch, args, out_name, embed_dir, scales):
     act_decls, sizes = gen_act_decls(arch)
     load = gen_load(arch, embed_dir, out_name, args.embed,
                     args.quantize, scales)
-    fwd, last = gen_forward(arch)
+    fwd, last = gen_forward(arch, scales if quant_active else None)
 
     # n_in = the *size in elements* of the input buffer a0.  For an MLP
     # this is the first layer's in_features; for a CNN it's c_in*28*28.
@@ -712,35 +741,37 @@ def main():
         args.embed = True
 
     if args.embed and args.quantize == "int8":
+        # Quantise weights to int8; keep biases as f32 (always tiny —
+        # quantising them buys ~10 bytes per layer at the cost of a
+        # less-accurate constant offset).
         import numpy as _np
         wrote = []
         for kind, idx, W, b in collected:
             wname, bname = names_for(kind, idx)
-            for arr, name in ((W, wname), (b, bname)):
-                # Symmetric per-tensor int8: scale = max|x| / 127.  Edge
-                # case: if the tensor is identically zero, scale=0 and
-                # all quantised bytes are 0; the dequant restores zeros.
-                abs_max = float(_np.abs(arr).max()) if arr.size else 0.0
-                scale = abs_max / 127.0 if abs_max > 0 else 0.0
-                if scale == 0.0:
-                    q = _np.zeros(arr.shape, dtype=_np.int8)
-                else:
-                    q = _np.round(arr / scale).clip(-128, 127).astype(_np.int8)
-                kind_short = "W" if name == wname else "b"
-                scales[(kind, idx, kind_short)] = scale
-                p = out_base.parent / f"{out_base.name}_{name}.i8"
-                q.tofile(p)
-                wrote.append(p)
-        print("wrote per-tensor int8 staging files:")
-        total_bytes = 0
+            # Weight: int8.
+            abs_max = float(_np.abs(W).max()) if W.size else 0.0
+            scale = abs_max / 127.0 if abs_max > 0 else 0.0
+            if scale == 0.0:
+                q = _np.zeros(W.shape, dtype=_np.int8)
+            else:
+                q = _np.round(W / scale).clip(-128, 127).astype(_np.int8)
+            scales[(kind, idx, "W")] = scale
+            wp = out_base.parent / f"{out_base.name}_{wname}.i8"
+            q.tofile(wp)
+            wrote.append(wp)
+            # Bias: f32.
+            bp = out_base.parent / f"{out_base.name}_{bname}.f32"
+            b.tofile(bp)
+            wrote.append(bp)
+        print("wrote per-tensor staging files:")
+        total = 0
         for p in wrote:
             sz = p.stat().st_size
-            total_bytes += sz
+            total += sz
             print(f"  {p}  ({sz} bytes)")
-        # Show the shrink we baked into the binary.
-        f32_bytes = sum(a.size * 4 for (_, _, W, b) in collected for a in (W, b))
-        print(f"weights:  {f32_bytes} bytes (f32) → {total_bytes} bytes "
-              f"(int8) — {f32_bytes / max(total_bytes, 1):.2f}× smaller")
+        f32_total = sum(a.size * 4 for (_, _, W, b) in collected for a in (W, b))
+        print(f"weights+biases:  {f32_total} bytes (all-f32) → {total} bytes "
+              f"(int8 W + f32 b) — {f32_total / max(total, 1):.2f}× smaller")
     elif args.embed:
         wrote = []
         for kind, idx, W, b in collected:
