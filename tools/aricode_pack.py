@@ -321,23 +321,29 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
     if embed and quantize == "int8":
         # Linear: weights stay int8 in RAM (used directly by arr_i8_matvec_f32);
         #         biases remain f32 (small, no quantisation benefit).
-        # Conv:   weights are int8 in the binary but dequantised to f32 at
-        #         startup (the conv builtin only takes f32); biases f32.
+        # Conv (C_in = 1):   weights stay int8 in RAM, used directly by
+        #                    arr_i8_conv2d_3x3_p1 — no dequant pass.
+        # Conv (C_in > 1):   weights are int8 in the binary but dequantised
+        #                    to f32 at startup, because the multi-channel
+        #                    conv path is implemented as a user-fn loop
+        #                    over input channels and there's no int8
+        #                    multi-channel kernel yet.  Tensors are tiny
+        #                    (a 16-channel 3×3×8 kernel is 1152 bytes),
+        #                    so the dequant pass is essentially free.
         lines = []
         for kind, idx, *rest in weighted_layers(arch):
             wname, bname = names_for(kind, idx)
             nw, nb = weight_size(kind, *rest)
             scale_w = scales[(kind, idx, "W")]
             if kind == "linear":
-                # Weights: int8 in binary AND in RAM; matvec uses them direct.
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
-                # Bias: f32 sidecar (no quantisation).
+                lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
+            elif kind == "conv2d_3x3_p1" and rest[0] == 1:
+                # Single-channel conv: int8 weights stay int8.
+                lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
             else:
-                # Conv path: quantised weights need dequant to f32 because
-                # arr_f32_conv2d_3x3_p1 only consumes f32.  Tiny tensors (a
-                # 16-channel 3×3 kernel is 1152 bytes) so the dequant pass
-                # is essentially free.
+                # Multi-channel conv: dequant to f32 at startup.
                 lines.append(f"    let _q_{wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
                 lines.append(f"    dequant_int8_to_f32(_q_{wname}, {wname}, {nw}, {scale_w!r});")
@@ -392,16 +398,22 @@ def gen_forward(arch, scales=None):
             c_in, c_out = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
+            conv_scale = scales.get(("conv2d_3x3_p1", ci, "W")) if scales else None
             if c_in == 1:
                 # Fast path: single-channel input goes straight into the
-                # AVX2 builtin.  Pad once, call once.
+                # AVX2 builtin.  Pad once, call once.  The int8 variant
+                # carries the per-tensor scale and reads weights as i8;
+                # otherwise fall back to the f32 conv builtin.
                 lines.append(f"    arr_f32_fill(padded, 0.0);")
                 lines.append(f"    let _y{ci}: i32 = 0;")
                 lines.append(f"    while (_y{ci} < 28) {{")
                 lines.append(f"        arr_f32_copy_slice({src}, _y{ci} * 28, padded, (_y{ci} + 1) * 30 + 1, 28);")
                 lines.append(f"        _y{ci} = _y{ci} + 1;")
                 lines.append(f"    }}")
-                lines.append(f"    arr_f32_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out});")
+                if conv_scale is not None:
+                    lines.append(f"    arr_i8_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out}, {conv_scale!r});")
+                else:
+                    lines.append(f"    arr_f32_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out});")
             else:
                 # Multi-channel input: loop over C_in and reuse the single-
                 # channel builtin per slice.  Each iteration:
