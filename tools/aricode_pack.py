@@ -116,10 +116,26 @@ PROLOGUE = """\
 // model: {model_name}
 // arch:  {arch_repr}
 // loader: {loader}
+// quantization: {quantize}
 // (run aricode_pack.py to regenerate after retraining.)
 
 fn arr_f32_from_file_into(fd: i32, buf: i32, n: i32) -> i32 {{
     file_read(fd, buf, n * 4);
+    return 0;
+}}
+
+// Dequantise n int8 bytes from `q` into f32 buffer `dst`, multiplying by
+// `scale`.  Sign-extends the byte before the float conversion (Aricode's
+// byte_at returns 0..255).  Used when the binary was packed with
+// `--quantize int8` — runs once per weight tensor at startup.
+fn dequant_int8_to_f32(q: i32, dst: i32, n: i32, scale: f64) -> i32 {{
+    let i: i32 = 0;
+    while (i < n) {{
+        let v: i32 = byte_at(q, i);
+        if (v >= 128) {{ v = v - 256; }}
+        arr_f32_set(dst, i, int_to_float(v) * scale);
+        i = i + 1;
+    }}
     return 0;
 }}
 
@@ -279,10 +295,31 @@ def names_for(kind, idx):
     raise ValueError(f"names_for: no weights for {kind!r}")
 
 
-def gen_load(arch, embed_dir, out_name, embed):
-    """Either runtime `file_read` calls (embed=False, single .f32 sidecar)
-    or compile-time `embed_file` calls (embed=True, weights baked into the
-    binary)."""
+def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
+    """Three paths:
+       - runtime file_read (embed=False)            : single .f32 sidecar
+       - embed_file f32   (embed=True, quant=none)  : f32 baked into .text
+       - embed_file_bytes int8 + dequant (quant=int8): int8 baked + dequant
+                                                       at startup
+    `scales` is a dict {(kind, idx, "W" | "b"): scale_f64} populated by
+    main() when --quantize int8 is in effect; ignored otherwise.
+    """
+    if embed and quantize == "int8":
+        lines = []
+        for kind, idx, *rest in weighted_layers(arch):
+            wname, bname = names_for(kind, idx)
+            nw, nb = weight_size(kind, *rest)
+            scale_w = scales[(kind, idx, "W")]
+            scale_b = scales[(kind, idx, "b")]
+            # Embed int8 staging blobs.
+            lines.append(f"    let _q_{wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+            lines.append(f"    let _q_{bname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{bname}.i8\");")
+            # Allocate f32 buffers + dequantise once at startup.
+            lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
+            lines.append(f"    dequant_int8_to_f32(_q_{wname}, {wname}, {nw}, {scale_w!r});")
+            lines.append(f"    let {bname}: i32 = arr_f32_new({nb});")
+            lines.append(f"    dequant_int8_to_f32(_q_{bname}, {bname}, {nb}, {scale_b!r});")
+        return lines
     if embed:
         lines = []
         for kind, idx, *rest in weighted_layers(arch):
@@ -427,10 +464,14 @@ def gen_forward(arch):
     return lines, cur_a
 
 
-def gen_main(arch, args, out_name, embed_dir):
-    weight_decls = gen_weight_decls(arch, args.embed)
+def gen_main(arch, args, out_name, embed_dir, scales):
+    # When --quantize int8 is in effect we don't pre-allocate W/b
+    # tensors; the load step both allocates and fills them.
+    quant_active = (args.quantize == "int8")
+    weight_decls = [] if quant_active else gen_weight_decls(arch, args.embed)
     act_decls, sizes = gen_act_decls(arch)
-    load = gen_load(arch, embed_dir, out_name, args.embed)
+    load = gen_load(arch, embed_dir, out_name, args.embed,
+                    args.quantize, scales)
     fwd, last = gen_forward(arch)
 
     # n_in = the *size in elements* of the input buffer a0.  For an MLP
@@ -539,6 +580,12 @@ def parse_args():
                         "embedded inline via embed_file, no runtime file "
                         "I/O for the model.  The MNIST images / labels "
                         "still come from disk.")
+    p.add_argument("--quantize", choices=("none", "int8"), default="none",
+                   help="Quantisation scheme for the weight blob.  int8 "
+                        "stores each tensor as signed-byte values + a "
+                        "single f32 scale per tensor; the binary shrinks "
+                        "by ~4× and the .ari preamble dequantises back "
+                        "to f32 at startup.  Implies --embed.")
     return p.parse_args()
 
 
@@ -656,10 +703,45 @@ def main():
     src_path  = out_base.with_suffix(".ari")
     embed_dir = str(out_base.parent.resolve())
 
-    if args.embed:
-        # One .f32 per tensor, in arch order.  embed_file consumes them at
-        # compile time and bakes the bytes into the .text section; they're
-        # not needed at runtime.
+    scales = {}   # (kind, idx, "W"|"b") → f32 scale, populated for int8
+
+    if args.quantize == "int8" and not args.embed:
+        # int8 only makes sense as a single-binary deploy; the
+        # alternative (separate sidecar) would require a different
+        # runtime loader path we don't currently emit.
+        args.embed = True
+
+    if args.embed and args.quantize == "int8":
+        import numpy as _np
+        wrote = []
+        for kind, idx, W, b in collected:
+            wname, bname = names_for(kind, idx)
+            for arr, name in ((W, wname), (b, bname)):
+                # Symmetric per-tensor int8: scale = max|x| / 127.  Edge
+                # case: if the tensor is identically zero, scale=0 and
+                # all quantised bytes are 0; the dequant restores zeros.
+                abs_max = float(_np.abs(arr).max()) if arr.size else 0.0
+                scale = abs_max / 127.0 if abs_max > 0 else 0.0
+                if scale == 0.0:
+                    q = _np.zeros(arr.shape, dtype=_np.int8)
+                else:
+                    q = _np.round(arr / scale).clip(-128, 127).astype(_np.int8)
+                kind_short = "W" if name == wname else "b"
+                scales[(kind, idx, kind_short)] = scale
+                p = out_base.parent / f"{out_base.name}_{name}.i8"
+                q.tofile(p)
+                wrote.append(p)
+        print("wrote per-tensor int8 staging files:")
+        total_bytes = 0
+        for p in wrote:
+            sz = p.stat().st_size
+            total_bytes += sz
+            print(f"  {p}  ({sz} bytes)")
+        # Show the shrink we baked into the binary.
+        f32_bytes = sum(a.size * 4 for (_, _, W, b) in collected for a in (W, b))
+        print(f"weights:  {f32_bytes} bytes (f32) → {total_bytes} bytes "
+              f"(int8) — {f32_bytes / max(total_bytes, 1):.2f}× smaller")
+    elif args.embed:
         wrote = []
         for kind, idx, W, b in collected:
             wname, bname = names_for(kind, idx)
@@ -685,13 +767,14 @@ def main():
     src = (
         PROLOGUE.format(model_name=out_base.name,
                         arch_repr=arch,
-                        loader=args.input_format)
+                        loader=args.input_format,
+                        quantize=args.quantize)
         + "\n"
         + MNIST_LOADER.format(n_in=n_in_elements,
                               mean=args.mean,
                               std=args.std)
         + "\n"
-        + gen_main(arch, args, out_base.name, embed_dir)
+        + gen_main(arch, args, out_base.name, embed_dir, scales)
         + "\n"
     )
     src_path.write_text(src)
