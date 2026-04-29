@@ -150,11 +150,12 @@ aricode-ml/
 | `flatten`        | —                          | reshape, no code emitted               |
 | `relu` / `sigmoid` / `tanh` / `softmax` | —              | in-place activations                   |
 
-Restrictions today: spatial size is 28×28 (the AVX2 conv builtin is
+Restrictions today: spatial size is 28×28 (the AVX2 conv builtins are
 hardcoded for MNIST); CIFAR-style 32×32 RGB needs a generic conv
-builtin which is on the roadmap.  Multi-channel conv with C_in > 1 is
-implemented as a user-fn loop over input channels — works, runs ~3-4×
-slower than a true multi-channel kernel would.
+builtin which is on the roadmap.  Multi-channel conv with C_in > 1
+goes through native AVX2 kernels (`arr_f32_conv2d_3x3_p1_multi` and
+`arr_i8_conv2d_3x3_p1_multi`) — same kernel call shape whether
+C_in = 1 or C_in = 64.
 
 ## When this is the right tool
 
@@ -203,13 +204,17 @@ Shipped:
   `arch.json` for sequential MLP / CNN architectures.  Removes the
   manual layer declaration step for the common cases (verified bit-
   exact against the hand-written archs for both demos).
+- v0.11: native multi-channel f32 conv (`arr_f32_conv2d_3x3_p1_multi`)
+  replaces the per-input-channel user-fn loop.  cnn2 demo: 1.45 s →
+  1.05 s for 10K samples (~38 % wall, layer-level ~3×).
+- v0.12: native multi-channel int8 conv
+  (`arr_i8_conv2d_3x3_p1_multi`).  Multi-channel int8 weights stay
+  int8 in RAM for `--input-format stdin` builds (single-shot CLI
+  cold-start halves: 2 ms → 1 ms).  Batch loaders still dequant
+  once at startup since amortising across N samples wins on
+  steady-state throughput; the packer picks per `--input-format`.
 
 Pending:
-- multi-channel int8 conv builtin (closes the last dequant pass for
-  deep CNNs; today multi-channel conv with `--quantize int8` falls
-  back to f32 dequant-at-startup).
-- multi-channel f32 conv builtin (`arr_f32_conv2d_3x3_p1_multi`) —
-  port the existing f64 implementation, skip the user-fn loop.
 - stand-alone transformer block packer (attention layer is already
   shipped in `attention_f32.ari`; needs the pack-side wiring).
 - HF auto-arch detection for *transformer* models (sentence-
