@@ -6,15 +6,16 @@ Neural network kernels and a model-to-binary packer for the
 Two halves:
 
 - **Training-side primitives** in pure `.ari` — dense, conv2d (3×3 pad
-  1), maxpool, single-head attention, AdamW + SGD, plus the AVX2
-  builtins behind them.  Used by the in-tree examples that train MNIST
-  end-to-end (98.65 % CNN with parallel workers, 23 s on a 4-core CPU).
+  1, single- or multi-channel input), maxpool, single-head attention,
+  layernorm, AdamW + SGD, plus the AVX2 builtins behind them.  Used by
+  the in-tree demos that train MNIST end-to-end (98.65 % CNN with
+  parallel workers, 23 s on a 4-core CPU).
 
 - **`aricode-pack`** — a tool that takes a PyTorch `state_dict` plus a
   short JSON architecture spec and emits a single self-contained ELF
   binary with the model weights baked into `.text`.  No Python, no
-  CUDA libs, no glibc, no runtime linker; ~200–400 KB total for small
-  models.
+  CUDA libs, no glibc, no runtime linker.  With `--quantize int8` a
+  2-conv MNIST CNN ships in 218 KB total.
 
 aricode is **not** a way to train large models faster than CUDA — it
 won't be, by 1-2 orders of magnitude.  It's a deployment niche: the
@@ -28,64 +29,95 @@ starts, regulated environments, offline machines, archival).
 cd examples/mnist_infer
 python3 -m venv .venv
 .venv/bin/pip install torch torchvision
-.venv/bin/python train_cnn_and_export.py
-# → cnn_mnist.pt              (state_dict, 33 s on RTX 3060, 98.32 % acc)
+.venv/bin/python train_cnn2_and_export.py
+# → cnn2_mnist.pt              (state_dict, 27 s on RTX 3060, 98.77 % acc)
 
 # 2. Declare the architecture (one-time, JSON).
-cat arch_cnn.json
+cat arch_cnn2.json
 # [
 #     ["conv2d_3x3_p1", 1, 8],
 #     ["relu"],
-#     ["maxpool_2x2", 8],
+#     ["conv2d_3x3_p1", 8, 16],     ← multi-channel input (v0.5+)
+#     ["relu"],
+#     ["maxpool_2x2", 16],
 #     ["flatten"],
-#     ["linear", 1568, 64],
+#     ["linear", 3136, 64],
 #     ["relu"],
 #     ["linear", 64, 10]
 # ]
 
-# 3. Pack the trained model into an aricode source tree.
+# 3. Pack the trained model — int8 weights, single-binary deploy.
 .venv/bin/python ../../tools/aricode_pack.py \
-    --checkpoint cnn_mnist.pt \
-    --arch arch_cnn.json \
+    --checkpoint cnn2_mnist.pt \
+    --arch arch_cnn2.json \
     --keys "fc{idx_plus_1}.{kind}" \
-    --input-format stdin --embed \
-    --out cnn_cli
-# → cnn_cli.ari  + 6 staging .f32 files
+    --input-format stdin \
+    --quantize int8 \
+    --out cnn2_cli
+# → cnn2_cli.ari + per-tensor staging .i8 / .f32 files
 
 # 4. Compile to one self-contained binary; staging files no longer needed.
-aric cnn_cli.ari -o cnn_cli
-rm cnn_cli_W*.f32 cnn_cli_b*.f32
+aric cnn2_cli.ari -o cnn2_cli
+rm cnn2_cli_W*.i8 cnn2_cli_b*.f32 cnn2_cli_*c*.i8 2>/dev/null
 
 # 5. Serve.  No Python, no .pt file, no external weights.
-cat /tmp/img_0.bin | ./cnn_cli
+cat /tmp/img_0.bin | ./cnn2_cli
 # → 7
 
-ls -la cnn_cli
-# -rwxr-xr-x  414K  cnn_cli                       (bare ELF, fully static)
-file cnn_cli
+ls -la cnn2_cli
+# -rwxr-xr-x  218K  cnn2_cli                       (bare ELF, fully static)
+file cnn2_cli
 # ELF 64-bit LSB executable, x86-64, statically linked, no section header
 ```
 
-End-to-end measurement on a Ryzen 7 5800X + RTX 3060:
+End-to-end measurement on a Ryzen 7 5800X + RTX 3060 (2-conv CNN, MNIST):
 
 | Stage                                    | Stack          | Wall            |
 |------------------------------------------|----------------|-----------------|
-| Train CNN, 10 epochs, MNIST              | PyTorch + GPU  | 33 s            |
+| Train CNN2, 8 epochs                     | PyTorch + GPU  | 27 s            |
 | Pack + compile                           | aricode-pack   | <1 s            |
-| **Inference, 10 K test images (batch)**  | aricode binary | **393 ms**      |
-| **Single-shot CLI cold-start**           | aricode binary | **0.41 ms**     |
-| **Test accuracy**                        | bit-exact match| **98.32 %**     |
+| **Inference, 10 K test images (batch)**  | aricode binary | **1.45 s**      |
+| **Single-shot CLI cold-start**           | aricode binary | **0.64 ms**     |
+| **Test accuracy**                        | bit-exact match| **98.79 %**     |
+| **Binary size (single-shot CLI)**        | aricode binary | **218 KB**      |
 
-The cold-start figure is ~10 000× faster than spinning up a Python
-interpreter with PyTorch loaded — that's the gap this tool exists to
-exploit.
+The 0.64 ms cold-start figure is ~10 000× faster than spinning up a
+Python interpreter with PyTorch loaded — that's the gap this tool
+exists to exploit.  With `--quantize int8` you also get a 4× shrink on
+both the binary and the runtime weight RAM, at no measurable cost in
+either accuracy or wall-clock (a single REX-byte typo in the i8
+matvec kernel made an early version 75× slower; edge test #52 catches
+that regression now).
+
+## Quantisation
+
+`--quantize int8` switches the deploy format to per-tensor symmetric
+int8 (scale = max|x| / 127, zero point = 0) for Linear weights, and
+keeps biases as f32 (a 64-element bias is 256 bytes either way; the
+constant offset hurts more than the bytes save).  Conv weights also
+go to int8 in the binary but get dequantised back to f32 once at
+startup since the AVX2 conv kernel is f32-only — those tensors are
+small (~5 KB total in the 2-conv demo) so the dequant pass is free.
+
+Linear matmul on int8 uses the native `arr_i8_matvec_f32` builtin —
+loads 8 sign-bytes via `vpmovsxbd`, promotes to f32 with `vcvtdq2ps`,
+runs the standard `vfmadd231ps` chain.  Same throughput as the f32
+matvec, no warm-up dequant pass, no f32 weight buffers in RAM.
+
+|                          | f32      | int8     | Δ              |
+|--------------------------|---------:|---------:|----------------|
+| Binary (CLI single-shot) | 824 KB   | 218 KB   | **3.78×** smaller |
+| Cold-start               | 0.64 ms  | 0.64 ms  | identical       |
+| Batch 10 K               | 1.45 s   | 1.45 s   | identical       |
+| Test accuracy            | 98.77 %  | 98.79 %  | within noise    |
+| Weight RAM               | ~810 KB  | ~205 KB  | **4×** smaller    |
 
 ## What's in the box
 
 ```
 aricode-ml/
 ├── tools/
-│   ├── aricode_pack.py         model → .ari + .f32 (or single binary)
+│   ├── aricode_pack.py         model → .ari + .f32/.i8 (or single binary)
 │   └── README.md               packer-specific docs
 ├── attention_f32.ari           single-head scaled dot-product attention
 ├── conv2d.ari / conv2d_f32.ari conv forward + im2col + maxpool
@@ -105,18 +137,20 @@ aricode-ml/
 
 ### Layer vocabulary supported by `aricode-pack`
 
-| Layer kind       | Args                       | Notes                              |
-|------------------|----------------------------|------------------------------------|
-| `linear`         | `in_features, out_features`| `nn.Linear` weight `(out, in)`     |
-| `conv2d_3x3_p1`  | `C_in, C_out`              | C_in = 1, fixed 28×28 spatial      |
-| `maxpool_2x2`    | `C`                        | 28×28 → 14×14                      |
-| `flatten`        | —                          | reshape, no code emitted           |
-| `relu` / `sigmoid` / `tanh` / `softmax` | —              | in-place activations               |
+| Layer kind       | Args                       | Notes                                 |
+|------------------|----------------------------|---------------------------------------|
+| `linear`         | `in_features, out_features`| `nn.Linear` weight `(out, in)`         |
+| `conv2d_3x3_p1`  | `C_in, C_out`              | 28×28 spatial.  C_in > 1 supported via |
+|                  |                            | a per-input-channel loop.              |
+| `maxpool_2x2`    | `C`                        | 28×28 → 14×14                          |
+| `flatten`        | —                          | reshape, no code emitted               |
+| `relu` / `sigmoid` / `tanh` / `softmax` | —              | in-place activations                   |
 
-Restrictions in v0.4: conv is single-channel input only (the existing
-AVX2 builtin `arr_f32_conv2d_3x3_p1` is fixed at C_in=1, 28×28).
-Multi-channel conv and arbitrary spatial sizes land when there's a
-demo that needs them.
+Restrictions today: spatial size is 28×28 (the AVX2 conv builtin is
+hardcoded for MNIST); CIFAR-style 32×32 RGB needs a generic conv
+builtin which is on the roadmap.  Multi-channel conv with C_in > 1 is
+implemented as a user-fn loop over input channels — works, runs ~3-4×
+slower than a true multi-channel kernel would.
 
 ## When this is the right tool
 
@@ -148,19 +182,24 @@ ecosystems have years of quantisation and batched-attention work
 this repo doesn't approximate.
 
 ✗ Your model has layers we don't pack yet (RNN, transformer block,
-multi-channel conv).  These are roadmap; for now, simple feed-forward
-nets and the MNIST CNN architecture are the sweet spot.
+arbitrary-spatial conv).  These are roadmap; for now, simple
+feed-forward nets and the MNIST CNN architecture family are the
+sweet spot.
 
 ## Roadmap
 
-- v0.5: int8 quantisation (4× memory shrink, real speedup on the
-  small-model path)
-- v0.5: multi-channel conv2d (`arr_f32_conv2d_3x3_p1_multi`)
-- v0.6: HuggingFace bridge — read `.safetensors`, auto-derive arch
-  for known shapes (sentence-transformers, distilbert)
-- v0.6: stand-alone transformer block packer (attention layer is
-  already shipped in `.ari`; needs the pack-side wiring)
-- v0.7: ARM / RISC-V back-end (today: x86_64 + AVX2 only)
+- v0.8: native int8 conv (`arr_i8_conv2d_3x3_p1`) — closes the last
+  startup-dequant pass; conv weights stay int8 in RAM too.
+- v0.8: multi-channel conv builtin (`arr_f32_conv2d_3x3_p1_multi`) to
+  port the f64 implementation to f32 and skip the per-input-channel
+  loop in the user-fn fallback.
+- v0.9: HuggingFace bridge — read `.safetensors`, auto-derive arch for
+  known shapes (sentence-transformers, distilbert).
+- v0.9: stand-alone transformer block packer (attention layer is
+  already shipped in `.ari`; needs the pack-side wiring).
+- v1.0: generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10
+  and any architecture with maxpool between conv layers.
+- later: ARM / RISC-V back-end (today: x86_64 + AVX2 only).
 
 ## Running the in-tree training demos
 
