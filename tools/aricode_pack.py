@@ -344,7 +344,8 @@ def names_for(kind, idx):
     raise ValueError(f"names_for: no weights for {kind!r}")
 
 
-def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
+def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
+             multi_int8_runtime=False):
     """Three paths:
        - runtime file_read (embed=False)            : single .f32 sidecar
        - embed_file f32   (embed=True, quant=none)  : f32 baked into .text
@@ -352,23 +353,30 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
                                                        at startup
     `scales` is a dict {(kind, idx, "W" | "b"): scale_f64} populated by
     main() when --quantize int8 is in effect; ignored otherwise.
+
+    `multi_int8_runtime` toggles where the multi-channel int8 conv pays
+    its dequant cost.  When False (default for batch workloads), it
+    pre-dequantises weights to f32 once at startup so the kernel side
+    is the f32 multi-channel conv (faster total wall on N>>1 samples).
+    When True (single-shot CLI), weights stay int8 in RAM and the kernel
+    is arr_i8_conv2d_3x3_p1_multi which dequantises inline per
+    (c_out, c_in) — sacrifices ~18 % batch wall to halve cold-start.
     """
     if embed and quantize == "int8":
         # Linear: weights stay int8 in RAM (used directly by arr_i8_matvec_f32);
         #         biases remain f32 (small, no quantisation benefit).
         # Conv (C_in = 1):   weights stay int8 in RAM, used directly by
         #                    arr_i8_conv2d_3x3_p1 — no dequant pass.
-        # Conv (C_in > 1):   weights are int8 in the binary but dequantised
-        #                    to f32 at startup, because the multi-channel
-        #                    conv path is implemented as a user-fn loop
-        #                    over input channels and there's no int8
-        #                    multi-channel kernel yet.  Tensors are tiny
-        #                    (a 16-channel 3×3×8 kernel is 1152 bytes),
-        #                    so the dequant pass is essentially free.
+        # Conv (C_in > 1):   if multi_int8_runtime, weights stay int8 in
+        #                    RAM and arr_i8_conv2d_3x3_p1_multi handles
+        #                    the inline dequant; otherwise weights are
+        #                    dequantised once at startup (default for
+        #                    batch input formats; better steady-state
+        #                    throughput, slightly worse cold-start).
         lines = []
         for kind, idx, *rest in weighted_layers(arch):
             wname, bname = names_for(kind, idx)
-            nw, nb = weight_size(kind, *rest)
+            nw, _ = weight_size(kind, *rest)
             scale_w = scales[(kind, idx, "W")]
             if kind == "linear":
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
@@ -377,8 +385,12 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
                 # Single-channel conv: int8 weights stay int8.
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
+            elif multi_int8_runtime:
+                # Multi-channel conv, single-shot mode: keep int8.
+                lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
             else:
-                # Multi-channel conv: dequant to f32 at startup.
+                # Multi-channel conv, batch mode: dequant once at startup.
                 lines.append(f"    let _q_{wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
                 lines.append(f"    dequant_int8_to_f32(_q_{wname}, {wname}, {nw}, {scale_w!r});")
@@ -402,7 +414,7 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales):
     return lines
 
 
-def gen_forward(arch, scales=None):
+def gen_forward(arch, scales=None, multi_int8_runtime=False):
     """Emit the per-sample forward pass on activation buffers a0..aN.
 
     cur_a tracks which activation buffer holds the running tensor.
@@ -466,7 +478,14 @@ def gen_forward(arch, scales=None):
                 lines.append(f"        }}")
                 lines.append(f"        _cin{ci} = _cin{ci} + 1;")
                 lines.append(f"    }}")
-                lines.append(f"    arr_f32_conv2d_3x3_p1_multi(padded_multi, {c_in}, Wc{ci}, bc{ci}, {dst}, {c_out});")
+                if conv_scale is not None and multi_int8_runtime:
+                    # int8 weights stay int8 in RAM — no startup dequant.
+                    lines.append(f"    arr_i8_conv2d_3x3_p1_multi(padded_multi, Wc{ci}, bc{ci}, {dst}, {c_out}, {conv_scale!r});")
+                else:
+                    # f32 multi-channel kernel handles both the
+                    # plain-f32 case and the int8-dequantised-at-startup
+                    # case (Wc{ci} is f32 in RAM in both).
+                    lines.append(f"    arr_f32_conv2d_3x3_p1_multi(padded_multi, {c_in}, Wc{ci}, bc{ci}, {dst}, {c_out});")
             cur_a += 1
             ci += 1
         elif kind == "maxpool_2x2":
@@ -523,9 +542,15 @@ def gen_main(arch, args, out_name, embed_dir, scales):
     quant_active = (args.quantize == "int8")
     weight_decls = [] if quant_active else gen_weight_decls(arch, args.embed)
     act_decls, sizes = gen_act_decls(arch)
+    # Pick the multi-channel int8 conv strategy based on workload:
+    # single-shot CLI wins from runtime dequant (no startup pass);
+    # batch loaders amortise the startup dequant across all samples
+    # so they prefer the f32 kernel.
+    multi_int8_runtime = (quant_active and args.input_format == "stdin")
     load = gen_load(arch, embed_dir, out_name, args.embed,
-                    args.quantize, scales)
-    fwd, last = gen_forward(arch, scales if quant_active else None)
+                    args.quantize, scales, multi_int8_runtime)
+    fwd, last = gen_forward(arch, scales if quant_active else None,
+                            multi_int8_runtime)
 
     # n_in = the *size in elements* of the input buffer a0.  For an MLP
     # this is the first layer's in_features; for a CNN it's c_in*28*28.
