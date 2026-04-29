@@ -629,8 +629,9 @@ def parse_args():
     p.add_argument("--checkpoint", required=True,
                    help="PyTorch state_dict .pt or .pth file (or a model "
                         "with .state_dict() attribute).")
-    p.add_argument("--arch", required=True,
-                   help="Architecture spec: JSON list of [kind, ...args].")
+    p.add_argument("--arch", default=None,
+                   help="Architecture spec: JSON list of [kind, ...args].  "
+                        "Required for the pack flow; omitted with --infer-arch.")
     p.add_argument("--keys", default="fc{idx_plus_1}.{kind}",
                    help="state_dict key template.  {idx} = layer index "
                         "(0-based), {idx_plus_1} = 1-based, {kind} = "
@@ -647,13 +648,14 @@ def parse_args():
     p.add_argument("--no-argmax", action="store_true",
                    help="Skip argmax + accuracy reporting (e.g. when the "
                         "model isn't a classifier).")
-    p.add_argument("--out", required=True,
+    p.add_argument("--out", default=None,
                    help="Output base name.  <out>.ari is always written.  "
                         "Without --embed, a single <out>.f32 sidecar is "
                         "written too; with --embed, per-tensor "
                         "<out>_W{i}.f32 / <out>_b{i}.f32 staging files are "
                         "produced (the compiler bakes them into the binary "
-                        "and they're no longer needed at runtime).")
+                        "and they're no longer needed at runtime).  "
+                        "Required for the pack flow; omitted with --infer-arch.")
     p.add_argument("--embed", action="store_true",
                    help="Emit a single self-contained binary: weights "
                         "embedded inline via embed_file, no runtime file "
@@ -665,6 +667,15 @@ def parse_args():
                         "single f32 scale per tensor; the binary shrinks "
                         "by ~4× and the .ari preamble dequantises back "
                         "to f32 at startup.  Implies --embed.")
+    p.add_argument("--infer-arch", action="store_true",
+                   help="Walk the checkpoint and print a starter arch.json "
+                        "for sequential MLP / CNN architectures.  Inserts "
+                        "ReLU between weight layers as the default "
+                        "activation; you can edit the output if your model "
+                        "uses different activations or layout.  Skips the "
+                        "pack step entirely (no .ari emitted).  Useful for "
+                        "models from HuggingFace where you don't want to "
+                        "hand-write the architecture descriptor.")
     return p.parse_args()
 
 
@@ -686,9 +697,124 @@ def sd_lookup(sd, candidates):
     return None
 
 
+def infer_arch_from_state_dict(sd):
+    """Best-effort architecture inference from a flat state_dict.
+
+    Heuristics:
+    - Group keys by their stem (the part before .weight / .bias).
+    - Walk stems in the order they appear in the dict (PyTorch /
+      safetensors preserve insertion order, which usually mirrors
+      forward-pass order for sequential models).
+    - 4-D weight tensor (C_out, C_in, kH, kW) → conv2d_3x3_p1 (we only
+      support 3×3 pad 1 today; assert kH = kW = 3).
+    - 2-D weight tensor (out, in) → linear.
+    - Insert ReLU between consecutive weight layers — almost always the
+      right default for the architectures the pack tool can deploy
+      today; users edit if they have something else.
+    - When a conv-output's flattened size doesn't equal the next
+      linear's in_features, insert maxpool_2x2 + flatten before it.
+      We only know how to suggest the 28×28 → 14×14 maxpool we have a
+      builtin for, so the inference is correct only when the
+      architecture matches the MNIST CNN family.
+
+    Returns the inferred arch as a list of [kind, ...args] entries.
+    Caller is responsible for sanity-checking the result; this is a
+    starting point, not a contract.
+    """
+    # Walk stems in insertion order.
+    stems = []
+    seen = set()
+    for k in sd.keys():
+        for suf in (".weight", ".bias"):
+            if k.endswith(suf):
+                stem = k[:-len(suf)]
+                if stem not in seen:
+                    stems.append(stem)
+                    seen.add(stem)
+                break
+
+    arch = []
+    last_spatial = None   # (C_out, 28, 28) after a conv layer; None otherwise
+    for i, stem in enumerate(stems):
+        wkey = stem + ".weight"
+        if wkey not in sd:
+            continue
+        W = sd[wkey]
+        shape = tuple(W.shape) if hasattr(W, "shape") else tuple(W.size())
+
+        if len(shape) == 4:
+            # Conv2d (C_out, C_in, kH, kW)
+            c_out, c_in, kh, kw = shape
+            if (kh, kw) != (3, 3):
+                raise SystemExit(
+                    f"infer-arch: conv kernel {kh}×{kw} for layer "
+                    f"{stem!r} not supported (only 3×3 pad-1 today).")
+            arch.append(["conv2d_3x3_p1", int(c_in), int(c_out)])
+            last_spatial = (int(c_out), 28, 28)
+        elif len(shape) == 2:
+            out_f, in_f = shape
+            # If we just left a spatial layer, insert pool + flatten
+            # before this Linear when the dims look right.
+            if last_spatial is not None:
+                C, H, W_ = last_spatial
+                # Try maxpool 2×2 → 14×14: pooled flat = C·14·14
+                pooled = C * (H // 2) * (W_ // 2)
+                if pooled == in_f:
+                    arch.append(["maxpool_2x2", C])
+                    arch.append(["flatten"])
+                elif C * H * W_ == in_f:
+                    arch.append(["flatten"])
+                else:
+                    raise SystemExit(
+                        f"infer-arch: can't bridge spatial output "
+                        f"{last_spatial} to linear in_features={in_f}.  "
+                        "Add a manual maxpool/flatten/etc. step.")
+                last_spatial = None
+            arch.append(["linear", int(in_f), int(out_f)])
+        else:
+            raise SystemExit(
+                f"infer-arch: layer {stem!r} has weight shape {shape}; "
+                "only 2-D (linear) and 4-D (conv) are supported.")
+
+        # Insert ReLU between layers, except after the last one (the
+        # head's logits aren't activation-followed in classifiers).
+        if i < len(stems) - 1:
+            arch.append(["relu"])
+
+    return arch
+
+
+def emit_arch_json(arch):
+    """Pretty-print an inferred arch in the format aricode-pack reads."""
+    import json
+    lines = ["["]
+    for i, layer in enumerate(arch):
+        suffix = "," if i + 1 < len(arch) else ""
+        lines.append(f"    {json.dumps(layer)}{suffix}")
+    lines.append("]")
+    return "\n".join(lines)
+
+
 def main():
     args = parse_args()
 
+    if args.infer_arch:
+        # --infer-arch short-circuits the pack pipeline: we only need
+        # the checkpoint, walk it, print a starter arch.json, exit.
+        sd = load_state_dict(args.checkpoint)
+        arch = infer_arch_from_state_dict(sd)
+        print(f"// Inferred from {args.checkpoint}")
+        print(f"// {len(sd)} tensors, {sum(1 for k in sd if k.endswith('.weight'))} weight tensors")
+        print(f"// Insert manual edits if your model uses a non-ReLU activation,")
+        print(f"// has different layer ordering, or needs additional pool/flatten.")
+        print(emit_arch_json(arch))
+        return
+
+    if args.arch is None or args.out is None:
+        missing = [a for a, v in (("--arch", args.arch), ("--out", args.out))
+                   if v is None]
+        raise SystemExit(f"{', '.join(missing)} required for the pack flow.  "
+                         "Run with --infer-arch to get a starter arch.json.")
     arch = json.loads(Path(args.arch).read_text())
     if not isinstance(arch, list):
         raise SystemExit("--arch must contain a JSON list of [kind, ...args].")

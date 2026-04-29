@@ -35,6 +35,8 @@ python3 -m venv .venv
 #    aricode-pack also reads .safetensors directly, no torch.load round-trip.
 
 # 2. Declare the architecture (one-time, JSON).
+#    Or get a starter from the checkpoint itself:
+#      python ../../tools/aricode_pack.py --checkpoint cnn2_mnist.pt --infer-arch
 cat arch_cnn2.json
 # [
 #     ["conv2d_3x3_p1", 1, 8],
@@ -193,10 +195,14 @@ sweet spot.
 Shipped:
 - v0.8: native int8 conv (`arr_i8_conv2d_3x3_p1`) — single-channel
   conv weights stay int8 in RAM, no startup dequant pass.
-- v0.9: HuggingFace `.safetensors` checkpoint reading (this release).
-  Pack accepts `--checkpoint *.safetensors` directly; no torch.load
-  round-trip needed.  See `tools/convert_to_safetensors.py` for
-  migrating existing `.pt` artefacts.
+- v0.9: HuggingFace `.safetensors` checkpoint reading.  Pack accepts
+  `--checkpoint *.safetensors` directly; no torch.load round-trip
+  needed.  See `tools/convert_to_safetensors.py` for migrating
+  existing `.pt` artefacts.
+- v0.10: `--infer-arch` walks a state_dict and emits a starter
+  `arch.json` for sequential MLP / CNN architectures.  Removes the
+  manual layer declaration step for the common cases (verified bit-
+  exact against the hand-written archs for both demos).
 
 Pending:
 - multi-channel int8 conv builtin (closes the last dequant pass for
@@ -206,9 +212,10 @@ Pending:
   port the existing f64 implementation, skip the user-fn loop.
 - stand-alone transformer block packer (attention layer is already
   shipped in `attention_f32.ari`; needs the pack-side wiring).
-- HF auto-arch detection — derive `arch.json` from common HF model
-  shapes (sentence-transformers, distilbert) without manual
-  declaration.
+- HF auto-arch detection for *transformer* models (sentence-
+  transformers, distilbert).  v0.10's `--infer-arch` covers
+  sequential MLP / CNN; the transformer case needs the pack-side
+  attention layer first.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
