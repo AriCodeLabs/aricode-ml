@@ -1,0 +1,11 @@
+[
+    ["conv2d_3x3_p1", 1, 8],
+    ["relu"],
+    ["conv2d_3x3_p1", 8, 16],
+    ["relu"],
+    ["maxpool_2x2", 16],
+    ["flatten"],
+    ["linear", 3136, 64],
+    ["relu"],
+    ["linear", 64, 10]
+]

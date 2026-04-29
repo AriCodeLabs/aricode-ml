@@ -249,6 +249,19 @@ def gen_scratch(arch):
     lines = []
     if any(layer[0] == "conv2d_3x3_p1" for layer in arch):
         lines.append("    let padded: i32 = arr_f32_new(900);  // 30×30 zero-padded")
+    # Multi-channel conv needs additional scratch: a `partial` output of
+    # max(C_out * 784) and a `W_slice` of max(C_out * 9), plus a zero
+    # bias of max(C_out).  Size to the maximum across the arch so we
+    # only allocate once.
+    multi_convs = [(c_in, c_out) for kind, *a in arch
+                   if kind == "conv2d_3x3_p1"
+                   for c_in, c_out in [tuple(a)] if c_in > 1]
+    if multi_convs:
+        max_c_out = max(c_out for _, c_out in multi_convs)
+        lines.append(f"    let _partial: i32 = arr_f32_new({max_c_out * 784});")
+        lines.append(f"    let _w_slice: i32 = arr_f32_new({max_c_out * 9});")
+        lines.append(f"    let _b_zero:  i32 = arr_f32_new({max_c_out});")
+        lines.append(f"    arr_f32_fill(_b_zero, 0.0);")
     pi = 0
     for kind, *args in arch:
         if kind == "maxpool_2x2":
@@ -311,21 +324,59 @@ def gen_forward(arch):
             li += 1
         elif kind == "conv2d_3x3_p1":
             c_in, c_out = args
-            if c_in != 1:
-                raise ValueError(
-                    "v0.4 supports conv2d_3x3_p1 with C_in=1 only "
-                    "(arr_f32_conv2d_3x3_p1 builtin is single-channel input)."
-                )
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            # Pad → call the AVX2 builtin.
-            lines.append(f"    arr_f32_fill(padded, 0.0);")
-            lines.append(f"    let _y{ci}: i32 = 0;")
-            lines.append(f"    while (_y{ci} < 28) {{")
-            lines.append(f"        arr_f32_copy_slice({src}, _y{ci} * 28, padded, (_y{ci} + 1) * 30 + 1, 28);")
-            lines.append(f"        _y{ci} = _y{ci} + 1;")
-            lines.append(f"    }}")
-            lines.append(f"    arr_f32_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out});")
+            if c_in == 1:
+                # Fast path: single-channel input goes straight into the
+                # AVX2 builtin.  Pad once, call once.
+                lines.append(f"    arr_f32_fill(padded, 0.0);")
+                lines.append(f"    let _y{ci}: i32 = 0;")
+                lines.append(f"    while (_y{ci} < 28) {{")
+                lines.append(f"        arr_f32_copy_slice({src}, _y{ci} * 28, padded, (_y{ci} + 1) * 30 + 1, 28);")
+                lines.append(f"        _y{ci} = _y{ci} + 1;")
+                lines.append(f"    }}")
+                lines.append(f"    arr_f32_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out});")
+            else:
+                # Multi-channel input: loop over C_in and reuse the single-
+                # channel builtin per slice.  Each iteration:
+                #   1. Pad input channel `cin` (28×28) into `padded` (30×30).
+                #   2. Slice W[:, cin, :] into _w_slice (C_out × 9 row-major).
+                #   3. Call single-channel conv with zero bias into _partial.
+                #   4. Accumulate _partial into dst with arr_f32_add_scaled.
+                # After the C_in loop, broadcast-add the real bias.  This
+                # is ~C_in× the cost of a true multi-channel builtin (which
+                # is on the v0.5 roadmap); fine for the small CNN sizes the
+                # pack tool targets today.
+                lines.append(f"    arr_f32_fill({dst}, 0.0);")
+                lines.append(f"    let _cin{ci}: i32 = 0;")
+                lines.append(f"    while (_cin{ci} < {c_in}) {{")
+                lines.append(f"        arr_f32_fill(padded, 0.0);")
+                lines.append(f"        let _yc{ci}: i32 = 0;")
+                lines.append(f"        while (_yc{ci} < 28) {{")
+                lines.append(f"            arr_f32_copy_slice({src}, _cin{ci} * 784 + _yc{ci} * 28, padded, (_yc{ci} + 1) * 30 + 1, 28);")
+                lines.append(f"            _yc{ci} = _yc{ci} + 1;")
+                lines.append(f"        }}")
+                lines.append(f"        let _co{ci}: i32 = 0;")
+                lines.append(f"        while (_co{ci} < {c_out}) {{")
+                lines.append(f"            arr_f32_copy_slice(Wc{ci}, _co{ci} * {c_in} * 9 + _cin{ci} * 9, _w_slice, _co{ci} * 9, 9);")
+                lines.append(f"            _co{ci} = _co{ci} + 1;")
+                lines.append(f"        }}")
+                lines.append(f"        arr_f32_conv2d_3x3_p1(padded, _w_slice, _b_zero, _partial, {c_out});")
+                lines.append(f"        arr_f32_add_scaled({dst}, _partial, 1.0);")
+                lines.append(f"        _cin{ci} = _cin{ci} + 1;")
+                lines.append(f"    }}")
+                # Broadcast bias.
+                lines.append(f"    let _bo{ci}: i32 = 0;")
+                lines.append(f"    while (_bo{ci} < {c_out}) {{")
+                lines.append(f"        let _bv{ci}: f64 = arr_f32_get(bc{ci}, _bo{ci});")
+                lines.append(f"        let _bi{ci}: i32 = 0;")
+                lines.append(f"        while (_bi{ci} < 784) {{")
+                lines.append(f"            let _idx{ci}: i32 = _bo{ci} * 784 + _bi{ci};")
+                lines.append(f"            arr_f32_set({dst}, _idx{ci}, arr_f32_get({dst}, _idx{ci}) + _bv{ci});")
+                lines.append(f"            _bi{ci} = _bi{ci} + 1;")
+                lines.append(f"        }}")
+                lines.append(f"        _bo{ci} = _bo{ci} + 1;")
+                lines.append(f"    }}")
             cur_a += 1
             ci += 1
         elif kind == "maxpool_2x2":
@@ -573,9 +624,11 @@ def main():
             # (i.e. "1.weight") doesn't clash with fc names.  Real users
             # can pass --conv-keys later; v0.4 supports the simple case.
             wkey = sd_lookup(sd, ["conv.weight",
+                                  f"conv{ci + 1}.weight",
                                   f"layers.{ci}.weight",
                                   keys(ci, "weight")])
             bkey = sd_lookup(sd, ["conv.bias",
+                                  f"conv{ci + 1}.bias",
                                   f"layers.{ci}.bias",
                                   keys(ci, "bias")])
             if wkey is None or bkey is None:
