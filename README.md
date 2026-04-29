@@ -25,12 +25,14 @@ starts, regulated environments, offline machines, archival).
 ## Quick start: GPU train → CPU deploy
 
 ```sh
-# 1. Train any small model in PyTorch on your GPU.
+# 1. Train any small model in PyTorch on your GPU
+#    — or drop in a .safetensors from HuggingFace Hub.
 cd examples/mnist_infer
 python3 -m venv .venv
-.venv/bin/pip install torch torchvision
+.venv/bin/pip install torch torchvision safetensors
 .venv/bin/python train_cnn2_and_export.py
 # → cnn2_mnist.pt              (state_dict, 27 s on RTX 3060, 98.77 % acc)
+#    aricode-pack also reads .safetensors directly, no torch.load round-trip.
 
 # 2. Declare the architecture (one-time, JSON).
 cat arch_cnn2.json
@@ -188,18 +190,28 @@ sweet spot.
 
 ## Roadmap
 
-- v0.8: native int8 conv (`arr_i8_conv2d_3x3_p1`) — closes the last
-  startup-dequant pass; conv weights stay int8 in RAM too.
-- v0.8: multi-channel conv builtin (`arr_f32_conv2d_3x3_p1_multi`) to
-  port the f64 implementation to f32 and skip the per-input-channel
-  loop in the user-fn fallback.
-- v0.9: HuggingFace bridge — read `.safetensors`, auto-derive arch for
-  known shapes (sentence-transformers, distilbert).
-- v0.9: stand-alone transformer block packer (attention layer is
-  already shipped in `.ari`; needs the pack-side wiring).
-- v1.0: generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10
-  and any architecture with maxpool between conv layers.
-- later: ARM / RISC-V back-end (today: x86_64 + AVX2 only).
+Shipped:
+- v0.8: native int8 conv (`arr_i8_conv2d_3x3_p1`) — single-channel
+  conv weights stay int8 in RAM, no startup dequant pass.
+- v0.9: HuggingFace `.safetensors` checkpoint reading (this release).
+  Pack accepts `--checkpoint *.safetensors` directly; no torch.load
+  round-trip needed.  See `tools/convert_to_safetensors.py` for
+  migrating existing `.pt` artefacts.
+
+Pending:
+- multi-channel int8 conv builtin (closes the last dequant pass for
+  deep CNNs; today multi-channel conv with `--quantize int8` falls
+  back to f32 dequant-at-startup).
+- multi-channel f32 conv builtin (`arr_f32_conv2d_3x3_p1_multi`) —
+  port the existing f64 implementation, skip the user-fn loop.
+- stand-alone transformer block packer (attention layer is already
+  shipped in `attention_f32.ari`; needs the pack-side wiring).
+- HF auto-arch detection — derive `arch.json` from common HF model
+  shapes (sentence-transformers, distilbert) without manual
+  declaration.
+- generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
+  any architecture with maxpool between conv layers.
+- ARM / RISC-V back-end (today: x86_64 + AVX2 only).
 
 ## Running the in-tree training demos
 

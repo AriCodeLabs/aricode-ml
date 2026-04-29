@@ -29,6 +29,24 @@ It does **not** try to compete with CUDA on training, and it doesn't
 try to outperform `ggml` on heavy LLM serving — those niches have
 different shapes.  This is the "small model, simple deployment" slot.
 
+## Supported checkpoint formats
+
+aricode-pack reads two formats from disk via `--checkpoint`:
+
+| Extension                | Loader                         | Use case |
+|--------------------------|--------------------------------|----------|
+| `.pt`, `.pth`            | `torch.load(weights_only=True)` | Standard PyTorch state_dict — fastest path when you trained the model yourself. |
+| `.safetensors`           | `safetensors.torch.load_file`  | HuggingFace Hub native format.  Skip the torch.load pickle round-trip; safer to load from untrusted sources. |
+
+Both formats produce the same flat `{tensor_name → tensor}` dict that
+the rest of the pack pipeline consumes.  The conversion helper
+`tools/convert_to_safetensors.py` migrates a `.pt` to `.safetensors`
+in one shot when you want to switch:
+
+```sh
+python convert_to_safetensors.py mymodel.pt mymodel.safetensors
+```
+
 ## Usage
 
 ```sh

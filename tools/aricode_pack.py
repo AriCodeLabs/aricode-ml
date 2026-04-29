@@ -55,6 +55,44 @@ try:
 except ImportError:
     torch = None  # only needed when reading .pt; fail late and clearly.
 
+try:
+    from safetensors.torch import load_file as _safetensors_load
+except ImportError:
+    _safetensors_load = None  # only needed for .safetensors checkpoints.
+
+
+def load_state_dict(path: str):
+    """Load a state_dict from either a PyTorch .pt/.pth or a HuggingFace
+    .safetensors file.  Format dispatch is by extension; both produce the
+    same flat {tensor_name → tensor} dict the rest of pack consumes.
+
+    Why support .safetensors directly: it's the de-facto deploy format
+    on HuggingFace Hub.  Reading it without a torch.load round-trip
+    means you can pack a HF checkpoint without ever instantiating the
+    model in Python (and without touching CUDA libs in the venv)."""
+    p = Path(path)
+    suffix = p.suffix.lower()
+    if suffix in (".pt", ".pth"):
+        if torch is None:
+            raise SystemExit(
+                "error: PyTorch is required to read .pt/.pth checkpoints; "
+                "install with `pip install torch` or convert to "
+                ".safetensors first.")
+        sd = torch.load(path, map_location="cpu", weights_only=True)
+        if hasattr(sd, "state_dict"):
+            sd = sd.state_dict()
+        return sd
+    if suffix == ".safetensors":
+        if _safetensors_load is None:
+            raise SystemExit(
+                "error: the `safetensors` package is required to read "
+                ".safetensors checkpoints.  Install with "
+                "`pip install safetensors`.")
+        return _safetensors_load(path)
+    raise SystemExit(
+        f"error: unsupported checkpoint extension '{suffix}'.  "
+        "Expected .pt, .pth, or .safetensors.")
+
 
 # ──────────────────────────────────────────────────────────────────────
 #  Layer schema — every supported layer registers (i) the weight slots
@@ -651,18 +689,12 @@ def sd_lookup(sd, candidates):
 def main():
     args = parse_args()
 
-    if torch is None:
-        print("error: PyTorch is required to read the checkpoint.", file=sys.stderr)
-        sys.exit(2)
-
     arch = json.loads(Path(args.arch).read_text())
     if not isinstance(arch, list):
         raise SystemExit("--arch must contain a JSON list of [kind, ...args].")
     arch = [tuple(layer) for layer in arch]
 
-    sd = torch.load(args.checkpoint, map_location="cpu", weights_only=True)
-    if hasattr(sd, "state_dict"):
-        sd = sd.state_dict()
+    sd = load_state_dict(args.checkpoint)
 
     keys = expand_keys(args.keys)
     # Adapter to fit collect_weights' template-arg expectation.
