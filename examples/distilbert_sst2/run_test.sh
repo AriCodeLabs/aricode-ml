@@ -20,14 +20,14 @@ echo "[1/4] downloading distilbert-base-uncased-finetuned-sst-2 + tokenising..."
 "$PY" -m pip install --quiet transformers > /dev/null 2>&1 || true
 "$PY" prepare.py | tail -5
 
-echo "[2/4] packing through aricode-pack (f32, single-shot embedded)..."
+echo "[2/4] packing through aricode-pack (int8 quantised, single-shot embedded)..."
 "$PY" "$PACK" \
     --checkpoint synth.pt --arch arch.json \
     --keys "fc{idx_plus_1}.{kind}" \
     --input-format embedded --input-file "$(pwd)/tokens.bin" \
-    --embed --no-argmax --out distilbert_sst2 > /dev/null
+    --embed --quantize int8 --no-argmax --out distilbert_sst2 > /dev/null
 
-echo "[3/4] compiling .ari → static ELF (268 MB f32 weights baked in)..."
+echo "[3/4] compiling .ari → static ELF (~173 MB; FFN linears int8, embedding/MHA/LN f32)..."
 "$ARIC" distilbert_sst2.ari -o distilbert_sst2 > /dev/null
 ls -la distilbert_sst2 | awk '{printf "  size: %s bytes\n", $5}'
 
@@ -50,12 +50,13 @@ diff = np.abs(got_cls - expected)
 print(f'  max abs diff: {diff.max():.3e}')
 print(f'  PyTorch label: {\"positive\" if expected[1] > expected[0] else \"negative\"}')
 print(f'  aricode label: {\"positive\" if got_cls[1] > got_cls[0] else \"negative\"}')
-# Tolerance: tanh-approx GELU + 67M-param error accumulation pushes
-# this above the 1e-3 line that smaller models hit.  1e-2 is still
-# vastly below classifier-class accuracy (decision boundary spans
-# multiple units of the logit scale).
-if diff.max() >= 1e-2:
-    raise SystemExit(f'FAIL: max diff {diff.max():.3e} exceeds 1e-2 tolerance')
+# Tolerance: per-tensor int8 symmetric quantisation across 67M
+# params, on top of tanh-approx GELU and f32 noise — not bit-exact
+# but well below classifier-class accuracy.  Decision boundaries
+# in SST-2 span multiple logit units; 0.5 is generous head-room
+# but still catches any algebraic bug at distilbert scale.
+if diff.max() >= 0.5:
+    raise SystemExit(f'FAIL: max diff {diff.max():.3e} exceeds 0.5 tolerance')
 if (got_cls[1] > got_cls[0]) != (expected[1] > expected[0]):
     raise SystemExit('FAIL: predicted label disagrees with PyTorch')
 print('  DBERT_SST2_OK — packed real distilbert SST-2 matches PyTorch')

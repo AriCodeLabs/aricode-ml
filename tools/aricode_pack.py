@@ -128,8 +128,13 @@ def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
     `seq > 1` (the transformer-block case where the input is
     `[seq, in_f]` flat after an attention block), emit a loop that
     applies the matvec per row, writing into the matching `[seq, out_f]`
-    flat output.  Per-row scratch buffers `_row_in` / `_row_out` are
-    allocated by gen_scratch.
+    flat output.  Per-Linear scratch buffers `_lin_in_{idx}` /
+    `_lin_out_{idx}` are allocated by gen_scratch — one pair per Linear,
+    sized exactly to that Linear's in_f / out_f.  Per-Linear (not
+    shared-max) sizing is required for the int8 path: arr_i8_matvec_f32
+    derives `n` from x's length header at [x-8], so a buffer sized
+    larger than the actual input would have the kernel try to read
+    past the W weights and trip the bounds check.
 
     `quant_scale` is None for the f32 path (single arr_f32_matvec call)
     or a Python float when the weights are int8 — uses the native
@@ -144,18 +149,19 @@ def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
             f"    arr_i8_matvec_f32({w_var}, {src_var}, {dst_var}, {out_f}, {quant_scale!r});",
             f"    arr_f32_add_scaled({dst_var}, {b_var}, 1.0);",
         ]
-    # Batched: loop seq times, slicing [in_f] rows of src into _row_in
-    # and writing [out_f] rows of dst from _row_out.  Slightly slower
-    # than a hypothetical batched matvec builtin (extra copies), but
-    # keeps the kernel surface unchanged and runs within microseconds
-    # on transformer-block-class shapes.
+    # Batched: loop seq times, slicing [in_f] rows of src into the
+    # per-Linear scratch and writing [out_f] rows of dst from it.
+    # The scratch is allocated by gen_scratch to exactly in_f / out_f
+    # so the int8 matvec's implicit-n-from-header math is correct.
+    si = f"_lin_in_{idx}"
+    so = f"_lin_out_{idx}"
     if quant_scale is None:
         body = [
             f"    let _li{idx}: i32 = 0;",
             f"    while (_li{idx} < {seq}) {{",
-            f"        arr_f32_copy_slice({src_var}, _li{idx} * {in_f}, _row_in, 0, {in_f});",
-            f"        arr_f32_matvec({w_var}, _row_in, {b_var}, _row_out, {out_f}, {in_f});",
-            f"        arr_f32_copy_slice(_row_out, 0, {dst_var}, _li{idx} * {out_f}, {out_f});",
+            f"        arr_f32_copy_slice({src_var}, _li{idx} * {in_f}, {si}, 0, {in_f});",
+            f"        arr_f32_matvec({w_var}, {si}, {b_var}, {so}, {out_f}, {in_f});",
+            f"        arr_f32_copy_slice({so}, 0, {dst_var}, _li{idx} * {out_f}, {out_f});",
             f"        _li{idx} = _li{idx} + 1;",
             f"    }}",
         ]
@@ -163,10 +169,10 @@ def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
         body = [
             f"    let _li{idx}: i32 = 0;",
             f"    while (_li{idx} < {seq}) {{",
-            f"        arr_f32_copy_slice({src_var}, _li{idx} * {in_f}, _row_in, 0, {in_f});",
-            f"        arr_i8_matvec_f32({w_var}, _row_in, _row_out, {out_f}, {quant_scale!r});",
-            f"        arr_f32_add_scaled(_row_out, {b_var}, 1.0);",
-            f"        arr_f32_copy_slice(_row_out, 0, {dst_var}, _li{idx} * {out_f}, {out_f});",
+            f"        arr_f32_copy_slice({src_var}, _li{idx} * {in_f}, {si}, 0, {in_f});",
+            f"        arr_i8_matvec_f32({w_var}, {si}, {so}, {out_f}, {quant_scale!r});",
+            f"        arr_f32_add_scaled({so}, {b_var}, 1.0);",
+            f"        arr_f32_copy_slice({so}, 0, {dst_var}, _li{idx} * {out_f}, {out_f});",
             f"        _li{idx} = _li{idx} + 1;",
             f"    }}",
         ]
@@ -970,9 +976,19 @@ def gen_scratch(arch):
     # Batched-Linear scratch: when any Linear receives more elements
     # than its in_f (i.e. operates on a [seq, in_f] flat input that
     # came from an attention block), emit_linear loops per row using
-    # _row_in / _row_out.  Size to the max in_f / out_f across the arch.
-    # Multi-head attention also uses these scratch buffers for its
-    # output projection, so factor those dims in too.
+    # _lin_in_{li} / _lin_out_{li} — one pair per Linear, sized
+    # EXACTLY to that Linear's in_f / out_f.  Per-Linear (not
+    # shared-max) sizing is required because arr_i8_matvec_f32
+    # derives `n` implicitly from x's length header; a shared
+    # max-sized scratch would feed the kernel an n bigger than W's
+    # row stride and trip the bounds check (caught in the distilbert
+    # demo before this fix).
+    #
+    # MHA's output projection still uses the shared _row_in /
+    # _row_out — its in_f and out_f are equal (both d_model) so it's
+    # immune to the implicit-n problem; allocating per-MHA-layer
+    # scratch would just bloat the binary without the correctness
+    # constraint that drove the per-Linear split.
     linear_layers_in = [args for kind, *args in arch if kind == "linear"]
     mha_dims = [args[1] for kind, *args in arch
                 if kind == "multi_head_attention"]
@@ -1016,15 +1032,58 @@ def gen_scratch(arch):
                 cur = args[0] * args[1]
             elif kind == "embedding":
                 cur = args[2] * args[1]   # seq * d_model
-        if any_batched or mha_dims:
-            in_dims  = ([in_f for in_f, _ in linear_layers_in] +
-                        list(mha_dims))
-            out_dims = ([out_f for _, out_f in linear_layers_in] +
-                        list(mha_dims))
-            max_in  = max(in_dims) if in_dims else 0
-            max_out = max(out_dims) if out_dims else 0
-            lines.append(f"    let _row_in: i32 = arr_f32_new({max_in});")
-            lines.append(f"    let _row_out: i32 = arr_f32_new({max_out});")
+        if any_batched:
+            # Per-Linear in/out scratches.  Walk arch once more, this
+            # time tracking the per-Linear cur_size so we know which
+            # Linears actually emit the batched loop (and therefore
+            # need their per-Linear scratch).  Linears that fit the
+            # seq=1 path don't need it.
+            cur2 = cur_first if (cur_first := cur) else 0
+            # Re-walk: replicate the cur tracking from earlier so we
+            # only allocate scratch for Linears that actually batch.
+            # (Hoisted out so the walker logic stays readable.)
+            cur2 = 0
+            if first_lin is not None:
+                if first_lin[0] == "linear":
+                    cur2 = first_lin[1]
+                elif first_lin[0] == "conv2d_3x3_p1":
+                    cur2 = first_lin[1] * 28 * 28
+                elif first_lin[0] == "attention":
+                    cur2 = first_lin[1] * first_lin[2]
+                elif first_lin[0] == "multi_head_attention":
+                    cur2 = first_lin[1] * first_lin[2]
+                elif first_lin[0] == "embedding":
+                    cur2 = first_lin[3] * first_lin[2]
+            li2 = 0
+            for kind, *args in arch:
+                if kind == "linear":
+                    in_f, out_f = args
+                    if cur2 >= in_f and cur2 % in_f == 0 and cur2 > in_f:
+                        lines.append(
+                            f"    let _lin_in_{li2}: i32 = arr_f32_new({in_f});")
+                        lines.append(
+                            f"    let _lin_out_{li2}: i32 = arr_f32_new({out_f});")
+                    cur2 = ((cur2 // in_f) * out_f
+                            if (cur2 >= in_f and cur2 % in_f == 0)
+                            else out_f)
+                    li2 += 1
+                elif kind == "conv2d_3x3_p1":
+                    cur2 = args[1] * 28 * 28
+                elif kind == "maxpool_2x2":
+                    cur2 = args[0] * 14 * 14
+                elif kind == "attention":
+                    cur2 = args[0] * args[2]
+                elif kind == "multi_head_attention":
+                    cur2 = args[0] * args[1]
+                elif kind == "embedding":
+                    cur2 = args[2] * args[1]
+        # MHA's output projection still uses the shared _row_in /
+        # _row_out (both sized d_model — symmetric, so no implicit-n
+        # mismatch).  Allocate them when any MHA is in the arch.
+        if mha_dims:
+            d = max(mha_dims)
+            lines.append(f"    let _row_in: i32 = arr_f32_new({d});")
+            lines.append(f"    let _row_out: i32 = arr_f32_new({d});")
     return lines
 
 
