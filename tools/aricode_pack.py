@@ -199,6 +199,124 @@ fn dequant_int8_to_f32(q: i32, dst: i32, n: i32, scale: f64) -> i32 {
 }"""
 
 
+# Inlined verbatim from aricode-stdlib/aricode-ml/attention_f32.ari.
+# Emitted only when the arch contains an attention layer; pure aricode
+# (no extra builtins beyond the matvec/softmax/scale/copy_slice/set
+# already used elsewhere in packed binaries), so the .ari output stays
+# self-contained — no `use ... from` import needed at compile time.
+#
+# Keep this in sync with the source; the scoreboard is the test in
+# examples/attention_min/ which compares packed-binary output against
+# a PyTorch reference.
+ATTENTION_LIB = """
+fn attn_alloc_desc_f32(seq: i32, d_in: i32, d_head: i32, causal: i32) -> i32 {
+    let d: i32 = arr_new(24);
+    arr_set(d,  7, arr_f32_new(seq * d_head));
+    arr_set(d,  8, arr_f32_new(seq * d_head));
+    arr_set(d,  9, arr_f32_new(seq * d_head));
+    arr_set(d, 10, arr_f32_new(seq * seq));
+    arr_set(d, 12, arr_f32_new(d_in));
+    arr_set(d, 13, arr_f32_new(d_head));
+    arr_set(d, 14, arr_f32_new(seq));
+    let zb: i32 = arr_f32_new(seq);
+    arr_f32_fill(zb, 0.0);
+    arr_set(d, 15, zb);
+    arr_set(d, 16, seq);
+    arr_set(d, 17, d_in);
+    arr_set(d, 18, d_head);
+    arr_set(d, 19, causal);
+    return d;
+}
+
+fn attn_project_qkv_f32(desc: i32) -> i32 {
+    let X: i32      = arr_get(desc,  0);
+    let W_Q: i32    = arr_get(desc,  1);  let b_Q: i32 = arr_get(desc,  2);
+    let W_K: i32    = arr_get(desc,  3);  let b_K: i32 = arr_get(desc,  4);
+    let W_V: i32    = arr_get(desc,  5);  let b_V: i32 = arr_get(desc,  6);
+    let Q: i32      = arr_get(desc,  7);
+    let K: i32      = arr_get(desc,  8);
+    let V: i32      = arr_get(desc,  9);
+    let row_in: i32 = arr_get(desc, 12);
+    let row_qkv: i32= arr_get(desc, 13);
+    let seq: i32    = arr_get(desc, 16);
+    let d_in: i32   = arr_get(desc, 17);
+    let d_head: i32 = arr_get(desc, 18);
+    let i: i32 = 0;
+    while (i < seq) {
+        arr_f32_copy_slice(X, i * d_in, row_in, 0, d_in);
+        arr_f32_matvec(W_Q, row_in, b_Q, row_qkv, d_head, d_in);
+        arr_f32_copy_slice(row_qkv, 0, Q, i * d_head, d_head);
+        arr_f32_matvec(W_K, row_in, b_K, row_qkv, d_head, d_in);
+        arr_f32_copy_slice(row_qkv, 0, K, i * d_head, d_head);
+        arr_f32_matvec(W_V, row_in, b_V, row_qkv, d_head, d_in);
+        arr_f32_copy_slice(row_qkv, 0, V, i * d_head, d_head);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn attn_scores_softmax_f32(desc: i32) -> i32 {
+    let Q: i32         = arr_get(desc,  7);
+    let K: i32         = arr_get(desc,  8);
+    let scores: i32    = arr_get(desc, 10);
+    let row_qkv: i32   = arr_get(desc, 13);
+    let row_score: i32 = arr_get(desc, 14);
+    let zero_bias: i32 = arr_get(desc, 15);
+    let seq: i32       = arr_get(desc, 16);
+    let d_head: i32    = arr_get(desc, 18);
+    let causal: i32    = arr_get(desc, 19);
+    let inv_sqrt_dh: f64 = 1.0 / math_sqrt(int_to_float(d_head));
+    let neg_big: f64 = 0.0 - 60.0;
+    let i: i32 = 0;
+    while (i < seq) {
+        arr_f32_copy_slice(Q, i * d_head, row_qkv, 0, d_head);
+        arr_f32_matvec(K, row_qkv, zero_bias, row_score, seq, d_head);
+        arr_f32_scale(row_score, inv_sqrt_dh);
+        if (causal != 0) {
+            let j: i32 = i + 1;
+            while (j < seq) {
+                arr_f32_set(row_score, j, neg_big);
+                j = j + 1;
+            }
+        }
+        arr_f32_softmax(row_score);
+        arr_f32_copy_slice(row_score, 0, scores, i * seq, seq);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn attn_combine_f32(desc: i32) -> i32 {
+    let V: i32         = arr_get(desc,  9);
+    let scores: i32    = arr_get(desc, 10);
+    let out: i32       = arr_get(desc, 11);
+    let row_qkv: i32   = arr_get(desc, 13);
+    let row_score: i32 = arr_get(desc, 14);
+    let seq: i32       = arr_get(desc, 16);
+    let d_head: i32    = arr_get(desc, 18);
+    let i: i32 = 0;
+    while (i < seq) {
+        arr_f32_copy_slice(scores, i * seq, row_score, 0, seq);
+        arr_f32_matvec_T(V, row_score, row_qkv, seq, d_head);
+        arr_f32_copy_slice(row_qkv, 0, out, i * d_head, d_head);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn attention_forward_f32(desc: i32) -> i32 {
+    attn_project_qkv_f32(desc);
+    attn_scores_softmax_f32(desc);
+    attn_combine_f32(desc);
+    return 0;
+}
+"""
+
+
+def needs_attention_lib(arch):
+    return any(layer[0] == "attention" for layer in arch)
+
+
 # Continuation of PROLOGUE.  Split out so DEQUANT_HELPER can be slotted
 # in conditionally between the two halves; load_byte_file / argmax_f32
 # are always needed regardless of quantisation choices.
@@ -423,11 +541,18 @@ def gen_scratch(arch):
         max_c_in = max(c_in for c_in, _ in multi_convs)
         lines.append(f"    let padded_multi: i32 = arr_f32_new({max_c_in * 900});")
     pi = 0
+    ai = 0
     for kind, *args in arch:
         if kind == "maxpool_2x2":
             c = args[0]
             lines.append(f"    let pool_a{pi}: i32 = arr_f32_new({c * 14 * 14});")
             pi += 1
+        elif kind == "attention":
+            seq, d_in, d_head, causal = args
+            lines.append(
+                f"    let attn_desc_{ai}: i32 = "
+                f"attn_alloc_desc_f32({seq}, {d_in}, {d_head}, {causal});")
+            ai += 1
     return lines
 
 
@@ -529,6 +654,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     li = 0
     ci = 0
     pi = 0
+    ai = 0
     for kind, *args in arch:
         if kind == "linear":
             in_f, out_f = args
@@ -618,6 +744,28 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(f"    }}")
             cur_a += 1
             pi += 1
+        elif kind == "attention":
+            # Single-head scaled dot-product attention.
+            # The descriptor was allocated once in gen_scratch; here we
+            # just point its Q/K/V/output slots at the current activation
+            # buffers and the per-layer weight tensors, then run the
+            # one-shot forward.  After the call, dst holds [seq, d_head]
+            # row-major — same shape contract as the kernel returns.
+            seq, d_in, d_head, causal = args
+            src = f"a{cur_a}"
+            dst = f"a{cur_a + 1}"
+            d = f"attn_desc_{ai}"
+            lines.append(f"    arr_set({d},  0, {src});")
+            lines.append(f"    arr_set({d},  1, Wq{ai});")
+            lines.append(f"    arr_set({d},  2, bq{ai});")
+            lines.append(f"    arr_set({d},  3, Wk{ai});")
+            lines.append(f"    arr_set({d},  4, bk{ai});")
+            lines.append(f"    arr_set({d},  5, Wv{ai});")
+            lines.append(f"    arr_set({d},  6, bv{ai});")
+            lines.append(f"    arr_set({d}, 11, {dst});")
+            lines.append(f"    attention_forward_f32({d});")
+            cur_a += 1
+            ai += 1
         elif kind == "flatten":
             # Reshape only — same buffer holds the data.  No code emitted.
             pass
@@ -651,9 +799,19 @@ def gen_main(arch, args, out_name, embed_dir, scales):
                             multi_int8_runtime)
 
     # n_in = the *size in elements* of the input buffer a0.  For an MLP
-    # this is the first layer's in_features; for a CNN it's c_in*28*28.
+    # this is the first layer's in_features; for a CNN it's c_in*28*28;
+    # for an attention-only model it's seq*d_in.
     n_in  = sizes[0]
-    n_out = next(i for i in reversed(arch) if i[0] == "linear")[2]
+    # n_out = element count of the final activation buffer.  For
+    # classifiers this is the last linear's out_features (used by
+    # argmax_f32 in the standard main loop).  For models without a
+    # final linear (e.g. attention-only test rigs), fall back to the
+    # last activation's element count so --no-argmax printing works.
+    last_linear = next((i for i in reversed(arch) if i[0] == "linear"), None)
+    if last_linear is not None:
+        n_out = last_linear[2]
+    else:
+        n_out = sizes[-1]
 
     body = []
     body.append(f"fn main() -> i32 {{")
@@ -676,6 +834,31 @@ def gen_main(arch, args, out_name, embed_dir, scales):
         body.append(f"        arr_f32_set(a0, i, (int_to_float(px) / 255.0 - {args.mean}) / {args.std});")
         body.append("        i = i + 1;")
         body.append("    }")
+        body += [("    " + l.lstrip()) for l in fwd]
+        if not args.no_argmax:
+            body.append(f"    print_int(argmax_f32(a{last}, {n_out}));")
+        else:
+            body.append(f"    let i2: i32 = 0;")
+            body.append(f"    while (i2 < {n_out}) {{")
+            body.append(f"        print_f64(arr_f32_get(a{last}, i2), 6);")
+            body.append("        i2 = i2 + 1;")
+            body.append("    }")
+        body.append("    return 0;")
+        body.append("}")
+        return "\n".join(body)
+
+    if args.input_format == "embedded":
+        # Embedded-input mode: a fixed input is baked into .text via
+        # embed_file at pack time.  Use case: deterministic regression
+        # tests, demo binaries, fixed-input batch evaluation against a
+        # reference checkpoint.  The standard --no-argmax flag controls
+        # whether the final activation is printed as argmax or as the
+        # full element-by-element f32 dump (for attention output, etc.).
+        if not args.input_file:
+            raise SystemExit(
+                "--input-format embedded requires --input-file <path>.")
+        body.append(f"    let X_in: i32 = embed_file(\"{args.input_file}\");")
+        body.append(f"    arr_f32_copy_slice(X_in, 0, a0, 0, {n_in});")
         body += [("    " + l.lstrip()) for l in fwd]
         if not args.no_argmax:
             body.append(f"    print_int(argmax_f32(a{last}, {n_out}));")
@@ -733,7 +916,10 @@ def parse_args():
                    help="state_dict key template.  {idx} = layer index "
                         "(0-based), {idx_plus_1} = 1-based, {kind} = "
                         "weight|bias.  Default: fc{idx_plus_1}.{kind}.")
-    p.add_argument("--input-format", choices=("mnist", "stdin"), default="mnist")
+    p.add_argument("--input-format", choices=("mnist", "stdin", "embedded"),
+                   default="mnist")
+    p.add_argument("--input-file",
+                   help="path to .f32 input file (used by --input-format embedded)")
     p.add_argument("--input-images", default=None,
                    help="Path to raw MNIST images file (mnist mode only).")
     p.add_argument("--input-labels", default=None,
@@ -936,9 +1122,10 @@ def main():
 
     # Collect (kind, idx, W, b) tuples in arch order so the staging-file
     # writer can name them consistently.
-    collected = []   # list of (kind, idx, W_array, b_array)
+    collected = []   # list of (kind, idx, suffix, W_array, b_array)
     li = 0
     ci = 0
+    ai = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -993,6 +1180,41 @@ def main():
             W = W.reshape(c_out, c_in * 9)
             collected.append(("conv2d_3x3_p1", ci, "", W, b))
             ci += 1
+        elif kind == "attention":
+            # ["attention", seq, d_in, d_head, causal]
+            # Three projections — Q, K, V — each loaded as a separate
+            # (W, b) tensor.  Standard HuggingFace / PyTorch convention
+            # is q_proj.weight / k_proj.weight / v_proj.weight; we also
+            # accept attn{idx}.q_proj.weight for stacked-block models.
+            seq, d_in, d_head, causal = largs
+            for proj in ("q", "k", "v"):
+                candidates_w = [
+                    f"{proj}_proj.weight",
+                    f"attn.{proj}_proj.weight",
+                    f"attention.{proj}_proj.weight",
+                    f"layers.{ai}.attn.{proj}_proj.weight",
+                    f"layers.{ai}.{proj}_proj.weight",
+                ]
+                candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
+                wkey = sd_lookup(sd, candidates_w)
+                bkey = sd_lookup(sd, candidates_b)
+                if wkey is None or bkey is None:
+                    raise SystemExit(
+                        f"attention #{ai}: missing {proj}_proj weight or bias.  "
+                        f"Tried: {candidates_w[0]} / "
+                        f"{candidates_w[3]}.  "
+                        f"Available: {sorted(sd.keys())}"
+                    )
+                W = sd[wkey].detach().cpu().numpy().astype("float32")
+                b = sd[bkey].detach().cpu().numpy().astype("float32")
+                if W.shape != (d_head, d_in) or b.shape != (d_head,):
+                    raise SystemExit(
+                        f"attention #{ai} {proj}_proj: shape mismatch. "
+                        f"expected ({d_head},{d_in}) + ({d_head},); got "
+                        f"{tuple(W.shape)} + {tuple(b.shape)}."
+                    )
+                collected.append(("attention", ai, proj, W, b))
+            ai += 1
     weights_blob = [a for (_, _, _, W, b) in collected for a in (W, b)]
 
     out_base = Path(args.out)
@@ -1070,6 +1292,8 @@ def main():
     ]
     if needs_dequant_helper(arch, args.quantize, args.input_format):
         prologue_parts.append(DEQUANT_HELPER)
+    if needs_attention_lib(arch):
+        prologue_parts.append(ATTENTION_LIB)
     prologue_parts.append(PROLOGUE_TAIL)
     src = (
         "".join(prologue_parts)

@@ -1,0 +1,8 @@
+# Build artifacts produced by run_test.sh — regenerable from make_synth.py
+# + aricode-pack, no value tracking them.
+synth.pt
+X_input.f32
+expected.f32
+attn_min
+attn_min.ari
+attn_min_*.f32
