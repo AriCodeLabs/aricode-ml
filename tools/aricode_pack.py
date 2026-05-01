@@ -352,7 +352,10 @@ fn attention_forward_f32(desc: i32) -> i32 {
 
 
 def needs_attention_lib(arch):
-    return any(layer[0] == "attention" for layer in arch)
+    # Multi-head attention also dispatches into single-head's
+    # attention_forward_f32, so the library is needed for either kind.
+    return any(layer[0] in ("attention", "multi_head_attention")
+               for layer in arch)
 
 
 # Affine LayerNorm: arr_f32_layernorm normalises in-place but doesn't
@@ -445,6 +448,8 @@ def residual_slots(arch):
         cur_size = first[1] * 28 * 28
     elif first[0] == "attention":
         cur_size = first[1] * first[2]
+    elif first[0] == "multi_head_attention":
+        cur_size = first[1] * first[2]   # seq * d_model
     elif first[0] == "layernorm":
         cur_size = first[1]
     else:
@@ -481,6 +486,9 @@ def residual_slots(arch):
         elif kind == "attention":
             seq, _, d_head, _ = args
             cur_size = seq * d_head
+        elif kind == "multi_head_attention":
+            seq, d_model, _, _ = args
+            cur_size = seq * d_model
         # layernorm, flatten, in-place activations: unchanged size
     if stack:
         raise ValueError(
@@ -583,6 +591,20 @@ def tensor_specs(kind, *args):
         seq, d_in, d_head, causal = args
         for proj in ("q", "k", "v"):
             yield (proj, d_head * d_in, d_head)
+    elif kind == "multi_head_attention":
+        # ["multi_head_attention", seq, d_model, n_heads, causal]
+        # Four (W, b) pairs — Q/K/V projections each (d_model, d_model)
+        # plus an output projection (d_model, d_model).  Matches the
+        # standard HuggingFace MHA layout (q_proj/k_proj/v_proj/out_proj).
+        # d_head = d_model / n_heads is computed at pack time and must
+        # divide evenly.
+        seq, d_model, n_heads, causal = args
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"multi_head_attention: d_model ({d_model}) must be a "
+                f"multiple of n_heads ({n_heads})")
+        for proj in ("q", "k", "v", "o"):
+            yield (proj, d_model * d_model, d_model)
     elif kind == "layernorm":
         # ["layernorm", dim] (eps defaults to 1e-5; or ["layernorm", dim, eps])
         # Single (γ, β) pair, both shape (dim,) — matches HuggingFace's
@@ -604,6 +626,11 @@ def tensor_names(kind, idx, suffix=""):
         return f"Wc{idx}", f"bc{idx}"
     if kind == "attention":
         return f"W{suffix}{idx}", f"b{suffix}{idx}"   # e.g. Wq0, bq0
+    if kind == "multi_head_attention":
+        # Distinct prefix from single-head so the same arch can host
+        # both kinds without name collisions.  e.g. Wmq0/bmq0 for the
+        # 0th MHA layer's Q projection.
+        return f"Wm{suffix}{idx}", f"bm{suffix}{idx}"
     if kind == "layernorm":
         return f"Wn{idx}", f"bn{idx}"   # γ=Wn (the "weight" in HF naming), β=bn
     raise ValueError(f"tensor_names: no weights for {kind!r}")
@@ -620,6 +647,7 @@ def weight_tensors(arch):
     ci = 0
     ai = 0
     ni = 0
+    mi = 0
     for kind, *args in arch:
         if kind == "linear":
             for suffix, nw, nb in tensor_specs(kind, *args):
@@ -636,6 +664,11 @@ def weight_tensors(arch):
                 wname, bname = tensor_names(kind, ai, suffix)
                 yield (kind, ai, suffix, nw, nb, wname, bname)
             ai += 1
+        elif kind == "multi_head_attention":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, mi, suffix)
+                yield (kind, mi, suffix, nw, nb, wname, bname)
+            mi += 1
         elif kind == "layernorm":
             for suffix, nw, nb in tensor_specs(kind, *args):
                 wname, bname = tensor_names(kind, ni, suffix)
@@ -699,6 +732,10 @@ def gen_act_decls(arch):
         # Input X is [seq, d_in] flat; size = seq * d_in.
         seq, d_in, _, _ = first[1], first[2], first[3], first[4]
         sizes = [seq * d_in]
+    elif first[0] == "multi_head_attention":
+        # Input X is [seq, d_model] flat; size = seq * d_model.
+        seq, d_model, _, _ = first[1], first[2], first[3], first[4]
+        sizes = [seq * d_model]
     elif first[0] == "layernorm":
         # Input is [K, dim] flat where K = arr_len(input) / dim.  When
         # LayerNorm is first, the packer can't know K from the arch
@@ -738,6 +775,11 @@ def gen_act_decls(arch):
             # potentially different feature dim.
             seq, _, d_head, _ = args
             sizes.append(seq * d_head)
+        elif kind == "multi_head_attention":
+            # Output is [seq, d_model] (the heads are concatenated and
+            # projected back to d_model) — same shape as the input.
+            seq, d_model, _, _ = args
+            sizes.append(seq * d_model)
         elif kind == "layernorm":
             # In-place — same buffer, same size.
             pass
@@ -772,6 +814,7 @@ def gen_scratch(arch):
         lines.append(f"    let padded_multi: i32 = arr_f32_new({max_c_in * 900});")
     pi = 0
     ai = 0
+    mi = 0
     for kind, *args in arch:
         if kind == "maxpool_2x2":
             c = args[0]
@@ -783,6 +826,31 @@ def gen_scratch(arch):
                 f"    let attn_desc_{ai}: i32 = "
                 f"attn_alloc_desc_f32({seq}, {d_in}, {d_head}, {causal});")
             ai += 1
+        elif kind == "multi_head_attention":
+            seq, d_model, n_heads, causal = args
+            d_head = d_model // n_heads
+            # Reuse one single-head descriptor across all n_heads heads —
+            # its scratch is sized (seq, d_head), which doesn't change
+            # within a layer.  Need SEPARATE Q/K/V slice scratches: the
+            # single-head kernel binds W_Q/W_K/W_V into its descriptor and
+            # then runs the project pass that reads all three in the same
+            # loop, so reusing one scratch would let the V slice clobber
+            # Q before Q's matvec runs.
+            lines.append(
+                f"    let mha_desc_{mi}: i32 = "
+                f"attn_alloc_desc_f32({seq}, {d_model}, {d_head}, {causal});")
+            for proj in ("q", "k", "v"):
+                lines.append(
+                    f"    let mha_W{proj}slice_{mi}: i32 = "
+                    f"arr_f32_new({d_head * d_model});")
+                lines.append(
+                    f"    let mha_b{proj}slice_{mi}: i32 = "
+                    f"arr_f32_new({d_head});")
+            lines.append(
+                f"    let mha_head_out_{mi}: i32 = arr_f32_new({seq * d_head});")
+            lines.append(
+                f"    let mha_concat_{mi}: i32 = arr_f32_new({seq * d_model});")
+            mi += 1
     # Residual slot buffers: one per save_residual entry, sized to the
     # activation count at the save point (= same as the matched add).
     for slot_idx, n_elems in residual_slots(arch):
@@ -792,8 +860,12 @@ def gen_scratch(arch):
     # than its in_f (i.e. operates on a [seq, in_f] flat input that
     # came from an attention block), emit_linear loops per row using
     # _row_in / _row_out.  Size to the max in_f / out_f across the arch.
+    # Multi-head attention also uses these scratch buffers for its
+    # output projection, so factor those dims in too.
     linear_layers_in = [args for kind, *args in arch if kind == "linear"]
-    if linear_layers_in:
+    mha_dims = [args[1] for kind, *args in arch
+                if kind == "multi_head_attention"]
+    if linear_layers_in or mha_dims:
         # Detect whether ANY Linear is batched by walking arch with a
         # cur_size tracker (mirrors gen_act_decls' batch logic).
         first_lin = next((l for l in arch if l[0] not in
@@ -824,9 +896,13 @@ def gen_scratch(arch):
                 cur = args[0] * 14 * 14
             elif kind == "attention":
                 cur = args[0] * args[2]
-        if any_batched:
-            max_in  = max(in_f for in_f, _ in linear_layers_in)
-            max_out = max(out_f for _, out_f in linear_layers_in)
+        if any_batched or mha_dims:
+            in_dims  = ([in_f for in_f, _ in linear_layers_in] +
+                        list(mha_dims))
+            out_dims = ([out_f for _, out_f in linear_layers_in] +
+                        list(mha_dims))
+            max_in  = max(in_dims) if in_dims else 0
+            max_out = max(out_dims) if out_dims else 0
             lines.append(f"    let _row_in: i32 = arr_f32_new({max_in});")
             lines.append(f"    let _row_out: i32 = arr_f32_new({max_out});")
     return lines
@@ -932,6 +1008,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     pi = 0
     ai = 0
     ni = 0
+    mi = 0
     # Stack of (slot_idx, n_elems) for every save_residual we've emitted
     # but not yet matched with an add_residual.  Pre-validated by
     # residual_slots (called from gen_scratch); here we just track
@@ -1066,6 +1143,74 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(f"    attention_forward_f32({d});")
             cur_a += 1
             ai += 1
+        elif kind == "multi_head_attention":
+            # Multi-head SDPA = single-head SDPA per head, with weights
+            # sliced from (d_model, d_model) into per-head (d_head, d_model)
+            # views, then heads concatenated and pushed through an output
+            # projection.  We reuse the existing single-head kernel n_heads
+            # times via a copy_slice + descriptor-pointer-swap scheme.
+            seq, d_model, n_heads, causal = args
+            d_head = d_model // n_heads
+            src = f"a{cur_a}"
+            dst = f"a{cur_a + 1}"
+            d = f"mha_desc_{mi}"
+            ho = f"mha_head_out_{mi}"
+            cc = f"mha_concat_{mi}"
+            lines.append(f"    // multi_head_attention {mi}: "
+                         f"d_model={d_model} n_heads={n_heads} d_head={d_head}")
+            lines.append(f"    let _mh{mi}: i32 = 0;")
+            lines.append(f"    while (_mh{mi} < {n_heads}) {{")
+            # Slice per-head Q/K/V W and b out of the full d_model tensors
+            # into separate scratches; the project pass inside
+            # attention_forward_f32 reads all three in the same loop, so
+            # they need to be live simultaneously.  The full Q/K/V
+            # weights stay in their (d_model, d_model) layout and we
+            # copy the contiguous d_head-row chunk for the current head.
+            for proj in ("q", "k", "v"):
+                W_full = f"Wm{proj}{mi}"
+                b_full = f"bm{proj}{mi}"
+                ws = f"mha_W{proj}slice_{mi}"
+                bs = f"mha_b{proj}slice_{mi}"
+                slot_w = {"q": 1, "k": 3, "v": 5}[proj]
+                slot_b = {"q": 2, "k": 4, "v": 6}[proj]
+                lines.append(
+                    f"        arr_f32_copy_slice({W_full}, "
+                    f"_mh{mi} * {d_head * d_model}, {ws}, 0, {d_head * d_model});")
+                lines.append(
+                    f"        arr_f32_copy_slice({b_full}, "
+                    f"_mh{mi} * {d_head}, {bs}, 0, {d_head});")
+                lines.append(f"        arr_set({d}, {slot_w}, {ws});")
+                lines.append(f"        arr_set({d}, {slot_b}, {bs});")
+            lines.append(f"        arr_set({d}, 0, {src});")
+            lines.append(f"        arr_set({d}, 11, {ho});")
+            lines.append(f"        attention_forward_f32({d});")
+            # Concat: per row, copy d_head elements from ho into cc at
+            # offset row*d_model + h*d_head.
+            lines.append(f"        let _mr{mi}: i32 = 0;")
+            lines.append(f"        while (_mr{mi} < {seq}) {{")
+            lines.append(
+                f"            arr_f32_copy_slice({ho}, _mr{mi} * {d_head}, "
+                f"{cc}, _mr{mi} * {d_model} + _mh{mi} * {d_head}, {d_head});")
+            lines.append(f"            _mr{mi} = _mr{mi} + 1;")
+            lines.append(f"        }}")
+            lines.append(f"        _mh{mi} = _mh{mi} + 1;")
+            lines.append(f"    }}")
+            # Output projection: dst[r] = Wo · cc[r] + bo, per row.
+            lines.append(f"    let _mp{mi}: i32 = 0;")
+            lines.append(f"    while (_mp{mi} < {seq}) {{")
+            lines.append(
+                f"        arr_f32_copy_slice({cc}, _mp{mi} * {d_model}, "
+                f"_row_in, 0, {d_model});")
+            lines.append(
+                f"        arr_f32_matvec(Wmo{mi}, _row_in, bmo{mi}, "
+                f"_row_out, {d_model}, {d_model});")
+            lines.append(
+                f"        arr_f32_copy_slice(_row_out, 0, {dst}, "
+                f"_mp{mi} * {d_model}, {d_model});")
+            lines.append(f"        _mp{mi} = _mp{mi} + 1;")
+            lines.append(f"    }}")
+            cur_a += 1
+            mi += 1
         elif kind == "flatten":
             # Reshape only — same buffer holds the data.  No code emitted.
             pass
@@ -1478,6 +1623,7 @@ def main():
     ci = 0
     ai = 0
     ni = 0
+    mi = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -1567,6 +1713,41 @@ def main():
                     )
                 collected.append(("attention", ai, proj, W, b))
             ai += 1
+        elif kind == "multi_head_attention":
+            seq, d_model, n_heads, causal = largs
+            # Q/K/V/O projections — same key-pattern set as single-head
+            # attention, plus an out_proj.  All four shaped (d_model, d_model).
+            proj_to_key = {"q": "q_proj", "k": "k_proj", "v": "v_proj",
+                           "o": "out_proj"}
+            for proj in ("q", "k", "v", "o"):
+                key_stem = proj_to_key[proj]
+                candidates_w = [
+                    f"{key_stem}.weight",
+                    f"attn.{key_stem}.weight",
+                    f"attention.{key_stem}.weight",
+                    f"layers.{mi}.attn.{key_stem}.weight",
+                    f"layers.{mi}.{key_stem}.weight",
+                ]
+                candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
+                wkey = sd_lookup(sd, candidates_w)
+                bkey = sd_lookup(sd, candidates_b)
+                if wkey is None or bkey is None:
+                    raise SystemExit(
+                        f"multi_head_attention #{mi}: missing {key_stem} "
+                        f"weight or bias.  Tried: {candidates_w[0]} / "
+                        f"{candidates_w[3]}.  Available: {sorted(sd.keys())}"
+                    )
+                W = sd[wkey].detach().cpu().numpy().astype("float32")
+                b = sd[bkey].detach().cpu().numpy().astype("float32")
+                if W.shape != (d_model, d_model) or b.shape != (d_model,):
+                    raise SystemExit(
+                        f"multi_head_attention #{mi} {key_stem}: shape "
+                        f"mismatch.  expected ({d_model},{d_model}) + "
+                        f"({d_model},); got {tuple(W.shape)} + "
+                        f"{tuple(b.shape)}."
+                    )
+                collected.append(("multi_head_attention", mi, proj, W, b))
+            mi += 1
         elif kind == "layernorm":
             # ["layernorm", dim] — γ ("LayerNorm.weight") and β ("LayerNorm.bias")
             # both shape (dim,).  HuggingFace naming, accepting the common

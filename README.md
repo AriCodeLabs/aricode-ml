@@ -151,6 +151,11 @@ aricode-ml/
 |                  |                            | `q_proj.weight` / `k_proj.weight` /    |
 |                  |                            | `v_proj.weight` (HF naming) from the   |
 |                  |                            | state_dict.                            |
+| `multi_head_attention` | `seq, d_model, n_heads, causal` | Multi-head SDPA built on the |
+|                  |                            | single-head kernel.  d_head =          |
+|                  |                            | d_model/n_heads.  Loads q_proj /       |
+|                  |                            | k_proj / v_proj / out_proj (all        |
+|                  |                            | shaped d_model×d_model).               |
 | `layernorm`      | `dim`                      | Affine LayerNorm over the last `dim`   |
 |                  |                            | elements (γ, β learnable; loads as     |
 |                  |                            | `LayerNorm.weight` / `LayerNorm.bias`).|
@@ -199,12 +204,13 @@ isn't competing for that workload.
 ecosystems have years of quantisation and batched-attention work
 this repo doesn't approximate.
 
-✗ Your model has layers we don't pack yet (RNN, multi-head
-attention, arbitrary-spatial conv).  Single-head scaled dot-product
-attention IS supported as of v0.13; LayerNorm, GELU, and residual
-connections shipped through v0.16; the full single-head Pre-LN
-transformer encoder block is shipped and regression-tested as of
-v0.17.  Multi-head attention is the next roadmap piece.
+✗ Your model has layers we don't pack yet (RNN, Embedding /
+positional encoding, arbitrary-spatial conv).  Single- and
+multi-head scaled dot-product attention, LayerNorm, GELU, and
+residual connections all ship through v0.18.  The full Pre-LN
+transformer encoder block is regression-tested.  Embedding-table
+front-ends (token-id → f32 vector) are the missing piece for a
+fully end-to-end packed transformer.
 
 ## Roadmap
 
@@ -270,13 +276,23 @@ Shipped:
       save → LN → Attention → add → save → LN → FFN(Linear-GELU-Linear) → add
   Pre-LN block (seq=4, d_model=16, d_ff=32) and matches PyTorch
   within 7.6e-6 across all 64 output elements.
+- v0.18: multi-head attention.  `["multi_head_attention", seq,
+  d_model, n_heads, causal]` arch entry; loads `q_proj` / `k_proj` /
+  `v_proj` / `out_proj` (all `d_model × d_model`) from the state_dict
+  and dispatches into the single-head kernel n_heads times via
+  per-head weight slicing.  Concatenates head outputs and applies
+  the output projection.  Regression: `examples/multi_head_min/`
+  packs `[multi_head_attention, seq=4, d_model=16, n_heads=4]` and
+  matches PyTorch's `torch.nn.functional.scaled_dot_product_attention`
+  composed-with-out-projection within 4e-5 — sufficient for f32
+  classifier-class accuracy.
 
 Pending:
-- multi-head attention wrapping — split d_model across heads, run
-  single-head SDPA per head, concatenate, optional output
-  projection.  Single-head SDPA + transformer-block scaffolding
-  are now production-ready; multi-head is the path to full
-  HF-class encoders.
+- combined HF-class encoder demo: layer-stack of N transformer
+  blocks built from the v0.13–v0.18 primitives.  All the building
+  blocks ship; the remaining work is example/test wiring and an
+  embedding-table front (no aricode-pack support for Embedding
+  layers yet).
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
