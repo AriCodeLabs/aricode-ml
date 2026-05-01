@@ -156,6 +156,13 @@ aricode-ml/
 |                  |                            | d_model/n_heads.  Loads q_proj /       |
 |                  |                            | k_proj / v_proj / out_proj (all        |
 |                  |                            | shaped d_model×d_model).               |
+| `embedding`      | `vocab_size, d_model, seq` | Token-ID lookup table.  Must be the    |
+|                  |                            | first arch entry; consumes a 1-byte-   |
+|                  |                            | per-token raw stream from the input    |
+|                  |                            | loader.  Loads HF                      |
+|                  |                            | `embeddings.word_embeddings.weight` /  |
+|                  |                            | `wte.weight` etc.  vocab_size ≤ 256    |
+|                  |                            | today (2/4-byte tokens are roadmap).   |
 | `layernorm`      | `dim`                      | Affine LayerNorm over the last `dim`   |
 |                  |                            | elements (γ, β learnable; loads as     |
 |                  |                            | `LayerNorm.weight` / `LayerNorm.bias`).|
@@ -204,13 +211,11 @@ isn't competing for that workload.
 ecosystems have years of quantisation and batched-attention work
 this repo doesn't approximate.
 
-✗ Your model has layers we don't pack yet (RNN, Embedding /
-positional encoding, arbitrary-spatial conv).  Single- and
-multi-head scaled dot-product attention, LayerNorm, GELU, and
-residual connections all ship through v0.18.  The full Pre-LN
-transformer encoder block is regression-tested.  Embedding-table
-front-ends (token-id → f32 vector) are the missing piece for a
-fully end-to-end packed transformer.
+✗ Your model has layers we don't pack yet (RNN, positional encoding,
+arbitrary-spatial conv).  Single- and multi-head SDPA, LayerNorm,
+GELU, residuals, and embedding lookup all ship through v0.19.  The
+last piece for a fully end-to-end packed HF transformer is positional
+encoding (and a 2/4-byte token loader for vocab > 256).
 
 ## Roadmap
 
@@ -286,13 +291,22 @@ Shipped:
   matches PyTorch's `torch.nn.functional.scaled_dot_product_attention`
   composed-with-out-projection within 4e-5 — sufficient for f32
   classifier-class accuracy.
+- v0.19: embedding-table front-end.  `["embedding", vocab_size,
+  d_model, seq]` arch entry; loads HuggingFace canonical names
+  (`embeddings.word_embeddings.weight`, `wte.weight`, etc.) and
+  emits a per-token copy_slice lookup.  Token IDs come in as a raw
+  byte stream (1 byte per token, vocab ≤ 256 today; 2- and 4-byte
+  loaders are roadmap).  Regression: `examples/embedding_min/`
+  packs an embedding-only arch with token IDs `[3, 1, 4, 2]` and
+  matches PyTorch's `nn.Embedding` lookup within 1e-6.
 
 Pending:
-- combined HF-class encoder demo: layer-stack of N transformer
-  blocks built from the v0.13–v0.18 primitives.  All the building
-  blocks ship; the remaining work is example/test wiring and an
-  embedding-table front (no aricode-pack support for Embedding
-  layers yet).
+- 2-byte / 4-byte token loaders for vocab > 256 (real HF transformer
+  vocab is 30K+).  Today's 1-byte loader is enough for synthetic
+  demos; production transformers need the bigger token range.
+- Positional encoding (sinusoidal or learned).  Embedding lookup is
+  shipped; positional add is the next layer up for a fully end-to-end
+  packed transformer encoder.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).

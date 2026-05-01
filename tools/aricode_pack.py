@@ -611,6 +611,13 @@ def tensor_specs(kind, *args):
         # LayerNorm.weight (γ) / LayerNorm.bias (β) convention.
         dim = args[0]
         yield ("", dim, dim)
+    elif kind == "embedding":
+        # ["embedding", vocab_size, d_model, seq]
+        # nn.Embedding has only a weight tensor (no bias).  We yield
+        # the bias size as 0; the consumers (gen_weight_decls, gen_load,
+        # main pack staging) skip the bias path when n_bias == 0.
+        vocab_size, d_model, _seq = args
+        yield ("", vocab_size * d_model, 0)
     else:
         raise ValueError(f"tensor_specs: no weights for {kind!r}")
 
@@ -633,6 +640,11 @@ def tensor_names(kind, idx, suffix=""):
         return f"Wm{suffix}{idx}", f"bm{suffix}{idx}"
     if kind == "layernorm":
         return f"Wn{idx}", f"bn{idx}"   # γ=Wn (the "weight" in HF naming), β=bn
+    if kind == "embedding":
+        # No bias for nn.Embedding; bemb{idx} is reserved but never
+        # allocated.  Returned only for API symmetry; consumers gate
+        # on n_bias==0 from tensor_specs and skip it.
+        return f"Wemb{idx}", f"bemb{idx}"
     raise ValueError(f"tensor_names: no weights for {kind!r}")
 
 
@@ -648,6 +660,7 @@ def weight_tensors(arch):
     ai = 0
     ni = 0
     mi = 0
+    ei = 0
     for kind, *args in arch:
         if kind == "linear":
             for suffix, nw, nb in tensor_specs(kind, *args):
@@ -674,6 +687,11 @@ def weight_tensors(arch):
                 wname, bname = tensor_names(kind, ni, suffix)
                 yield (kind, ni, suffix, nw, nb, wname, bname)
             ni += 1
+        elif kind == "embedding":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, ei, suffix)
+                yield (kind, ei, suffix, nw, nb, wname, bname)
+            ei += 1
 
 
 def weight_size(kind, *args):
@@ -689,13 +707,16 @@ def weight_size(kind, *args):
 
 def gen_weight_decls(arch, embed):
     """Either pre-allocated empty tensors (filled by file_read later) or
-    nothing (embed_file inside gen_load declares the let bindings)."""
+    nothing (embed_file inside gen_load declares the let bindings).
+    Layers with no bias (n_bias==0, e.g. nn.Embedding) skip the bias
+    decl entirely."""
     if embed:
         return []
     lines = []
     for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
         lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
-        lines.append(f"    let {bname}: i32 = arr_f32_new({nb});")
+        if nb > 0:
+            lines.append(f"    let {bname}: i32 = arr_f32_new({nb});")
     return lines
 
 
@@ -735,6 +756,12 @@ def gen_act_decls(arch):
     elif first[0] == "multi_head_attention":
         # Input X is [seq, d_model] flat; size = seq * d_model.
         seq, d_model, _, _ = first[1], first[2], first[3], first[4]
+        sizes = [seq * d_model]
+    elif first[0] == "embedding":
+        # Embedding's input is a sequence of token IDs (held in a
+        # separate scratch buffer the input loader fills).  Its OUTPUT
+        # is the [seq, d_model] f32 tensor that becomes a0.
+        _vocab, d_model, seq = first[1], first[2], first[3]
         sizes = [seq * d_model]
     elif first[0] == "layernorm":
         # Input is [K, dim] flat where K = arr_len(input) / dim.  When
@@ -780,6 +807,17 @@ def gen_act_decls(arch):
             # projected back to d_model) — same shape as the input.
             seq, d_model, _, _ = args
             sizes.append(seq * d_model)
+        elif kind == "embedding":
+            # Token-ID lookup → [seq, d_model] f32.  When embedding is
+            # the first layer, this is the same size as sizes[0] (set
+            # by the first-layer branch above) — but iterating over
+            # arch yields embedding too on the first pass, so we'd
+            # double-append.  Skip if this is the first layer.
+            if len(sizes) == 1 and arch[0][0] == "embedding":
+                pass
+            else:
+                _, d_model, seq = args
+                sizes.append(seq * d_model)
         elif kind == "layernorm":
             # In-place — same buffer, same size.
             pass
@@ -826,6 +864,11 @@ def gen_scratch(arch):
                 f"    let attn_desc_{ai}: i32 = "
                 f"attn_alloc_desc_f32({seq}, {d_in}, {d_head}, {causal});")
             ai += 1
+        elif kind == "embedding":
+            # No descriptor or scratch needed — the embedding forward
+            # reads token IDs directly from the input-loader-emitted
+            # _toks_raw buffer and copy_slice's into the activation.
+            pass
         elif kind == "multi_head_attention":
             seq, d_model, n_heads, causal = args
             d_head = d_model // n_heads
@@ -978,13 +1021,15 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
         lines = []
         for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
             lines.append(f"    let {wname}: i32 = embed_file(\"{embed_dir}/{out_name}_{wname}.f32\");")
-            lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
+            if nb > 0:
+                lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
         return lines
     lines = [f"    let weight_path: i32 = str_new(\"{out_name}.f32\");",
              "    let _wfd: i32 = file_open(weight_path, 0);"]
     for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
         lines.append(f"    file_read(_wfd, {wname}, {nw * 4});")
-        lines.append(f"    file_read(_wfd, {bname}, {nb * 4});")
+        if nb > 0:
+            lines.append(f"    file_read(_wfd, {bname}, {nb * 4});")
     lines.append("    file_close(_wfd);")
     return lines
 
@@ -1009,6 +1054,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     ai = 0
     ni = 0
     mi = 0
+    ei = 0
     # Stack of (slot_idx, n_elems) for every save_residual we've emitted
     # but not yet matched with an add_residual.  Pre-validated by
     # residual_slots (called from gen_scratch); here we just track
@@ -1224,6 +1270,37 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines += emit_softmax(f"a{cur_a}")
         elif kind == "gelu":
             lines += emit_gelu(f"a{cur_a}")
+        elif kind == "embedding":
+            # Token-ID lookup: for each i in 0..seq, read the i-th
+            # token from the _toks_raw byte buffer (1 byte per token,
+            # vocab < 256) and copy d_model elements from row tok of
+            # the embedding matrix into the activation buffer.
+            #
+            # Embedding only supported as the FIRST layer today; the
+            # input loader emits _toks_raw via embed_file_bytes.
+            # vocab >= 256 needs 2-byte-per-token decoding (TODO).
+            vocab_size, d_model, seq = args
+            if cur_a != 0:
+                raise SystemExit(
+                    f"embedding #{ei} must be the first layer; today the "
+                    "packer only emits a token-input loader for the "
+                    "leading position.")
+            if vocab_size > 256:
+                raise SystemExit(
+                    f"embedding #{ei}: vocab_size={vocab_size} exceeds the "
+                    "256-token limit of the 1-byte-per-token loader.  "
+                    "2-byte and 4-byte token decoding are roadmap items.")
+            dst = f"a{cur_a}"
+            lines.append(f"    let _ei{ei}: i32 = 0;")
+            lines.append(f"    while (_ei{ei} < {seq}) {{")
+            lines.append(f"        let _tok{ei}: i32 = byte_at(_toks_raw, _ei{ei});")
+            lines.append(
+                f"        arr_f32_copy_slice(Wemb{ei}, _tok{ei} * {d_model}, "
+                f"{dst}, _ei{ei} * {d_model}, {d_model});")
+            lines.append(f"        _ei{ei} = _ei{ei} + 1;")
+            lines.append(f"    }}")
+            ei += 1
+            # cur_a stays at 0; the embedding's output IS a0.
         elif kind == "save_residual":
             # Snapshot a{cur_a} into the next residual slot so the
             # matched add_residual can fold it back in.  In-place: no
@@ -1314,8 +1391,17 @@ def gen_main(arch, args, out_name, embed_dir, scales):
         if not args.input_file:
             raise SystemExit(
                 "--input-format embedded requires --input-file <path>.")
-        body.append(f"    let X_in: i32 = embed_file(\"{args.input_file}\");")
-        body.append(f"    arr_f32_copy_slice(X_in, 0, a0, 0, {n_in});")
+        if arch[0][0] == "embedding":
+            # Embedding-first arch: the file is a raw byte stream of
+            # token IDs (1 byte per token).  The embedding layer's
+            # forward decodes them into the activation buffer.
+            body.append(
+                f"    let _toks_raw: i32 = embed_file_bytes(\"{args.input_file}\");")
+        else:
+            # Standard f32-input case: copy n_in f32 elements straight
+            # into a0.
+            body.append(f"    let X_in: i32 = embed_file(\"{args.input_file}\");")
+            body.append(f"    arr_f32_copy_slice(X_in, 0, a0, 0, {n_in});")
         body += [("    " + l.lstrip()) for l in fwd]
         if not args.no_argmax:
             body.append(f"    print_int(argmax_f32(a{last}, {n_out}));")
@@ -1624,6 +1710,7 @@ def main():
     ai = 0
     ni = 0
     mi = 0
+    ei = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -1778,7 +1865,45 @@ def main():
                 )
             collected.append(("layernorm", ni, "", W, b))
             ni += 1
-    weights_blob = [a for (_, _, _, W, b) in collected for a in (W, b)]
+        elif kind == "embedding":
+            # ["embedding", vocab_size, d_model, seq] — only a weight
+            # tensor (no bias).  HuggingFace canonical names cover BERT/
+            # distilbert (embeddings.word_embeddings.weight) and GPT-style
+            # (wte.weight); also accept bare ".weight" stems for one-off
+            # checkpoints saved with state_dict[token_emb] = ...
+            vocab_size, d_model, _seq = largs
+            candidates = [
+                "embeddings.word_embeddings.weight",
+                "wte.weight",
+                "embed.weight",
+                "tok_embeddings.weight",
+                "embeddings.weight",
+                f"layers.{ei}.embed.weight",
+            ]
+            wkey = sd_lookup(sd, candidates)
+            if wkey is None:
+                raise SystemExit(
+                    f"embedding #{ei}: cannot find weight in checkpoint.  "
+                    f"Tried: {candidates[0]} / {candidates[1]} / ...  "
+                    f"Available: {sorted(sd.keys())}"
+                )
+            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            if W.shape != (vocab_size, d_model):
+                raise SystemExit(
+                    f"embedding #{ei}: shape mismatch.  expected "
+                    f"({vocab_size},{d_model}); got {tuple(W.shape)}."
+                )
+            # Synthesise a zero-byte placeholder for `b` so the shared
+            # 5-tuple shape stays consistent.  Downstream consumers
+            # already gate on size==0 to skip bias staging.
+            import numpy as _np
+            b = _np.zeros(0, dtype=_np.float32)
+            collected.append(("embedding", ei, "", W, b))
+            ei += 1
+    # Skip zero-size tensors when accumulating the f32 blob (no bias for
+    # nn.Embedding); same condition gate the staging-file writer uses.
+    weights_blob = [a for (_, _, _, W, b) in collected
+                    for a in ((W,) if b.size == 0 else (W, b))]
 
     out_base = Path(args.out)
     src_path  = out_base.with_suffix(".ari")
@@ -1829,10 +1954,12 @@ def main():
         for kind, idx, suffix, W, b in collected:
             wname, bname = tensor_names(kind, idx, suffix)
             wp = out_base.parent / f"{out_base.name}_{wname}.f32"
-            bp = out_base.parent / f"{out_base.name}_{bname}.f32"
             with open(wp, "wb") as f: W.tofile(f)
-            with open(bp, "wb") as f: b.tofile(f)
-            wrote.extend([wp, bp])
+            wrote.append(wp)
+            if b.size > 0:
+                bp = out_base.parent / f"{out_base.name}_{bname}.f32"
+                with open(bp, "wb") as f: b.tofile(f)
+                wrote.append(bp)
         print("wrote per-tensor staging files:")
         for p in wrote:
             print(f"  {p}")
