@@ -1,0 +1,6 @@
+synth.pt
+X_input.f32
+expected.f32
+gelu_min
+gelu_min.ari
+gelu_min_*.f32

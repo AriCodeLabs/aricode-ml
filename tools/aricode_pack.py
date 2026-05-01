@@ -155,6 +155,10 @@ def emit_softmax(var):
     return [f"    arr_f32_softmax({var});"]
 
 
+def emit_gelu(var):
+    return [f"    gelu_f32({var});"]
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Code generator: walks the arch list and emits a self-contained
 #  aricode source that loads the weight blob, runs the test loop, and
@@ -345,6 +349,39 @@ fn layernorm_affine_f32(buf: i32, dim: i32, gamma: i32, beta: i32) -> i32 {
 
 def needs_layernorm_helper(arch):
     return any(layer[0] == "layernorm" for layer in arch)
+
+
+# GELU helper: tanh-approximation form used by HuggingFace, OpenAI's
+# GPT lineage, BERT/distilbert, etc. (matches torch.nn.GELU with
+# `approximate='tanh'`).  Computes
+#
+#   gelu(x) = 0.5 · x · (1 + tanh(c · (x + 0.044715 · x³)))
+#
+# with c = sqrt(2/π) ≈ 0.79788.  tanh is computed via math_exp using the
+# numerically-stable tanh(z) = 1 − 2/(e^(2z) + 1) form so we don't need
+# a scalar math_tanh builtin.  Scalar inner pass — fine at d_ff up to
+# ~3072 where the FFN dominates wall regardless.  A vectorised
+# arr_f32_gelu builtin would be a future drop-in.
+GELU_HELPER = """
+fn gelu_f32(buf: i32) -> i32 {
+    let n: i32 = arr_len(buf);
+    let i: i32 = 0;
+    let c: f64 = 0.7978845608028654;
+    while (i < n) {
+        let x: f64 = arr_f32_get(buf, i);
+        let inner: f64 = c * (x + 0.044715 * x * x * x);
+        let e2z: f64 = math_exp(2.0 * inner);
+        let t: f64 = 1.0 - 2.0 / (e2z + 1.0);
+        arr_f32_set(buf, i, 0.5 * x * (1.0 + t));
+        i = i + 1;
+    }
+    return 0;
+}
+"""
+
+
+def needs_gelu_helper(arch):
+    return any(layer[0] == "gelu" for layer in arch)
 
 
 # Continuation of PROLOGUE.  Split out so DEQUANT_HELPER can be slotted
@@ -842,6 +879,8 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines += emit_tanh(f"a{cur_a}")
         elif kind == "softmax":
             lines += emit_softmax(f"a{cur_a}")
+        elif kind == "gelu":
+            lines += emit_gelu(f"a{cur_a}")
         else:
             raise ValueError(f"unknown layer kind: {kind!r}")
     return lines, cur_a
@@ -1431,6 +1470,8 @@ def main():
         prologue_parts.append(ATTENTION_LIB)
     if needs_layernorm_helper(arch):
         prologue_parts.append(LAYERNORM_HELPER)
+    if needs_gelu_helper(arch):
+        prologue_parts.append(GELU_HELPER)
     prologue_parts.append(PROLOGUE_TAIL)
     src = (
         "".join(prologue_parts)

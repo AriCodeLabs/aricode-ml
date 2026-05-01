@@ -155,7 +155,9 @@ aricode-ml/
 |                  |                            | elements (γ, β learnable; loads as     |
 |                  |                            | `LayerNorm.weight` / `LayerNorm.bias`).|
 | `flatten`        | —                          | reshape, no code emitted               |
-| `relu` / `sigmoid` / `tanh` / `softmax` | —              | in-place activations                   |
+| `relu` / `sigmoid` / `tanh` / `softmax` / `gelu` | —      | in-place activations.  `gelu` uses the |
+|                  |                            | tanh approximation matching            |
+|                  |                            | `torch.nn.GELU(approximate='tanh')`.   |
 
 Restrictions today: spatial size is 28×28 (the AVX2 conv builtins are
 hardcoded for MNIST); CIFAR-style 32×32 RGB needs a generic conv
@@ -238,12 +240,16 @@ Shipped:
   arr_f32_layernorm normalises in-place; a small scalar helper then
   applies the affine pass.  Regression: `examples/layernorm_min/`
   matches PyTorch's `torch.nn.LayerNorm + Linear` within 1.4e-6.
+- v0.15: GELU activation.  `["gelu"]` arch entry; tanh approximation
+  matching `torch.nn.GELU(approximate='tanh')` — the form used by
+  HF / OpenAI / BERT lineages.  Regression: `examples/gelu_min/`
+  packs a Linear → GELU → Linear FFN block and matches the PyTorch
+  reference within 1.9e-6.
 
 Pending:
 - multi-block transformer (attention + LayerNorm + FFN block) —
-  attention and LayerNorm now ship; the missing pieces are
-  multi-head wrapping, residual-add as an arch entry, and a
-  GELU activation builtin (today only ReLU/sigmoid/tanh).
+  attention, LayerNorm, and GELU now ship; the missing pieces are
+  multi-head attention wrapping and residual-add as an arch entry.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
