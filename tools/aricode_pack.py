@@ -177,15 +177,15 @@ fn arr_f32_from_file_into(fd: i32, buf: i32, n: i32) -> i32 {{
 }}
 
 // Dequantise n int8 bytes from `q` into f32 buffer `dst`, multiplying by
-// `scale`.  Sign-extends the byte before the float conversion (Aricode's
-// byte_at returns 0..255).  Used when the binary was packed with
-// `--quantize int8` — runs once per weight tensor at startup.
+// `scale`.  arr_i8_get does the sign-extend in hardware (movsx); the
+// loop is the unchanged scalar pattern used when the binary was packed
+// with `--quantize int8` and the multi-channel conv layer has chosen
+// the dequant-at-startup path (--input-format mnist; the stdin path
+// keeps weights int8 in RAM).  Runs once per weight tensor at startup.
 fn dequant_int8_to_f32(q: i32, dst: i32, n: i32, scale: f64) -> i32 {{
     let i: i32 = 0;
     while (i < n) {{
-        let v: i32 = byte_at(q, i);
-        if (v >= 128) {{ v = v - 256; }}
-        arr_f32_set(dst, i, int_to_float(v) * scale);
+        arr_f32_set(dst, i, int_to_float(arr_i8_get(q, i)) * scale);
         i = i + 1;
     }}
     return 0;
