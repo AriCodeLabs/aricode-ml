@@ -317,6 +317,36 @@ def needs_attention_lib(arch):
     return any(layer[0] == "attention" for layer in arch)
 
 
+# Affine LayerNorm: arr_f32_layernorm normalises in-place but doesn't
+# apply the learnable scale (γ) and shift (β) every real transformer
+# uses.  This helper does the affine pass after the builtin normalises.
+# Scalar inner loop is acceptable at d_model = 64..512 (a typical
+# distilbert d_model is 768 → ~50K ops for 64 tokens, < 25 µs).
+LAYERNORM_HELPER = """
+fn layernorm_affine_f32(buf: i32, dim: i32, gamma: i32, beta: i32) -> i32 {
+    arr_f32_layernorm(buf, dim, 0.00001);
+    let n: i32 = arr_len(buf);
+    let K: i32 = n / dim;
+    let k: i32 = 0;
+    while (k < K) {
+        let i: i32 = 0;
+        while (i < dim) {
+            let off: i32 = k * dim + i;
+            arr_f32_set(buf, off,
+                arr_f32_get(buf, off) * arr_f32_get(gamma, i) + arr_f32_get(beta, i));
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+"""
+
+
+def needs_layernorm_helper(arch):
+    return any(layer[0] == "layernorm" for layer in arch)
+
+
 # Continuation of PROLOGUE.  Split out so DEQUANT_HELPER can be slotted
 # in conditionally between the two halves; load_byte_file / argmax_f32
 # are always needed regardless of quantisation choices.
@@ -412,6 +442,12 @@ def tensor_specs(kind, *args):
         seq, d_in, d_head, causal = args
         for proj in ("q", "k", "v"):
             yield (proj, d_head * d_in, d_head)
+    elif kind == "layernorm":
+        # ["layernorm", dim] (eps defaults to 1e-5; or ["layernorm", dim, eps])
+        # Single (γ, β) pair, both shape (dim,) — matches HuggingFace's
+        # LayerNorm.weight (γ) / LayerNorm.bias (β) convention.
+        dim = args[0]
+        yield ("", dim, dim)
     else:
         raise ValueError(f"tensor_specs: no weights for {kind!r}")
 
@@ -427,6 +463,8 @@ def tensor_names(kind, idx, suffix=""):
         return f"Wc{idx}", f"bc{idx}"
     if kind == "attention":
         return f"W{suffix}{idx}", f"b{suffix}{idx}"   # e.g. Wq0, bq0
+    if kind == "layernorm":
+        return f"Wn{idx}", f"bn{idx}"   # γ=Wn (the "weight" in HF naming), β=bn
     raise ValueError(f"tensor_names: no weights for {kind!r}")
 
 
@@ -440,6 +478,7 @@ def weight_tensors(arch):
     li = 0
     ci = 0
     ai = 0
+    ni = 0
     for kind, *args in arch:
         if kind == "linear":
             for suffix, nw, nb in tensor_specs(kind, *args):
@@ -456,6 +495,11 @@ def weight_tensors(arch):
                 wname, bname = tensor_names(kind, ai, suffix)
                 yield (kind, ai, suffix, nw, nb, wname, bname)
             ai += 1
+        elif kind == "layernorm":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, ni, suffix)
+                yield (kind, ni, suffix, nw, nb, wname, bname)
+            ni += 1
 
 
 def weight_size(kind, *args):
@@ -497,9 +541,17 @@ def gen_act_decls(arch):
         # Input X is [seq, d_in] flat; size = seq * d_in.
         seq, d_in, _, _ = first[1], first[2], first[3], first[4]
         sizes = [seq * d_in]
+    elif first[0] == "layernorm":
+        # Input is [K, dim] flat where K = arr_len(input) / dim.  When
+        # LayerNorm is first, the packer can't know K from the arch
+        # alone — default to K=1 (single-row input, common for test
+        # rigs and one-shot inference).  For batch-style usage with
+        # K > 1, prepend a no-op layer (or a placeholder linear with
+        # in_features=K*dim) to fix the input size.
+        sizes = [first[1]]   # = dim
     else:
-        raise ValueError(f"first layer must be linear, conv2d_3x3_p1, or attention; "
-                         f"got {first[0]!r}")
+        raise ValueError(f"first layer must be linear, conv2d_3x3_p1, attention, "
+                         f"or layernorm; got {first[0]!r}")
 
     for kind, *args in arch:
         if kind == "linear":
@@ -515,6 +567,9 @@ def gen_act_decls(arch):
             # potentially different feature dim.
             seq, _, d_head, _ = args
             sizes.append(seq * d_head)
+        elif kind == "layernorm":
+            # In-place — same buffer, same size.
+            pass
         elif kind == "flatten":
             # No size change, just shape interpretation.  Reuse same buffer.
             pass
@@ -655,6 +710,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     ci = 0
     pi = 0
     ai = 0
+    ni = 0
     for kind, *args in arch:
         if kind == "linear":
             in_f, out_f = args
@@ -744,6 +800,15 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(f"    }}")
             cur_a += 1
             pi += 1
+        elif kind == "layernorm":
+            # In-place affine layernorm over the last axis.  The kernel
+            # normalises (mean=0, var=1 per group of `dim`); the helper
+            # then applies the learnable γ and β.
+            dim = args[0]
+            src = f"a{cur_a}"
+            lines.append(
+                f"    layernorm_affine_f32({src}, {dim}, Wn{ni}, bn{ni});")
+            ni += 1
         elif kind == "attention":
             # Single-head scaled dot-product attention.
             # The descriptor was allocated once in gen_scratch; here we
@@ -1165,6 +1230,7 @@ def main():
     li = 0
     ci = 0
     ai = 0
+    ni = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -1254,6 +1320,36 @@ def main():
                     )
                 collected.append(("attention", ai, proj, W, b))
             ai += 1
+        elif kind == "layernorm":
+            # ["layernorm", dim] — γ ("LayerNorm.weight") and β ("LayerNorm.bias")
+            # both shape (dim,).  HuggingFace naming, accepting the common
+            # in-block placements (LayerNorm, attention.LayerNorm, etc.).
+            dim = largs[0]
+            candidates_w = [
+                "LayerNorm.weight",
+                f"layers.{ni}.LayerNorm.weight",
+                f"layer_norm{ni}.weight",
+                f"ln_{ni}.weight",
+            ]
+            candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
+            wkey = sd_lookup(sd, candidates_w)
+            bkey = sd_lookup(sd, candidates_b)
+            if wkey is None or bkey is None:
+                raise SystemExit(
+                    f"layernorm #{ni}: missing γ / β.  Tried: "
+                    f"{candidates_w[0]} / {candidates_w[1]}.  "
+                    f"Available: {sorted(sd.keys())}"
+                )
+            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            b = sd[bkey].detach().cpu().numpy().astype("float32")
+            if W.shape != (dim,) or b.shape != (dim,):
+                raise SystemExit(
+                    f"layernorm #{ni}: shape mismatch.  expected "
+                    f"({dim},) + ({dim},); got {tuple(W.shape)} + "
+                    f"{tuple(b.shape)}."
+                )
+            collected.append(("layernorm", ni, "", W, b))
+            ni += 1
     weights_blob = [a for (_, _, _, W, b) in collected for a in (W, b)]
 
     out_base = Path(args.out)
@@ -1333,6 +1429,8 @@ def main():
         prologue_parts.append(DEQUANT_HELPER)
     if needs_attention_lib(arch):
         prologue_parts.append(ATTENTION_LIB)
+    if needs_layernorm_helper(arch):
+        prologue_parts.append(LAYERNORM_HELPER)
     prologue_parts.append(PROLOGUE_TAIL)
     src = (
         "".join(prologue_parts)

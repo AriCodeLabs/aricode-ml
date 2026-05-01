@@ -151,6 +151,9 @@ aricode-ml/
 |                  |                            | `q_proj.weight` / `k_proj.weight` /    |
 |                  |                            | `v_proj.weight` (HF naming) from the   |
 |                  |                            | state_dict.                            |
+| `layernorm`      | `dim`                      | Affine LayerNorm over the last `dim`   |
+|                  |                            | elements (γ, β learnable; loads as     |
+|                  |                            | `LayerNorm.weight` / `LayerNorm.bias`).|
 | `flatten`        | —                          | reshape, no code emitted               |
 | `relu` / `sigmoid` / `tanh` / `softmax` | —              | in-place activations                   |
 
@@ -230,12 +233,17 @@ Shipped:
   1.3e-6 — pure f32 quantisation noise.  Also new in v0.13:
   `--input-format embedded` for baking a fixed input file into
   `.text` (test rigs, deterministic single-shot demos).
+- v0.14: affine LayerNorm.  `["layernorm", dim]` arch entry; loads
+  γ / β from `LayerNorm.weight` / `LayerNorm.bias` (HF convention).
+  arr_f32_layernorm normalises in-place; a small scalar helper then
+  applies the affine pass.  Regression: `examples/layernorm_min/`
+  matches PyTorch's `torch.nn.LayerNorm + Linear` within 1.4e-6.
 
 Pending:
-- multi-block transformer (attention + LayerNorm + FFN block) — the
-  attention kernel handles single-head SDPA; multi-head, residual
-  connections, and the typical transformer-block sandwich are the
-  next layer up.
+- multi-block transformer (attention + LayerNorm + FFN block) —
+  attention and LayerNorm now ship; the missing pieces are
+  multi-head wrapping, residual-add as an arch entry, and a
+  GELU activation builtin (today only ReLU/sigmoid/tanh).
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
