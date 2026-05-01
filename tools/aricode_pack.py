@@ -964,7 +964,7 @@ def gen_scratch(arch):
         first_lin = next((l for l in arch if l[0] not in
                           ("save_residual", "add_residual", "flatten",
                            "relu", "sigmoid", "tanh", "softmax", "gelu",
-                           "layernorm")), None)
+                           "layernorm", "positional_embedding")), None)
         if first_lin is not None:
             if first_lin[0] == "linear":
                 cur = first_lin[1]
@@ -972,6 +972,11 @@ def gen_scratch(arch):
                 cur = first_lin[1] * 28 * 28
             elif first_lin[0] == "attention":
                 cur = first_lin[1] * first_lin[2]
+            elif first_lin[0] == "multi_head_attention":
+                cur = first_lin[1] * first_lin[2]
+            elif first_lin[0] == "embedding":
+                # ["embedding", vocab, d_model, seq] → output [seq, d_model]
+                cur = first_lin[3] * first_lin[2]
             else:
                 cur = 0
         else:
@@ -989,6 +994,10 @@ def gen_scratch(arch):
                 cur = args[0] * 14 * 14
             elif kind == "attention":
                 cur = args[0] * args[2]
+            elif kind == "multi_head_attention":
+                cur = args[0] * args[1]
+            elif kind == "embedding":
+                cur = args[2] * args[1]   # seq * d_model
         if any_batched or mha_dims:
             in_dims  = ([in_f for in_f, _ in linear_layers_in] +
                         list(mha_dims))
@@ -1876,16 +1885,26 @@ def main():
             seq, d_model, n_heads, causal = largs
             # Q/K/V/O projections — same key-pattern set as single-head
             # attention, plus an out_proj.  All four shaped (d_model, d_model).
-            proj_to_key = {"q": "q_proj", "k": "k_proj", "v": "v_proj",
-                           "o": "out_proj"}
+            # We accept both the bare HuggingFace `q_proj` convention
+            # and distilbert's nested `transformer.layer.{i}.attention.q_lin`
+            # form (note: distilbert uses `_lin` not `_proj`).
+            proj_to_keys = {
+                "q": ("q_proj", "q_lin"),
+                "k": ("k_proj", "k_lin"),
+                "v": ("v_proj", "v_lin"),
+                "o": ("out_proj", "out_lin"),
+            }
             for proj in ("q", "k", "v", "o"):
-                key_stem = proj_to_key[proj]
+                hf_key, dbert_key = proj_to_keys[proj]
                 candidates_w = [
-                    f"{key_stem}.weight",
-                    f"attn.{key_stem}.weight",
-                    f"attention.{key_stem}.weight",
-                    f"layers.{mi}.attn.{key_stem}.weight",
-                    f"layers.{mi}.{key_stem}.weight",
+                    f"{hf_key}.weight",
+                    f"attn.{hf_key}.weight",
+                    f"attention.{hf_key}.weight",
+                    f"layers.{mi}.attn.{hf_key}.weight",
+                    f"layers.{mi}.{hf_key}.weight",
+                    # distilbert: transformer.layer.{i}.attention.q_lin.weight
+                    f"transformer.layer.{mi}.attention.{dbert_key}.weight",
+                    f"layer.{mi}.attention.{dbert_key}.weight",
                 ]
                 candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
                 wkey = sd_lookup(sd, candidates_w)
@@ -1909,15 +1928,55 @@ def main():
             mi += 1
         elif kind == "layernorm":
             # ["layernorm", dim] — γ ("LayerNorm.weight") and β ("LayerNorm.bias")
-            # both shape (dim,).  HuggingFace naming, accepting the common
-            # in-block placements (LayerNorm, attention.LayerNorm, etc.).
+            # both shape (dim,).  HuggingFace naming.  The packer's per-LN
+            # counter `ni` walks LN entries in arch order, so for typical
+            # encoder stacks the embedding-LN is ni=0, then per-block
+            # sa_layer_norm and output_layer_norm interleave.  Distilbert
+            # / BERT layouts:
+            #   ni=0   embeddings.LayerNorm
+            #   ni=1   transformer.layer.0.sa_layer_norm
+            #   ni=2   transformer.layer.0.output_layer_norm
+            #   ni=3   transformer.layer.1.sa_layer_norm
+            #   ...
+            # We try all of these patterns; first hit wins.
             dim = largs[0]
-            candidates_w = [
-                "LayerNorm.weight",
-                f"layers.{ni}.LayerNorm.weight",
-                f"layer_norm{ni}.weight",
-                f"ln_{ni}.weight",
-            ]
+            if ni == 0:
+                # Initial / embedding-level LN.  Prefer HF embedding LN
+                # over plain `LayerNorm.weight` so a checkpoint that
+                # has both an embedding LN and per-block LNs disambiguates
+                # correctly (an arch with ni=0 ALWAYS expects the
+                # embedding-level LN to match first).
+                candidates_w = [
+                    "embeddings.LayerNorm.weight",
+                    "LayerNorm.weight",
+                    "layers.0.LayerNorm.weight",
+                    "layer_norm0.weight",
+                    "ln_0.weight",
+                ]
+            else:
+                # Per-block LN.  Decode (block_idx, sa|output) from ni:
+                # blocks contribute 2 LNs each after the embedding LN
+                # at ni=0, so block_idx = (ni - 1) // 2 and the SA flag
+                # is is_sa = ni is odd.  Tries distilbert and BERT
+                # naming patterns FIRST so embedding-level keys can't
+                # accidentally match a per-block ni>0 slot.
+                block_idx = (ni - 1) // 2
+                is_sa = (ni % 2 == 1)
+                sa_or_out = "sa_layer_norm" if is_sa else "output_layer_norm"
+                candidates_w = [
+                    # distilbert: transformer.layer.{i}.{sa|output}_layer_norm
+                    f"transformer.layer.{block_idx}.{sa_or_out}.weight",
+                    f"layer.{block_idx}.{sa_or_out}.weight",
+                    # BERT: encoder.layer.{i}.attention.output.LayerNorm /
+                    #       encoder.layer.{i}.output.LayerNorm
+                    f"encoder.layer.{block_idx}.attention.output.LayerNorm.weight"
+                        if is_sa else
+                        f"encoder.layer.{block_idx}.output.LayerNorm.weight",
+                    # Plain layered fallbacks (the existing convention)
+                    f"layers.{ni}.LayerNorm.weight",
+                    f"layer_norm{ni}.weight",
+                    f"ln_{ni}.weight",
+                ]
             candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
             wkey = sd_lookup(sd, candidates_w)
             bkey = sd_lookup(sd, candidates_b)
