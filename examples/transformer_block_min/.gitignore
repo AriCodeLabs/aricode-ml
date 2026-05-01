@@ -1,0 +1,6 @@
+synth.pt
+X_input.f32
+expected.f32
+tb_min
+tb_min.ari
+tb_min_*.f32

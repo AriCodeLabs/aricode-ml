@@ -1,0 +1,13 @@
+[
+    ["save_residual"],
+    ["layernorm", 16],
+    ["attention", 4, 16, 16, 0],
+    ["add_residual"],
+
+    ["save_residual"],
+    ["layernorm", 16],
+    ["linear", 16, 32],
+    ["gelu"],
+    ["linear", 32, 16],
+    ["add_residual"]
+]

@@ -120,23 +120,57 @@ def linear_weights(idx: int, in_f: int, out_f: int, sd, key_pattern: str):
 
 
 def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
-                quant_scale=None):
+                quant_scale=None, seq=1):
     """Emit a Linear-layer forward.
 
-    `quant_scale` is None for the f32 path (default, single arr_f32_matvec
-    call) or a Python float when the weights are int8.  In the int8 case
-    we use the native arr_i8_matvec_f32 builtin, then arr_f32_add_scaled
-    to fuse in the f32 bias — two calls vs one on the f32 path, but the
-    weights stay int8 in RAM so RAM usage on a 200 KB FC layer drops to
-    50 KB and we skip the startup dequant pass entirely."""
-    if quant_scale is None:
+    `seq` defaults to 1 — the original single-row matvec form used by
+    classifier heads, MLPs, and post-flatten CNN classifiers.  When
+    `seq > 1` (the transformer-block case where the input is
+    `[seq, in_f]` flat after an attention block), emit a loop that
+    applies the matvec per row, writing into the matching `[seq, out_f]`
+    flat output.  Per-row scratch buffers `_row_in` / `_row_out` are
+    allocated by gen_scratch.
+
+    `quant_scale` is None for the f32 path (single arr_f32_matvec call)
+    or a Python float when the weights are int8 — uses the native
+    arr_i8_matvec_f32 builtin + arr_f32_add_scaled for the bias.
+    """
+    if seq <= 1:
+        if quant_scale is None:
+            return [
+                f"    arr_f32_matvec({w_var}, {src_var}, {b_var}, {dst_var}, {out_f}, {in_f});",
+            ]
         return [
-            f"    arr_f32_matvec({w_var}, {src_var}, {b_var}, {dst_var}, {out_f}, {in_f});",
+            f"    arr_i8_matvec_f32({w_var}, {src_var}, {dst_var}, {out_f}, {quant_scale!r});",
+            f"    arr_f32_add_scaled({dst_var}, {b_var}, 1.0);",
         ]
-    return [
-        f"    arr_i8_matvec_f32({w_var}, {src_var}, {dst_var}, {out_f}, {quant_scale!r});",
-        f"    arr_f32_add_scaled({dst_var}, {b_var}, 1.0);",
-    ]
+    # Batched: loop seq times, slicing [in_f] rows of src into _row_in
+    # and writing [out_f] rows of dst from _row_out.  Slightly slower
+    # than a hypothetical batched matvec builtin (extra copies), but
+    # keeps the kernel surface unchanged and runs within microseconds
+    # on transformer-block-class shapes.
+    if quant_scale is None:
+        body = [
+            f"    let _li{idx}: i32 = 0;",
+            f"    while (_li{idx} < {seq}) {{",
+            f"        arr_f32_copy_slice({src_var}, _li{idx} * {in_f}, _row_in, 0, {in_f});",
+            f"        arr_f32_matvec({w_var}, _row_in, {b_var}, _row_out, {out_f}, {in_f});",
+            f"        arr_f32_copy_slice(_row_out, 0, {dst_var}, _li{idx} * {out_f}, {out_f});",
+            f"        _li{idx} = _li{idx} + 1;",
+            f"    }}",
+        ]
+    else:
+        body = [
+            f"    let _li{idx}: i32 = 0;",
+            f"    while (_li{idx} < {seq}) {{",
+            f"        arr_f32_copy_slice({src_var}, _li{idx} * {in_f}, _row_in, 0, {in_f});",
+            f"        arr_i8_matvec_f32({w_var}, _row_in, _row_out, {out_f}, {quant_scale!r});",
+            f"        arr_f32_add_scaled(_row_out, {b_var}, 1.0);",
+            f"        arr_f32_copy_slice(_row_out, 0, {dst_var}, _li{idx} * {out_f}, {out_f});",
+            f"        _li{idx} = _li{idx} + 1;",
+            f"    }}",
+        ]
+    return body
 
 
 def emit_relu(var):
@@ -395,11 +429,16 @@ def residual_slots(arch):
     earlier unmatched save."""
     if not any(layer[0] in ("save_residual", "add_residual") for layer in arch):
         return []
-    # We need per-position activation sizes.  Recompute by walking
-    # gen_act_decls' logic inline (cheaper than refactoring its return
-    # to expose the per-step size).
-    # Mirror gen_act_decls' first-layer dispatch.
-    first = arch[0]
+    # We need per-position activation sizes.  Mirror gen_act_decls'
+    # first-layer dispatch, including the same look-past-pseudo-ops
+    # logic so an arch that opens with save_residual (the standard
+    # Pre-LN transformer pattern) sizes correctly.
+    pseudo = ("save_residual", "add_residual", "flatten",
+              "relu", "sigmoid", "tanh", "softmax", "gelu",
+              "layernorm")
+    first = next((l for l in arch if l[0] not in pseudo), None)
+    if first is None:
+        first = arch[0]
     if first[0] == "linear":
         cur_size = first[1]
     elif first[0] == "conv2d_3x3_p1":
@@ -428,7 +467,12 @@ def residual_slots(arch):
                     f"residual size mismatch: save was {saved_size} elements "
                     f"but add is at {cur_size} elements")
         elif kind == "linear":
-            cur_size = args[1]
+            in_f, out_f = args
+            if cur_size >= in_f and cur_size % in_f == 0:
+                seq_in = cur_size // in_f
+                cur_size = seq_in * out_f
+            else:
+                cur_size = out_f
         elif kind == "conv2d_3x3_p1":
             cur_size = args[1] * 28 * 28
         elif kind == "maxpool_2x2":
@@ -628,7 +672,24 @@ def gen_act_decls(arch):
     it.  Returns (decl_lines, sizes_list)."""
     if not arch:
         raise ValueError("empty arch")
-    first = arch[0]
+    # Look past pseudo-layers to find the first size-defining entry.
+    # save_residual / add_residual / flatten / activations / layernorm
+    # all preserve the input shape, so they don't constrain sizes[0].
+    # The standard Pre-LN transformer pattern starts with
+    # save_residual + layernorm; without this skip, gen_act_decls
+    # would either crash or pick the wrong size.
+    pseudo = ("save_residual", "add_residual", "flatten",
+              "relu", "sigmoid", "tanh", "softmax", "gelu",
+              "layernorm")
+    first = next((l for l in arch if l[0] not in pseudo), None)
+    if first is None:
+        # Pure LN/activation chain — fall back to first layer's dim
+        # (only meaningful for layernorm; activations don't carry a dim).
+        first = arch[0]
+        if first[0] != "layernorm":
+            raise ValueError(
+                f"arch must include at least one size-defining layer; "
+                f"got pseudo-only with first={first[0]!r}")
     if first[0] == "linear":
         sizes = [first[1]]
     elif first[0] == "conv2d_3x3_p1":
@@ -652,7 +713,20 @@ def gen_act_decls(arch):
 
     for kind, *args in arch:
         if kind == "linear":
-            sizes.append(args[1])
+            in_f, out_f = args
+            # Batch-aware: if the current activation has more than `in_f`
+            # elements (e.g. coming out of an attention block with
+            # `seq * d_in` elements), apply Linear per row and the
+            # output gets `(seq) * out_f` elements.  For seq=1 this
+            # collapses to the classic single-row behaviour.
+            cur = sizes[-1]
+            if cur >= in_f and cur % in_f == 0:
+                seq = cur // in_f
+                sizes.append(seq * out_f)
+            else:
+                # Mismatch — keep the old assumption; the runtime call
+                # would emit garbage.  Most likely a bug in the arch JSON.
+                sizes.append(out_f)
         elif kind == "conv2d_3x3_p1":
             c_in, c_out = args
             sizes.append(c_out * 28 * 28)
@@ -714,6 +788,47 @@ def gen_scratch(arch):
     for slot_idx, n_elems in residual_slots(arch):
         lines.append(
             f"    let _resid_{slot_idx}: i32 = arr_f32_new({n_elems});")
+    # Batched-Linear scratch: when any Linear receives more elements
+    # than its in_f (i.e. operates on a [seq, in_f] flat input that
+    # came from an attention block), emit_linear loops per row using
+    # _row_in / _row_out.  Size to the max in_f / out_f across the arch.
+    linear_layers_in = [args for kind, *args in arch if kind == "linear"]
+    if linear_layers_in:
+        # Detect whether ANY Linear is batched by walking arch with a
+        # cur_size tracker (mirrors gen_act_decls' batch logic).
+        first_lin = next((l for l in arch if l[0] not in
+                          ("save_residual", "add_residual", "flatten",
+                           "relu", "sigmoid", "tanh", "softmax", "gelu",
+                           "layernorm")), None)
+        if first_lin is not None:
+            if first_lin[0] == "linear":
+                cur = first_lin[1]
+            elif first_lin[0] == "conv2d_3x3_p1":
+                cur = first_lin[1] * 28 * 28
+            elif first_lin[0] == "attention":
+                cur = first_lin[1] * first_lin[2]
+            else:
+                cur = 0
+        else:
+            cur = 0
+        any_batched = False
+        for kind, *args in arch:
+            if kind == "linear":
+                in_f, out_f = args
+                if cur >= in_f and cur % in_f == 0 and cur > in_f:
+                    any_batched = True
+                cur = (cur // in_f) * out_f if (cur >= in_f and cur % in_f == 0) else out_f
+            elif kind == "conv2d_3x3_p1":
+                cur = args[1] * 28 * 28
+            elif kind == "maxpool_2x2":
+                cur = args[0] * 14 * 14
+            elif kind == "attention":
+                cur = args[0] * args[2]
+        if any_batched:
+            max_in  = max(in_f for in_f, _ in linear_layers_in)
+            max_out = max(out_f for _, out_f in linear_layers_in)
+            lines.append(f"    let _row_in: i32 = arr_f32_new({max_in});")
+            lines.append(f"    let _row_out: i32 = arr_f32_new({max_out});")
     return lines
 
 
@@ -823,14 +938,22 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     # which slot each add belongs to.
     resid_stack = []
     next_resid_slot = 0
+    # Recompute per-position activation sizes (mirrors gen_act_decls
+    # exactly) so Linears that receive [seq, in_f] flat input know to
+    # emit a per-row loop.  Could share the list with gen_act_decls'
+    # return value, but recomputing is cheaper than threading through.
+    _, sizes_for_seq = gen_act_decls(arch)
     for kind, *args in arch:
         if kind == "linear":
             in_f, out_f = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
             sc = scales.get(("linear", li, "W")) if scales else None
+            cur_size = sizes_for_seq[cur_a]
+            seq_in = cur_size // in_f if (cur_size >= in_f and cur_size % in_f == 0) else 1
             lines += emit_linear(li, in_f, out_f, src, dst,
-                                 f"W{li}", f"b{li}", quant_scale=sc)
+                                 f"W{li}", f"b{li}", quant_scale=sc,
+                                 seq=seq_in)
             cur_a += 1
             li += 1
         elif kind == "conv2d_3x3_p1":
@@ -995,16 +1118,12 @@ def gen_main(arch, args, out_name, embed_dir, scales):
     # this is the first layer's in_features; for a CNN it's c_in*28*28;
     # for an attention-only model it's seq*d_in.
     n_in  = sizes[0]
-    # n_out = element count of the final activation buffer.  For
-    # classifiers this is the last linear's out_features (used by
-    # argmax_f32 in the standard main loop).  For models without a
-    # final linear (e.g. attention-only test rigs), fall back to the
-    # last activation's element count so --no-argmax printing works.
-    last_linear = next((i for i in reversed(arch) if i[0] == "linear"), None)
-    if last_linear is not None:
-        n_out = last_linear[2]
-    else:
-        n_out = sizes[-1]
+    # n_out = element count of the final activation buffer.  Always
+    # derived from sizes[-1] (gen_act_decls handles batched Linear,
+    # attention output shape, classifier head, etc.) so the
+    # no-argmax printing loop and the argmax search both walk the
+    # whole final tensor.
+    n_out = sizes[-1]
 
     body = []
     body.append(f"fn main() -> i32 {{")

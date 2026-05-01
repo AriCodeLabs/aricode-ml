@@ -199,11 +199,12 @@ isn't competing for that workload.
 ecosystems have years of quantisation and batched-attention work
 this repo doesn't approximate.
 
-✗ Your model has layers we don't pack yet (RNN, multi-block
-transformers with LayerNorm + residuals + FFN, arbitrary-spatial
-conv).  Single-head scaled dot-product attention IS supported as of
-v0.13; multi-head and full transformer blocks are next on the
-roadmap.
+✗ Your model has layers we don't pack yet (RNN, multi-head
+attention, arbitrary-spatial conv).  Single-head scaled dot-product
+attention IS supported as of v0.13; LayerNorm, GELU, and residual
+connections shipped through v0.16; the full single-head Pre-LN
+transformer encoder block is shipped and regression-tested as of
+v0.17.  Multi-head attention is the next roadmap piece.
 
 ## Roadmap
 
@@ -257,13 +258,25 @@ Shipped:
   Regression: `examples/residual_min/` packs a Linear → save →
   Linear → GELU → Linear → add residual-FFN block and matches the
   PyTorch reference within 2.9e-6.
+- v0.17: batched Linear + full Pre-LN transformer encoder block.
+  When a Linear's input has more elements than `in_f` (typical
+  after an attention block — input is `[seq, d_in]` flat),
+  emit_linear now emits a per-row loop using `_row_in` / `_row_out`
+  scratch.  Activation sizing in `gen_act_decls` is batch-aware,
+  the residual-slot validator agrees on shapes, and `n_out` always
+  reads `sizes[-1]` so multi-row outputs print correctly under
+  `--no-argmax`.  End-to-end regression:
+  `examples/transformer_block_min/` packs the standard
+      save → LN → Attention → add → save → LN → FFN(Linear-GELU-Linear) → add
+  Pre-LN block (seq=4, d_model=16, d_ff=32) and matches PyTorch
+  within 7.6e-6 across all 64 output elements.
 
 Pending:
-- multi-block transformer: attention + LayerNorm + FFN + residuals
-  now all ship as arch entries.  The remaining piece for full
-  transformer-encoder support is multi-head attention wrapping
-  (split d_model across heads, run single-head SDPA per head,
-  concatenate, project) — today only single-head SDPA is exposed.
+- multi-head attention wrapping — split d_model across heads, run
+  single-head SDPA per head, concatenate, optional output
+  projection.  Single-head SDPA + transformer-block scaffolding
+  are now production-ready; multi-head is the path to full
+  HF-class encoders.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
