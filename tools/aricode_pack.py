@@ -1072,10 +1072,23 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
         arch_by_idx = {("conv2d_3x3_p1", i): _conv_c_in(layer)
                        for i, layer in enumerate(
                            [l for l in arch if l[0] == "conv2d_3x3_p1"])}
+        QUANTISABLE = ("linear", "conv2d_3x3_p1")
         lines = []
         for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
-            scale_w = scales[(kind, idx, "W")]
             c_in = arch_by_idx.get((kind, idx))
+            if kind not in QUANTISABLE:
+                # Not int8-supported (attention / MHA / embedding /
+                # positional_embedding / layernorm) — staged as f32 by
+                # the main pack(), embed via embed_file directly.
+                lines.append(
+                    f"    let {wname}: i32 = "
+                    f"embed_file(\"{embed_dir}/{out_name}_{wname}.f32\");")
+                if nb > 0:
+                    lines.append(
+                        f"    let {bname}: i32 = "
+                        f"embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
+                continue
+            scale_w = scales[(kind, idx, "W")]
             if kind == "linear":
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
@@ -2097,28 +2110,47 @@ def main():
         args.embed = True
 
     if args.embed and args.quantize == "int8":
-        # Quantise weights to int8; keep biases as f32 (always tiny —
-        # quantising them buys ~10 bytes per layer at the cost of a
-        # less-accurate constant offset).
+        # int8 staging: only LINEAR and CONV tensors get quantised —
+        # those are the kinds with native int8 matvec/conv kernels.
+        # Other kinds (attention, multi_head_attention, embedding,
+        # positional_embedding, layernorm) keep f32 staging because
+        # their forward paths consume f32 weights (no int8 kernel
+        # exists for them).  Without this gate the packer used to
+        # emit `dequant_int8_to_f32` calls for tensors that the
+        # prologue didn't even include the helper for, producing
+        # "Undefined function" compile errors on transformer-class
+        # models.
+        QUANTISABLE = ("linear", "conv2d_3x3_p1")
         import numpy as _np
         wrote = []
         for kind, idx, suffix, W, b in collected:
             wname, bname = tensor_names(kind, idx, suffix)
-            # Weight: int8.
-            abs_max = float(_np.abs(W).max()) if W.size else 0.0
-            scale = abs_max / 127.0 if abs_max > 0 else 0.0
-            if scale == 0.0:
-                q = _np.zeros(W.shape, dtype=_np.int8)
+            if kind in QUANTISABLE:
+                # Weight → int8 (per-tensor symmetric scale).
+                abs_max = float(_np.abs(W).max()) if W.size else 0.0
+                scale = abs_max / 127.0 if abs_max > 0 else 0.0
+                if scale == 0.0:
+                    q = _np.zeros(W.shape, dtype=_np.int8)
+                else:
+                    q = _np.round(W / scale).clip(-128, 127).astype(_np.int8)
+                scales[(kind, idx, "W")] = scale
+                wp = out_base.parent / f"{out_base.name}_{wname}.i8"
+                q.tofile(wp)
+                wrote.append(wp)
             else:
-                q = _np.round(W / scale).clip(-128, 127).astype(_np.int8)
-            scales[(kind, idx, "W")] = scale
-            wp = out_base.parent / f"{out_base.name}_{wname}.i8"
-            q.tofile(wp)
-            wrote.append(wp)
-            # Bias: f32.
-            bp = out_base.parent / f"{out_base.name}_{bname}.f32"
-            b.tofile(bp)
-            wrote.append(bp)
+                # Stays f32 — gen_load embeds via embed_file (not
+                # embed_file_bytes) and the runtime kernel reads
+                # straight f32.
+                wp = out_base.parent / f"{out_base.name}_{wname}.f32"
+                W.tofile(wp)
+                wrote.append(wp)
+            # Bias (when present): always f32.  Tiny tensors so
+            # quantisation buys ~10 bytes per layer at the cost of
+            # a less-accurate constant offset.
+            if b.size > 0:
+                bp = out_base.parent / f"{out_base.name}_{bname}.f32"
+                b.tofile(bp)
+                wrote.append(bp)
         print("wrote per-tensor staging files:")
         total = 0
         for p in wrote:
@@ -2127,7 +2159,8 @@ def main():
             print(f"  {p}  ({sz} bytes)")
         f32_total = sum(a.size * 4 for (_, _, _, W, b) in collected for a in (W, b))
         print(f"weights+biases:  {f32_total} bytes (all-f32) → {total} bytes "
-              f"(int8 W + f32 b) — {f32_total / max(total, 1):.2f}× smaller")
+              f"(int8 W on Linear/Conv only + f32 elsewhere) — "
+              f"{f32_total / max(total, 1):.2f}× smaller")
     elif args.embed:
         wrote = []
         for kind, idx, suffix, W, b in collected:
