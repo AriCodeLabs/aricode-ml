@@ -313,6 +313,28 @@ Shipped:
   `examples/embedding_2byte_min/` packs the distilbert vocab
   (30522), uses tokens spanning the full byte range, and matches
   PyTorch within 1e-6.
+- v0.24: GELU math_exp saturation guard + synthetic distilbert
+  regression.  Diagnosed via two parallel investigations: a
+  structural map of the packer (which surfaced real per-counter
+  drift candidates worth a future refactor) and a step-by-step
+  bug trace (which found the actual root cause).  aricode's
+  `math_exp` builtin doesn't IEEE-saturate at overflow — for
+  `|arg| ≳ 700` it returns garbage (e.g. `math_exp(848)` ≈ -0.0,
+  `math_exp(-848)` ≈ INT64_MIN-as-f64).  GELU (tanh approximation)
+  computes `2/(e^(2z)+1)` which trips this trap when activations
+  push `|2z| > ~22`.  Result: GELU's tanh saturation flips
+  (returns `0` where torch returns `x`, and vice versa), corrupting
+  the FFN residual stream.  Fix: branch in the inlined gelu_f32
+  helper to clamp `tanh(z) = ±1` for `|z| > 10` (well within f32
+  precision; the branch is exact for our purposes).  Caught by the
+  new `examples/distilbert_2block_min/` regression — a 1-block
+  Post-LN distilbert-style encoder with real HF key naming
+  (`transformer.layer.{i}.attention.q_lin`, `sa_layer_norm`,
+  `embeddings.LayerNorm`, etc.).  Without the clamp this test
+  fails by max abs ~6.18; with it, 5.7e-6.  Follow-up: harden
+  `math_exp` in the codegen so other call sites stop tripping the
+  same overflow trap.
+
 - v0.21: learned positional embedding.  `["positional_embedding",
   max_pos, d_model, seq]` arch entry.  Slices `W_pos[0:seq*d_model]`
   into a per-layer scratch and folds it back into the current

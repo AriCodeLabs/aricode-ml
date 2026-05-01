@@ -1,0 +1,16 @@
+[
+    ["embedding", 200, 32, 4],
+    ["positional_embedding", 32, 32, 4],
+    ["layernorm", 32],
+    ["save_residual"],
+    ["multi_head_attention", 4, 32, 4, 0],
+    ["add_residual"],
+    ["layernorm", 32],
+    ["save_residual"],
+    ["linear", 32, 128],
+    ["gelu"],
+    ["linear", 128, 32],
+    ["add_residual"],
+    ["layernorm", 32],
+    ["linear", 32, 8]
+]

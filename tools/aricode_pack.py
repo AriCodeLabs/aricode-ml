@@ -422,8 +422,26 @@ fn gelu_f32(buf: i32) -> i32 {
     while (i < n) {
         let x: f64 = arr_f32_get(buf, i);
         let inner: f64 = c * (x + 0.044715 * x * x * x);
-        let e2z: f64 = math_exp(2.0 * inner);
-        let t: f64 = 1.0 - 2.0 / (e2z + 1.0);
+        let two_inner: f64 = 2.0 * inner;
+        // Saturation clamp: aricode's math_exp doesn't IEEE-saturate at
+        // overflow (returns garbage for |arg| ≳ 700 instead of ±inf / 0).
+        // For activations large enough to push 2*inner past ±20, tanh is
+        // already within ~2e-9 of ±1, so we branch instead of touching
+        // math_exp.  Without this clamp, FFN GELU silently flips its
+        // saturation tail and corrupts the residual stream — the
+        // distilbert_2block divergence reduces from ~6.18 to ~6e-6 with
+        // this guard alone.
+        let t: f64 = 0.0;
+        if (two_inner > 20.0) {
+            t = 1.0;
+        } else {
+            if (two_inner < 0.0 - 20.0) {
+                t = 0.0 - 1.0;
+            } else {
+                let e2z: f64 = math_exp(two_inner);
+                t = 1.0 - 2.0 / (e2z + 1.0);
+            }
+        }
         arr_f32_set(buf, i, 0.5 * x * (1.0 + t));
         i = i + 1;
     }
