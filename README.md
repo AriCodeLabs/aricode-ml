@@ -321,6 +321,19 @@ Shipped:
   Regression: `examples/positional_min/` chains
   `[embedding(100,16,4), positional_embedding(32,16,4)]` and
   matches `tok_emb[ids] + pos_emb[:seq]` within 1e-6.
+- v0.22: full Pre-LN transformer encoder integration.  No new
+  layer kinds — just the compose-it-all-together test that proves
+  every primitive shipped through v0.21 cooperates correctly under
+  the standard encoder stack:
+      embedding → +positional_embedding
+        → save → LN → MHA → add
+        → save → LN → FFN(Linear-GELU-Linear) → add
+        → LN → classifier
+  Regression: `examples/encoder_full_min/` packs this stack with
+  a synthetic checkpoint and matches PyTorch within 3.3e-6 on the
+  classifier logits.  Stacking N blocks against a real fine-tuned
+  distilbert is now purely a matter of state_dict keys + tokenizer
+  glue.
 
 Pending:
 - Sinusoidal positional encoding (no params, computed from position).
@@ -328,11 +341,12 @@ Pending:
   Attention-Is-All-You-Need / Llama-2 sinusoidal flavour needs a
   small per-position helper.  Lower priority since most practical
   HF encoder checkpoints use the learned form.
-- End-to-end multi-block HF-class encoder demo: stack an
-  `embedding` + `positional_embedding` + N transformer blocks +
-  classifier head, pack a real fine-tuned distilbert
-  sentence-classifier, validate against PyTorch.  All the building
-  blocks ship through v0.21; this is example/test wiring only.
+- Real distilbert pack: drop a HuggingFace fine-tuned checkpoint in
+  and run sentence classification end-to-end.  All the building
+  blocks ship through v0.22.  Outstanding work: tokenizer pre-step
+  (the packer doesn't run a wordpiece tokenizer; users feed token
+  IDs directly), and an arch.json template for the standard 6-block
+  / 12-block distilbert / BERT layouts.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).

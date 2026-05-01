@@ -1,0 +1,6 @@
+synth.pt
+tokens.bin
+expected.f32
+enc_min
+enc_min.ari
+enc_min_*.f32

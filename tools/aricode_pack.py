@@ -467,6 +467,10 @@ def residual_slots(arch):
         cur_size = first[1] * first[2]   # seq * d_model
     elif first[0] == "layernorm":
         cur_size = first[1]
+    elif first[0] == "embedding":
+        # ["embedding", vocab, d_model, seq] → output sized seq * d_model.
+        _, d_model, seq = first[1], first[2], first[3]
+        cur_size = seq * d_model
     else:
         raise ValueError(
             f"residual_slots: unsupported first-layer kind {first[0]!r}")
