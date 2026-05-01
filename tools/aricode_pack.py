@@ -174,44 +174,68 @@ PROLOGUE = """\
 fn arr_f32_from_file_into(fd: i32, buf: i32, n: i32) -> i32 {{
     file_read(fd, buf, n * 4);
     return 0;
-}}
+}}"""
 
+# Emitted only when the generated main actually calls it — i.e. when
+# packing is `--quantize int8` AND the arch has a multi-channel conv
+# layer AND the multi-channel int8 path is configured to dequant-at-
+# startup (default for batch loaders).  Single-shot CLI builds keep
+# weights int8 in RAM and never call this, so leaving it out of the
+# prelude shrinks the binary by ~120 B.
+DEQUANT_HELPER = """
 // Dequantise n int8 bytes from `q` into f32 buffer `dst`, multiplying by
 // `scale`.  arr_i8_get does the sign-extend in hardware (movsx); the
 // loop is the unchanged scalar pattern used when the binary was packed
 // with `--quantize int8` and the multi-channel conv layer has chosen
 // the dequant-at-startup path (--input-format mnist; the stdin path
 // keeps weights int8 in RAM).  Runs once per weight tensor at startup.
-fn dequant_int8_to_f32(q: i32, dst: i32, n: i32, scale: f64) -> i32 {{
+fn dequant_int8_to_f32(q: i32, dst: i32, n: i32, scale: f64) -> i32 {
     let i: i32 = 0;
-    while (i < n) {{
+    while (i < n) {
         arr_f32_set(dst, i, int_to_float(arr_i8_get(q, i)) * scale);
         i = i + 1;
-    }}
+    }
     return 0;
-}}
+}"""
 
-fn load_byte_file(path_str: i32, byte_count: i32) -> i32 {{
+
+# Continuation of PROLOGUE.  Split out so DEQUANT_HELPER can be slotted
+# in conditionally between the two halves; load_byte_file / argmax_f32
+# are always needed regardless of quantisation choices.
+PROLOGUE_TAIL = """
+fn load_byte_file(path_str: i32, byte_count: i32) -> i32 {
     let slots: i32 = (byte_count + 7) / 8;
     let buf: i32 = arr_new(slots);
     let fd: i32 = file_open(path_str, 0);
     file_read(fd, buf, byte_count);
     file_close(fd);
     return buf;
-}}
+}
 
-fn argmax_f32(buf: i32, n: i32) -> i32 {{
+fn argmax_f32(buf: i32, n: i32) -> i32 {
     let best_i: i32 = 0;
     let best_v: f64 = arr_f32_get(buf, 0);
     let i: i32 = 1;
-    while (i < n) {{
+    while (i < n) {
         let v: f64 = arr_f32_get(buf, i);
-        if (v > best_v) {{ best_v = v; best_i = i; }}
+        if (v > best_v) { best_v = v; best_i = i; }
         i = i + 1;
-    }}
+    }
     return best_i;
-}}
+}
 """
+
+
+def needs_dequant_helper(arch, quantize, input_format):
+    """The dequant_int8_to_f32 helper is only called from gen_load's
+    int8 + multi-channel + batch path.  Mirrors the same condition
+    used in gen_load and gen_forward to choose the runtime dispatch."""
+    if quantize != "int8":
+        return False
+    if input_format == "stdin":
+        return False        # multi_int8_runtime path keeps weights int8
+    return any(kind == "conv2d_3x3_p1" and a[0] > 1
+               for kind, *a in arch)
 
 
 MNIST_LOADER = """\
@@ -964,11 +988,17 @@ def main():
     # number of input bytes per MNIST sample (1 byte per pixel).
     _, sizes = gen_act_decls(arch)
     n_in_elements = sizes[0]
-    src = (
+    prologue_parts = [
         PROLOGUE.format(model_name=out_base.name,
                         arch_repr=arch,
                         loader=args.input_format,
-                        quantize=args.quantize)
+                        quantize=args.quantize),
+    ]
+    if needs_dequant_helper(arch, args.quantize, args.input_format):
+        prologue_parts.append(DEQUANT_HELPER)
+    prologue_parts.append(PROLOGUE_TAIL)
+    src = (
+        "".join(prologue_parts)
         + "\n"
         + MNIST_LOADER.format(n_in=n_in_elements,
                               mean=args.mean,
