@@ -453,7 +453,7 @@ def residual_slots(arch):
     # Pre-LN transformer pattern) sizes correctly.
     pseudo = ("save_residual", "add_residual", "flatten",
               "relu", "sigmoid", "tanh", "softmax", "gelu",
-              "layernorm")
+              "layernorm", "positional_embedding")
     first = next((l for l in arch if l[0] not in pseudo), None)
     if first is None:
         first = arch[0]
@@ -633,6 +633,15 @@ def tensor_specs(kind, *args):
         # main pack staging) skip the bias path when n_bias == 0.
         vocab_size, d_model, _seq = args
         yield ("", vocab_size * d_model, 0)
+    elif kind == "positional_embedding":
+        # ["positional_embedding", max_pos, d_model, seq]
+        # Same shape as nn.Embedding (max_pos, d_model), no bias.  HF's
+        # learned positional table for BERT/distilbert.  Indexed by
+        # token position 0..seq-1 (not by token ID), so the loader
+        # path is different from token embedding — but the weight
+        # tensor itself is identical in shape.
+        max_pos, d_model, _seq = args
+        yield ("", max_pos * d_model, 0)
     else:
         raise ValueError(f"tensor_specs: no weights for {kind!r}")
 
@@ -660,6 +669,8 @@ def tensor_names(kind, idx, suffix=""):
         # allocated.  Returned only for API symmetry; consumers gate
         # on n_bias==0 from tensor_specs and skip it.
         return f"Wemb{idx}", f"bemb{idx}"
+    if kind == "positional_embedding":
+        return f"Wpos{idx}", f"bpos{idx}"
     raise ValueError(f"tensor_names: no weights for {kind!r}")
 
 
@@ -676,6 +687,7 @@ def weight_tensors(arch):
     ni = 0
     mi = 0
     ei = 0
+    pe = 0
     for kind, *args in arch:
         if kind == "linear":
             for suffix, nw, nb in tensor_specs(kind, *args):
@@ -707,6 +719,11 @@ def weight_tensors(arch):
                 wname, bname = tensor_names(kind, ei, suffix)
                 yield (kind, ei, suffix, nw, nb, wname, bname)
             ei += 1
+        elif kind == "positional_embedding":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, pe, suffix)
+                yield (kind, pe, suffix, nw, nb, wname, bname)
+            pe += 1
 
 
 def weight_size(kind, *args):
@@ -749,7 +766,7 @@ def gen_act_decls(arch):
     # would either crash or pick the wrong size.
     pseudo = ("save_residual", "add_residual", "flatten",
               "relu", "sigmoid", "tanh", "softmax", "gelu",
-              "layernorm")
+              "layernorm", "positional_embedding")
     first = next((l for l in arch if l[0] not in pseudo), None)
     if first is None:
         # Pure LN/activation chain — fall back to first layer's dim
@@ -833,6 +850,10 @@ def gen_act_decls(arch):
             else:
                 _, d_model, seq = args
                 sizes.append(seq * d_model)
+        elif kind == "positional_embedding":
+            # In-place add to the existing [seq, d_model] activation —
+            # no size change, no new buffer.
+            pass
         elif kind == "layernorm":
             # In-place — same buffer, same size.
             pass
@@ -868,6 +889,7 @@ def gen_scratch(arch):
     pi = 0
     ai = 0
     mi = 0
+    pi_pos = 0   # positional_embedding counter (for scratch buffer naming)
     for kind, *args in arch:
         if kind == "maxpool_2x2":
             c = args[0]
@@ -884,6 +906,15 @@ def gen_scratch(arch):
             # reads token IDs directly from the input-loader-emitted
             # _toks_raw buffer and copy_slice's into the activation.
             pass
+        elif kind == "positional_embedding":
+            # Need a window scratch sized [seq, d_model] so we can
+            # arr_f32_add_scaled the leading seq*d_model slice of
+            # the (max_pos, d_model) table into the activation in
+            # one whole-array call.
+            max_pos, d_model, seq = args
+            lines.append(
+                f"    let pe_window_{pi_pos}: i32 = arr_f32_new({seq * d_model});")
+            pi_pos += 1
         elif kind == "multi_head_attention":
             seq, d_model, n_heads, causal = args
             d_head = d_model // n_heads
@@ -1070,6 +1101,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     ni = 0
     mi = 0
     ei = 0
+    pe_idx = 0
     # Stack of (slot_idx, n_elems) for every save_residual we've emitted
     # but not yet matched with an add_residual.  Pre-validated by
     # residual_slots (called from gen_scratch); here we just track
@@ -1327,10 +1359,19 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(f"    }}")
             ei += 1
             # cur_a stays at 0; the embedding's output IS a0.
+        elif kind == "positional_embedding":
+            # Add the leading seq*d_model slice of W_pos in-place to
+            # the current activation.  Slice once into pe_window_i so
+            # arr_f32_add_scaled (whole-array) can fold it back.
+            max_pos, d_model, seq = args
+            lines.append(
+                f"    arr_f32_copy_slice(Wpos{pe_idx}, 0, "
+                f"pe_window_{pe_idx}, 0, {seq * d_model});")
+            lines.append(
+                f"    arr_f32_add_scaled(a{cur_a}, "
+                f"pe_window_{pe_idx}, 1.0);")
+            pe_idx += 1
         elif kind == "save_residual":
-            # Snapshot a{cur_a} into the next residual slot so the
-            # matched add_residual can fold it back in.  In-place: no
-            # cur_a advance.
             slot_idx = next_resid_slot
             next_resid_slot += 1
             resid_stack.append(slot_idx)
@@ -1737,6 +1778,7 @@ def main():
     ni = 0
     mi = 0
     ei = 0
+    pe_count = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -1926,6 +1968,36 @@ def main():
             b = _np.zeros(0, dtype=_np.float32)
             collected.append(("embedding", ei, "", W, b))
             ei += 1
+        elif kind == "positional_embedding":
+            # ["positional_embedding", max_pos, d_model, seq] — only a
+            # weight tensor (no bias).  HuggingFace canonical names cover
+            # BERT/distilbert (embeddings.position_embeddings.weight)
+            # and GPT-2 style (wpe.weight).
+            max_pos, d_model, _seq = largs
+            candidates = [
+                "embeddings.position_embeddings.weight",
+                "position_embeddings.weight",
+                "wpe.weight",
+                "pos_embed.weight",
+                f"layers.{pe_count}.pos_embed.weight",
+            ]
+            wkey = sd_lookup(sd, candidates)
+            if wkey is None:
+                raise SystemExit(
+                    f"positional_embedding #{pe_count}: cannot find weight "
+                    f"in checkpoint.  Tried: {candidates[0]} / "
+                    f"{candidates[1]} / ...  Available: {sorted(sd.keys())}"
+                )
+            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            if W.shape != (max_pos, d_model):
+                raise SystemExit(
+                    f"positional_embedding #{pe_count}: shape mismatch.  "
+                    f"expected ({max_pos},{d_model}); got {tuple(W.shape)}."
+                )
+            import numpy as _np
+            b = _np.zeros(0, dtype=_np.float32)
+            collected.append(("positional_embedding", pe_count, "", W, b))
+            pe_count += 1
     # Skip zero-size tensors when accumulating the f32 blob (no bias for
     # nn.Embedding); same condition gate the staging-file writer uses.
     weights_blob = [a for (_, _, _, W, b) in collected

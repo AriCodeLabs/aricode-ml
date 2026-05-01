@@ -1,0 +1,4 @@
+[
+    ["embedding", 100, 16, 4],
+    ["positional_embedding", 32, 16, 4]
+]

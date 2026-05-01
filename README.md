@@ -164,6 +164,11 @@ aricode-ml/
 |                  |                            | `embeddings.word_embeddings.weight` /  |
 |                  |                            | `wte.weight` etc.  Real HF vocabs      |
 |                  |                            | (BERT/distilbert: 30522) work.         |
+| `positional_embedding` | `max_pos, d_model, seq` | Learned positional embedding —      |
+|                  |                            | adds `W_pos[0:seq]` in-place to the    |
+|                  |                            | current activation.  Loads HF          |
+|                  |                            | `embeddings.position_embeddings.weight`|
+|                  |                            | / `wpe.weight`.                        |
 | `layernorm`      | `dim`                      | Affine LayerNorm over the last `dim`   |
 |                  |                            | elements (γ, β learnable; loads as     |
 |                  |                            | `LayerNorm.weight` / `LayerNorm.bias`).|
@@ -212,11 +217,13 @@ isn't competing for that workload.
 ecosystems have years of quantisation and batched-attention work
 this repo doesn't approximate.
 
-✗ Your model has layers we don't pack yet (RNN, positional encoding,
-arbitrary-spatial conv).  Single- and multi-head SDPA, LayerNorm,
-GELU, residuals, and full-vocab embedding lookup all ship through
-v0.20.  The remaining piece for a fully end-to-end packed HF
-transformer encoder is positional encoding.
+✗ Your model has layers we don't pack yet (RNN, sinusoidal
+positional encoding, arbitrary-spatial conv).  Through v0.21, every
+layer of a learned-positional Pre-LN transformer encoder ships and
+is regression-tested: token embedding (1/2/4-byte vocab), learned
+positional embedding, single- and multi-head SDPA, LayerNorm, GELU,
+residuals, batched Linear (FFN).  Stacking these into a multi-block
+encoder is example-wiring only.
 
 ## Roadmap
 
@@ -306,14 +313,26 @@ Shipped:
   `examples/embedding_2byte_min/` packs the distilbert vocab
   (30522), uses tokens spanning the full byte range, and matches
   PyTorch within 1e-6.
+- v0.21: learned positional embedding.  `["positional_embedding",
+  max_pos, d_model, seq]` arch entry.  Slices `W_pos[0:seq*d_model]`
+  into a per-layer scratch and folds it back into the current
+  activation via `arr_f32_add_scaled`.  Loads HF
+  `embeddings.position_embeddings.weight` / `wpe.weight`.
+  Regression: `examples/positional_min/` chains
+  `[embedding(100,16,4), positional_embedding(32,16,4)]` and
+  matches `tok_emb[ids] + pos_emb[:seq]` within 1e-6.
 
 Pending:
-- Positional encoding (sinusoidal or learned).  With v0.20 the
-  embedding-input path is production-ready; the only remaining
-  layer for a fully end-to-end packed transformer encoder is the
-  positional add.  Learned positional encoding can already be
-  hacked by stacking a second embedding through `add_residual`;
-  sinusoidal needs a small per-position helper.
+- Sinusoidal positional encoding (no params, computed from position).
+  Today's learned variant covers BERT/distilbert/GPT-2; the
+  Attention-Is-All-You-Need / Llama-2 sinusoidal flavour needs a
+  small per-position helper.  Lower priority since most practical
+  HF encoder checkpoints use the learned form.
+- End-to-end multi-block HF-class encoder demo: stack an
+  `embedding` + `positional_embedding` + N transformer blocks +
+  classifier head, pack a real fine-tuned distilbert
+  sentence-classifier, validate against PyTorch.  All the building
+  blocks ship through v0.21; this is example/test wiring only.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
