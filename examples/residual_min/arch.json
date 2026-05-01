@@ -1,0 +1,8 @@
+[
+    ["linear", 8, 8],
+    ["save_residual"],
+    ["linear", 8, 8],
+    ["gelu"],
+    ["linear", 8, 8],
+    ["add_residual"]
+]

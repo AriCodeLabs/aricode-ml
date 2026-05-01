@@ -158,6 +158,10 @@ aricode-ml/
 | `relu` / `sigmoid` / `tanh` / `softmax` / `gelu` | —      | in-place activations.  `gelu` uses the |
 |                  |                            | tanh approximation matching            |
 |                  |                            | `torch.nn.GELU(approximate='tanh')`.   |
+| `save_residual` / `add_residual` | —          | LIFO-paired snapshot/accumulate for    |
+|                  |                            | residual connections.  Save after one  |
+|                  |                            | layer; add after a sub-block to fold   |
+|                  |                            | the snapshot back in.                  |
 
 Restrictions today: spatial size is 28×28 (the AVX2 conv builtins are
 hardcoded for MNIST); CIFAR-style 32×32 RGB needs a generic conv
@@ -245,11 +249,21 @@ Shipped:
   HF / OpenAI / BERT lineages.  Regression: `examples/gelu_min/`
   packs a Linear → GELU → Linear FFN block and matches the PyTorch
   reference within 1.9e-6.
+- v0.16: residual connections via paired `["save_residual"]` /
+  `["add_residual"]` arch entries.  LIFO-paired so transformer
+  blocks (with attention residual + FFN residual nested or
+  sequential) compose naturally.  Stack-validates at pack time —
+  unbalanced save/add or size-mismatched pairs error out clearly.
+  Regression: `examples/residual_min/` packs a Linear → save →
+  Linear → GELU → Linear → add residual-FFN block and matches the
+  PyTorch reference within 2.9e-6.
 
 Pending:
-- multi-block transformer (attention + LayerNorm + FFN block) —
-  attention, LayerNorm, and GELU now ship; the missing pieces are
-  multi-head attention wrapping and residual-add as an arch entry.
+- multi-block transformer: attention + LayerNorm + FFN + residuals
+  now all ship as arch entries.  The remaining piece for full
+  transformer-encoder support is multi-head attention wrapping
+  (split d_model across heads, run single-head SDPA per head,
+  concatenate, project) — today only single-head SDPA is exposed.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).

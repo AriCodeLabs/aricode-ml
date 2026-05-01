@@ -384,6 +384,66 @@ def needs_gelu_helper(arch):
     return any(layer[0] == "gelu" for layer in arch)
 
 
+def residual_slots(arch):
+    """Walk the arch and return a list of (slot_idx, n_elems) for every
+    `save_residual` entry, in source order.  The slot's element count is
+    the activation size at the moment of save (= same as the matched
+    add_residual, since we don't reshape between save and add).
+
+    Stack-validates the arch as a side effect: every save must have a
+    matching add later in the arch, and every add must follow some
+    earlier unmatched save."""
+    if not any(layer[0] in ("save_residual", "add_residual") for layer in arch):
+        return []
+    # We need per-position activation sizes.  Recompute by walking
+    # gen_act_decls' logic inline (cheaper than refactoring its return
+    # to expose the per-step size).
+    # Mirror gen_act_decls' first-layer dispatch.
+    first = arch[0]
+    if first[0] == "linear":
+        cur_size = first[1]
+    elif first[0] == "conv2d_3x3_p1":
+        cur_size = first[1] * 28 * 28
+    elif first[0] == "attention":
+        cur_size = first[1] * first[2]
+    elif first[0] == "layernorm":
+        cur_size = first[1]
+    else:
+        raise ValueError(
+            f"residual_slots: unsupported first-layer kind {first[0]!r}")
+    slots = []
+    stack = []
+    next_idx = 0
+    for kind, *args in arch:
+        if kind == "save_residual":
+            slots.append((next_idx, cur_size))
+            stack.append((next_idx, cur_size))
+            next_idx += 1
+        elif kind == "add_residual":
+            if not stack:
+                raise ValueError("add_residual without a matching save_residual")
+            saved_idx, saved_size = stack.pop()
+            if saved_size != cur_size:
+                raise ValueError(
+                    f"residual size mismatch: save was {saved_size} elements "
+                    f"but add is at {cur_size} elements")
+        elif kind == "linear":
+            cur_size = args[1]
+        elif kind == "conv2d_3x3_p1":
+            cur_size = args[1] * 28 * 28
+        elif kind == "maxpool_2x2":
+            c = args[0]
+            cur_size = c * 14 * 14
+        elif kind == "attention":
+            seq, _, d_head, _ = args
+            cur_size = seq * d_head
+        # layernorm, flatten, in-place activations: unchanged size
+    if stack:
+        raise ValueError(
+            f"{len(stack)} save_residual entries with no matching add_residual")
+    return slots
+
+
 # Continuation of PROLOGUE.  Split out so DEQUANT_HELPER can be slotted
 # in conditionally between the two halves; load_byte_file / argmax_f32
 # are always needed regardless of quantisation choices.
@@ -607,6 +667,10 @@ def gen_act_decls(arch):
         elif kind == "layernorm":
             # In-place — same buffer, same size.
             pass
+        elif kind in ("save_residual", "add_residual"):
+            # In-place; the save copies, the add accumulates.  Neither
+            # changes the activation size.
+            pass
         elif kind == "flatten":
             # No size change, just shape interpretation.  Reuse same buffer.
             pass
@@ -645,6 +709,11 @@ def gen_scratch(arch):
                 f"    let attn_desc_{ai}: i32 = "
                 f"attn_alloc_desc_f32({seq}, {d_in}, {d_head}, {causal});")
             ai += 1
+    # Residual slot buffers: one per save_residual entry, sized to the
+    # activation count at the save point (= same as the matched add).
+    for slot_idx, n_elems in residual_slots(arch):
+        lines.append(
+            f"    let _resid_{slot_idx}: i32 = arr_f32_new({n_elems});")
     return lines
 
 
@@ -748,6 +817,12 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     pi = 0
     ai = 0
     ni = 0
+    # Stack of (slot_idx, n_elems) for every save_residual we've emitted
+    # but not yet matched with an add_residual.  Pre-validated by
+    # residual_slots (called from gen_scratch); here we just track
+    # which slot each add belongs to.
+    resid_stack = []
+    next_resid_slot = 0
     for kind, *args in arch:
         if kind == "linear":
             in_f, out_f = args
@@ -881,6 +956,20 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines += emit_softmax(f"a{cur_a}")
         elif kind == "gelu":
             lines += emit_gelu(f"a{cur_a}")
+        elif kind == "save_residual":
+            # Snapshot a{cur_a} into the next residual slot so the
+            # matched add_residual can fold it back in.  In-place: no
+            # cur_a advance.
+            slot_idx = next_resid_slot
+            next_resid_slot += 1
+            resid_stack.append(slot_idx)
+            lines.append(
+                f"    arr_f32_copy_slice(a{cur_a}, 0, _resid_{slot_idx}, 0, "
+                f"arr_len(a{cur_a}));")
+        elif kind == "add_residual":
+            slot_idx = resid_stack.pop()
+            lines.append(
+                f"    arr_f32_add_scaled(a{cur_a}, _resid_{slot_idx}, 1.0);")
         else:
             raise ValueError(f"unknown layer kind: {kind!r}")
     return lines, cur_a
