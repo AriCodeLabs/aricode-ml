@@ -709,7 +709,7 @@ def weight_tensors(arch):
     ni = 0
     mi = 0
     ei = 0
-    pe = 0
+    pei = 0
     for kind, *args in arch:
         if kind == "linear":
             for suffix, nw, nb in tensor_specs(kind, *args):
@@ -743,9 +743,9 @@ def weight_tensors(arch):
             ei += 1
         elif kind == "positional_embedding":
             for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, pe, suffix)
-                yield (kind, pe, suffix, nw, nb, wname, bname)
-            pe += 1
+                wname, bname = tensor_names(kind, pei, suffix)
+                yield (kind, pei, suffix, nw, nb, wname, bname)
+            pei += 1
 
 
 def weight_size(kind, *args):
@@ -911,7 +911,7 @@ def gen_scratch(arch):
     pi = 0
     ai = 0
     mi = 0
-    pi_pos = 0   # positional_embedding counter (for scratch buffer naming)
+    pei = 0   # positional_embedding counter (for scratch buffer naming)
     for kind, *args in arch:
         if kind == "maxpool_2x2":
             c = args[0]
@@ -935,8 +935,8 @@ def gen_scratch(arch):
             # one whole-array call.
             max_pos, d_model, seq = args
             lines.append(
-                f"    let pe_window_{pi_pos}: i32 = arr_f32_new({seq * d_model});")
-            pi_pos += 1
+                f"    let pe_window_{pei}: i32 = arr_f32_new({seq * d_model});")
+            pei += 1
         elif kind == "multi_head_attention":
             seq, d_model, n_heads, causal = args
             d_head = d_model // n_heads
@@ -1132,7 +1132,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     ni = 0
     mi = 0
     ei = 0
-    pe_idx = 0
+    pei = 0
     # Stack of (slot_idx, n_elems) for every save_residual we've emitted
     # but not yet matched with an add_residual.  Pre-validated by
     # residual_slots (called from gen_scratch); here we just track
@@ -1396,12 +1396,12 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             # arr_f32_add_scaled (whole-array) can fold it back.
             max_pos, d_model, seq = args
             lines.append(
-                f"    arr_f32_copy_slice(Wpos{pe_idx}, 0, "
-                f"pe_window_{pe_idx}, 0, {seq * d_model});")
+                f"    arr_f32_copy_slice(Wpos{pei}, 0, "
+                f"pe_window_{pei}, 0, {seq * d_model});")
             lines.append(
                 f"    arr_f32_add_scaled(a{cur_a}, "
-                f"pe_window_{pe_idx}, 1.0);")
-            pe_idx += 1
+                f"pe_window_{pei}, 1.0);")
+            pei += 1
         elif kind == "save_residual":
             slot_idx = next_resid_slot
             next_resid_slot += 1
@@ -1809,7 +1809,7 @@ def main():
     ni = 0
     mi = 0
     ei = 0
-    pe_count = 0
+    pei = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -2060,25 +2060,25 @@ def main():
                 "position_embeddings.weight",
                 "wpe.weight",
                 "pos_embed.weight",
-                f"layers.{pe_count}.pos_embed.weight",
+                f"layers.{pei}.pos_embed.weight",
             ]
             wkey = sd_lookup(sd, candidates)
             if wkey is None:
                 raise SystemExit(
-                    f"positional_embedding #{pe_count}: cannot find weight "
+                    f"positional_embedding #{pei}: cannot find weight "
                     f"in checkpoint.  Tried: {candidates[0]} / "
                     f"{candidates[1]} / ...  Available: {sorted(sd.keys())}"
                 )
             W = sd[wkey].detach().cpu().numpy().astype("float32")
             if W.shape != (max_pos, d_model):
                 raise SystemExit(
-                    f"positional_embedding #{pe_count}: shape mismatch.  "
+                    f"positional_embedding #{pei}: shape mismatch.  "
                     f"expected ({max_pos},{d_model}); got {tuple(W.shape)}."
                 )
             import numpy as _np
             b = _np.zeros(0, dtype=_np.float32)
-            collected.append(("positional_embedding", pe_count, "", W, b))
-            pe_count += 1
+            collected.append(("positional_embedding", pei, "", W, b))
+            pei += 1
     # Skip zero-size tensors when accumulating the f32 blob (no bias for
     # nn.Embedding); same condition gate the staging-file writer uses.
     weights_blob = [a for (_, _, _, W, b) in collected
