@@ -274,15 +274,66 @@ def linear_layers(arch):
             yield idx, rest[0], rest[1]
 
 
-def weight_size(kind, *args):
-    """Number of f32 elements for a weighted layer (W) and (b)."""
+def tensor_specs(kind, *args):
+    """Yield (suffix, n_weight_elems, n_bias_elems) per (W, b) tensor pair
+    inside a layer.  Single-tensor layers yield exactly one entry with
+    suffix='' (so existing naming stays untouched); multi-tensor layers
+    like attention yield multiple entries with disambiguating suffixes
+    ('q', 'k', 'v').  Used by both the staging-file writer and the code
+    generator to enumerate every weight tensor uniformly."""
     if kind == "linear":
         in_f, out_f = args
-        return out_f * in_f, out_f
-    if kind == "conv2d_3x3_p1":
+        yield ("", out_f * in_f, out_f)
+    elif kind == "conv2d_3x3_p1":
         c_in, c_out = args
-        return c_out * c_in * 9, c_out
-    raise ValueError(f"weight_size: no weights for {kind!r}")
+        yield ("", c_out * c_in * 9, c_out)
+    else:
+        raise ValueError(f"tensor_specs: no weights for {kind!r}")
+
+
+def tensor_names(kind, idx, suffix=""):
+    """Return (wname, bname) for one (W, b) pair within a layer.
+    Existing single-tensor convention preserved (W{idx}/b{idx}, Wc{idx}/
+    bc{idx}); multi-tensor layers compose their suffix into the stem
+    (e.g. attention yields Wq{idx}, bq{idx}, Wk{idx}, ...)."""
+    if kind == "linear":
+        return f"W{idx}", f"b{idx}"
+    if kind == "conv2d_3x3_p1":
+        return f"Wc{idx}", f"bc{idx}"
+    raise ValueError(f"tensor_names: no weights for {kind!r}")
+
+
+def weight_tensors(arch):
+    """Yield (kind, idx, suffix, nw, nb, wname, bname) per (W, b) tensor
+    pair across the whole arch, in source order.  This is the iteration
+    shape every weight-emission site should use — handles the multi-
+    tensor case transparently (attention yields three entries per layer
+    with q/k/v suffixes) and exposes the canonical names without each
+    callsite having to reinvent them."""
+    li = 0
+    ci = 0
+    for kind, *args in arch:
+        if kind == "linear":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, li, suffix)
+                yield (kind, li, suffix, nw, nb, wname, bname)
+            li += 1
+        elif kind == "conv2d_3x3_p1":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, ci, suffix)
+                yield (kind, ci, suffix, nw, nb, wname, bname)
+            ci += 1
+
+
+def weight_size(kind, *args):
+    """Legacy single-tensor accessor.  Kept so internal callers and any
+    out-of-tree forks stay compiling; new code should use tensor_specs."""
+    specs = list(tensor_specs(kind, *args))
+    if len(specs) != 1:
+        raise ValueError(f"weight_size: {kind!r} has {len(specs)} tensor pairs; "
+                         f"use tensor_specs for the multi-tensor case.")
+    _, nw, nb = specs[0]
+    return nw, nb
 
 
 def gen_weight_decls(arch, embed):
@@ -291,12 +342,7 @@ def gen_weight_decls(arch, embed):
     if embed:
         return []
     lines = []
-    for kind, idx, *rest in weighted_layers(arch):
-        nw, nb = weight_size(kind, *rest)
-        if kind == "linear":
-            wname, bname = f"W{idx}", f"b{idx}"
-        else:  # conv2d_3x3_p1
-            wname, bname = f"Wc{idx}", f"bc{idx}"
+    for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
         lines.append(f"    let {wname}: i32 = arr_f32_new({nw});")
         lines.append(f"    let {bname}: i32 = arr_f32_new({nb});")
     return lines
@@ -361,11 +407,10 @@ def gen_scratch(arch):
 
 
 def names_for(kind, idx):
-    if kind == "linear":
-        return f"W{idx}", f"b{idx}"
-    if kind == "conv2d_3x3_p1":
-        return f"Wc{idx}", f"bc{idx}"
-    raise ValueError(f"names_for: no weights for {kind!r}")
+    """Legacy single-tensor accessor.  Equivalent to tensor_names(kind, idx)
+    with the default empty suffix; kept for callers that don't yet use
+    weight_tensors()."""
+    return tensor_names(kind, idx)
 
 
 def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
@@ -397,15 +442,22 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
         #                    dequantised once at startup (default for
         #                    batch input formats; better steady-state
         #                    throughput, slightly worse cold-start).
+        # For the "is multi-channel conv?" check, peek at the same arch
+        # entry the tensor came from.  We can't read it from the per-
+        # tensor info alone since suffix-style layers don't carry C_in.
+        def _conv_c_in(arch_entry):
+            return arch_entry[1] if arch_entry[0] == "conv2d_3x3_p1" else None
+        arch_by_idx = {("conv2d_3x3_p1", i): _conv_c_in(layer)
+                       for i, layer in enumerate(
+                           [l for l in arch if l[0] == "conv2d_3x3_p1"])}
         lines = []
-        for kind, idx, *rest in weighted_layers(arch):
-            wname, bname = names_for(kind, idx)
-            nw, _ = weight_size(kind, *rest)
+        for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
             scale_w = scales[(kind, idx, "W")]
+            c_in = arch_by_idx.get((kind, idx))
             if kind == "linear":
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
-            elif kind == "conv2d_3x3_p1" and rest[0] == 1:
+            elif kind == "conv2d_3x3_p1" and c_in == 1:
                 # Single-channel conv: int8 weights stay int8.
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
@@ -422,16 +474,13 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
         return lines
     if embed:
         lines = []
-        for kind, idx, *rest in weighted_layers(arch):
-            wname, bname = names_for(kind, idx)
+        for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
             lines.append(f"    let {wname}: i32 = embed_file(\"{embed_dir}/{out_name}_{wname}.f32\");")
             lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
         return lines
     lines = [f"    let weight_path: i32 = str_new(\"{out_name}.f32\");",
              "    let _wfd: i32 = file_open(weight_path, 0);"]
-    for kind, idx, *rest in weighted_layers(arch):
-        wname, bname = names_for(kind, idx)
-        nw, nb = weight_size(kind, *rest)
+    for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
         lines.append(f"    file_read(_wfd, {wname}, {nw * 4});")
         lines.append(f"    file_read(_wfd, {bname}, {nb * 4});")
     lines.append("    file_close(_wfd);")
@@ -882,7 +931,7 @@ def main():
                     f"linear #{li}: shape mismatch.  expected ({out_f},{in_f}) "
                     f"+ ({out_f},); got {tuple(W.shape)} + {tuple(b.shape)}."
                 )
-            collected.append(("linear", li, W, b))
+            collected.append(("linear", li, "", W, b))
             li += 1
         elif kind == "conv2d_3x3_p1":
             c_in, c_out = largs
@@ -917,9 +966,9 @@ def main():
             # Flatten (C_out, C_in, 3, 3) → (C_out, C_in*9) row-major to
             # match arr_f32_conv2d_3x3_p1's expected weight layout.
             W = W.reshape(c_out, c_in * 9)
-            collected.append(("conv2d_3x3_p1", ci, W, b))
+            collected.append(("conv2d_3x3_p1", ci, "", W, b))
             ci += 1
-    weights_blob = [a for (_, _, W, b) in collected for a in (W, b)]
+    weights_blob = [a for (_, _, _, W, b) in collected for a in (W, b)]
 
     out_base = Path(args.out)
     src_path  = out_base.with_suffix(".ari")
@@ -939,8 +988,8 @@ def main():
         # less-accurate constant offset).
         import numpy as _np
         wrote = []
-        for kind, idx, W, b in collected:
-            wname, bname = names_for(kind, idx)
+        for kind, idx, suffix, W, b in collected:
+            wname, bname = tensor_names(kind, idx, suffix)
             # Weight: int8.
             abs_max = float(_np.abs(W).max()) if W.size else 0.0
             scale = abs_max / 127.0 if abs_max > 0 else 0.0
@@ -962,13 +1011,13 @@ def main():
             sz = p.stat().st_size
             total += sz
             print(f"  {p}  ({sz} bytes)")
-        f32_total = sum(a.size * 4 for (_, _, W, b) in collected for a in (W, b))
+        f32_total = sum(a.size * 4 for (_, _, _, W, b) in collected for a in (W, b))
         print(f"weights+biases:  {f32_total} bytes (all-f32) → {total} bytes "
               f"(int8 W + f32 b) — {f32_total / max(total, 1):.2f}× smaller")
     elif args.embed:
         wrote = []
-        for kind, idx, W, b in collected:
-            wname, bname = names_for(kind, idx)
+        for kind, idx, suffix, W, b in collected:
+            wname, bname = tensor_names(kind, idx, suffix)
             wp = out_base.parent / f"{out_base.name}_{wname}.f32"
             bp = out_base.parent / f"{out_base.name}_{bname}.f32"
             with open(wp, "wb") as f: W.tofile(f)
