@@ -1016,9 +1016,48 @@ def infer_arch_from_state_dict(sd):
                     seen.add(stem)
                 break
 
+    # Pre-pass: detect contiguous q_proj / k_proj / v_proj triples and
+    # rewrite the stem list so they emit one attention entry instead of
+    # three Linears.  HuggingFace convention; PyTorch nn.MultiheadAttention's
+    # combined `in_proj_weight` would need a separate splitter.
+    def _is_qkv_triple(s_q, s_k, s_v):
+        return (s_q.endswith("q_proj") and s_k.endswith("k_proj")
+                and s_v.endswith("v_proj")
+                and s_q[:-6] == s_k[:-6] == s_v[:-6])
+
+    rewritten = []
+    skip = 0
+    for i, stem in enumerate(stems):
+        if skip:
+            skip -= 1
+            continue
+        if (i + 2 < len(stems)
+                and _is_qkv_triple(stem, stems[i+1], stems[i+2])):
+            wq = sd[stem + ".weight"]
+            shape = tuple(wq.shape) if hasattr(wq, "shape") else tuple(wq.size())
+            if len(shape) == 2:
+                d_head, d_in = int(shape[0]), int(shape[1])
+                # seq is a runtime parameter; the state_dict doesn't carry
+                # it.  Emit a placeholder the user fills in (or pass it
+                # via a future --seq-len flag).  Default 128 ≈ typical
+                # sentence-transformer max_seq.
+                rewritten.append(("__attention__", d_in, d_head, 128, 0))
+                skip = 2
+                continue
+        rewritten.append(stem)
+
     arch = []
     last_spatial = None   # (C_out, 28, 28) after a conv layer; None otherwise
-    for i, stem in enumerate(stems):
+    for i, stem in enumerate(rewritten):
+        if isinstance(stem, tuple) and stem[0] == "__attention__":
+            _, d_in, d_head, seq, causal = stem
+            arch.append(["attention", seq, d_in, d_head, causal])
+            # Reset spatial tracking — attention output is [seq, d_head] flat,
+            # not spatial; if a Linear follows, it'll connect by element count.
+            last_spatial = None
+            if i < len(rewritten) - 1:
+                arch.append(["relu"])
+            continue
         wkey = stem + ".weight"
         if wkey not in sd:
             continue
@@ -1061,7 +1100,7 @@ def infer_arch_from_state_dict(sd):
 
         # Insert ReLU between layers, except after the last one (the
         # head's logits aren't activation-followed in classifiers).
-        if i < len(stems) - 1:
+        if i < len(rewritten) - 1:
             arch.append(["relu"])
 
     return arch

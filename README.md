@@ -144,9 +144,13 @@ aricode-ml/
 | Layer kind       | Args                       | Notes                                 |
 |------------------|----------------------------|---------------------------------------|
 | `linear`         | `in_features, out_features`| `nn.Linear` weight `(out, in)`         |
-| `conv2d_3x3_p1`  | `C_in, C_out`              | 28×28 spatial.  C_in > 1 supported via |
-|                  |                            | a per-input-channel loop.              |
+| `conv2d_3x3_p1`  | `C_in, C_out`              | 28×28 spatial; C_in > 1 uses native    |
+|                  |                            | multi-channel kernel.                  |
 | `maxpool_2x2`    | `C`                        | 28×28 → 14×14                          |
+| `attention`      | `seq, d_in, d_head, causal`| Single-head scaled dot-product.  Loads |
+|                  |                            | `q_proj.weight` / `k_proj.weight` /    |
+|                  |                            | `v_proj.weight` (HF naming) from the   |
+|                  |                            | state_dict.                            |
 | `flatten`        | —                          | reshape, no code emitted               |
 | `relu` / `sigmoid` / `tanh` / `softmax` | —              | in-place activations                   |
 
@@ -186,10 +190,11 @@ isn't competing for that workload.
 ecosystems have years of quantisation and batched-attention work
 this repo doesn't approximate.
 
-✗ Your model has layers we don't pack yet (RNN, transformer block,
-arbitrary-spatial conv).  These are roadmap; for now, simple
-feed-forward nets and the MNIST CNN architecture family are the
-sweet spot.
+✗ Your model has layers we don't pack yet (RNN, multi-block
+transformers with LayerNorm + residuals + FFN, arbitrary-spatial
+conv).  Single-head scaled dot-product attention IS supported as of
+v0.13; multi-head and full transformer blocks are next on the
+roadmap.
 
 ## Roadmap
 
@@ -213,14 +218,24 @@ Shipped:
   cold-start halves: 2 ms → 1 ms).  Batch loaders still dequant
   once at startup since amortising across N samples wins on
   steady-state throughput; the packer picks per `--input-format`.
+- v0.13: transformer attention pack-side.  `["attention", seq, d_in,
+  d_head, causal]` is now a first-class arch entry; the packer
+  resolves `q_proj` / `k_proj` / `v_proj` from the state_dict
+  (HuggingFace convention), inlines the attention library into the
+  prologue, allocates the descriptor + scratch, and emits the
+  forward.  `--infer-arch` detects the q/k/v triple and emits a
+  starter attention entry (with placeholder seq).  End-to-end
+  regression: `examples/attention_min/run_test.sh` packs a synthetic
+  4-token attention layer and matches the PyTorch reference within
+  1.3e-6 — pure f32 quantisation noise.  Also new in v0.13:
+  `--input-format embedded` for baking a fixed input file into
+  `.text` (test rigs, deterministic single-shot demos).
 
 Pending:
-- stand-alone transformer block packer (attention layer is already
-  shipped in `attention_f32.ari`; needs the pack-side wiring).
-- HF auto-arch detection for *transformer* models (sentence-
-  transformers, distilbert).  v0.10's `--infer-arch` covers
-  sequential MLP / CNN; the transformer case needs the pack-side
-  attention layer first.
+- multi-block transformer (attention + LayerNorm + FFN block) — the
+  attention kernel handles single-head SDPA; multi-head, residual
+  connections, and the typical transformer-block sandwich are the
+  next layer up.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
