@@ -316,24 +316,38 @@ Shipped:
 - v0.24: GELU math_exp saturation guard + synthetic distilbert
   regression.  Diagnosed via two parallel investigations: a
   structural map of the packer (which surfaced real per-counter
-  drift candidates worth a future refactor) and a step-by-step
-  bug trace (which found the actual root cause).  aricode's
-  `math_exp` builtin doesn't IEEE-saturate at overflow — for
-  `|arg| ≳ 700` it returns garbage (e.g. `math_exp(848)` ≈ -0.0,
-  `math_exp(-848)` ≈ INT64_MIN-as-f64).  GELU (tanh approximation)
-  computes `2/(e^(2z)+1)` which trips this trap when activations
-  push `|2z| > ~22`.  Result: GELU's tanh saturation flips
-  (returns `0` where torch returns `x`, and vice versa), corrupting
-  the FFN residual stream.  Fix: branch in the inlined gelu_f32
-  helper to clamp `tanh(z) = ±1` for `|z| > 10` (well within f32
-  precision; the branch is exact for our purposes).  Caught by the
+  drift candidates) and a step-by-step bug trace (which found the
+  actual root cause).  aricode's `math_exp` builtin doesn't
+  IEEE-saturate at overflow — for `|arg| ≳ 700` it returns garbage
+  (e.g. `math_exp(848)` ≈ -0.0, `math_exp(-848)` ≈
+  INT64_MIN-as-f64).  GELU (tanh approximation) computes
+  `2/(e^(2z)+1)` which trips this trap when activations push
+  `|2z| > ~22`.  Result: GELU's tanh saturation flips (returns
+  `0` where torch returns `x`, and vice versa), corrupting the
+  FFN residual stream.  Fix: branch in the inlined gelu_f32
+  helper to clamp `tanh(z) = ±1` for `|z| > 10`.  Caught by the
   new `examples/distilbert_2block_min/` regression — a 1-block
   Post-LN distilbert-style encoder with real HF key naming
   (`transformer.layer.{i}.attention.q_lin`, `sa_layer_norm`,
   `embeddings.LayerNorm`, etc.).  Without the clamp this test
-  fails by max abs ~6.18; with it, 5.7e-6.  Follow-up: harden
-  `math_exp` in the codegen so other call sites stop tripping the
-  same overflow trap.
+  fails by max abs ~6.18; with it, 5.7e-6.
+
+- v0.25: follow-ups to v0.24's diagnosis.
+  - **`math_exp` codegen hardening** (compiler commit fd57356):
+    the polynomial path now clamps x to [-700, +700] via
+    `minsd`/`maxsd` against bit-immediate constants, so the
+    IEEE-bit-trick `(k+1023)<<52` step always lands in the f64
+    normal range.  Other call sites (user code calling
+    `math_exp` directly, future builtins) stop tripping the
+    same overflow trap.  Edge test #75 locks the clamp in.
+  - **packer counter unification**: the structural-map agent
+    flagged `positional_embedding` as the only kind whose
+    counter had different variable names across walks
+    (`pe` / `pi_pos` / `pe_idx` / `pe_count`) — pure plumbing
+    risk, no functional bug, but now all four walks read `pei`
+    in lockstep with the existing single-name convention every
+    other layer kind uses (`li` / `ci` / `ai` / `mi` / `ni` /
+    `ei`).
 
 - v0.21: learned positional embedding.  `["positional_embedding",
   max_pos, d_model, seq]` arch entry.  Slices `W_pos[0:seq*d_model]`
