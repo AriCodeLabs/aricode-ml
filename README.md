@@ -361,13 +361,24 @@ Shipped:
   mmap-backed virtual reservation — small models still pay
   zero RSS for the larger reservation.
 
-  Open follow-up: int8 quantisation today only routes Linear and
-  Conv tensors through the int8 path (the other kinds —
-  embedding / MHA / LayerNorm — don't have int8 kernels yet), and
-  the int8 Linear matvec trips a bounds check on the FFN's
-  per-Linear in_f mismatch with the shared scratch buffer.  For
-  now distilbert deploys as f32; per-Linear scratch (or an
-  explicit n-arg in arr_i8_matvec_f32) closes that gap.
+  v0.27 closes the int8 gap: per-Linear scratch (one `_lin_in_{li}`
+  / `_lin_out_{li}` pair per batched Linear, sized exactly to its
+  in_f / out_f) means arr_i8_matvec_f32's implicit-n-from-header
+  always lines up with W's row stride.  Distilbert int8:
+
+      PyTorch:    [-4.131,  4.490]   →  positive
+      aricode:    [-4.026,  4.395]   →  positive  (same class)
+      max diff:   0.10               (int8 noise across 67M params)
+      binary:     173 MB             (vs 268 MB f32 — 35 % smaller)
+      cold-start: 130 ms             (no regression vs f32)
+
+  Companion compiler bump (`CODEGEN_MAX_VARS` 256 → 2048): real
+  distilbert's main() declares ~230 locals; the per-Linear
+  scratch addition pushed it over the previous cap.
+
+  Embedding / MHA / LayerNorm tensors still stay f32 (no int8
+  kernels for those layer kinds yet); the savings come entirely
+  from the FFN linears (the bulk of compute and parameter count).
 
 - v0.25: follow-ups to v0.24's diagnosis.
   - **`math_exp` codegen hardening** (compiler commit fd57356):
