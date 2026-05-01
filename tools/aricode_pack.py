@@ -287,6 +287,13 @@ def tensor_specs(kind, *args):
     elif kind == "conv2d_3x3_p1":
         c_in, c_out = args
         yield ("", c_out * c_in * 9, c_out)
+    elif kind == "attention":
+        # ["attention", seq, d_in, d_head, causal]
+        # Three (W, b) projections — Q, K, V — each shaped (d_head, d_in)
+        # and (d_head,), matching the nn.Linear layout the kernel reads.
+        seq, d_in, d_head, causal = args
+        for proj in ("q", "k", "v"):
+            yield (proj, d_head * d_in, d_head)
     else:
         raise ValueError(f"tensor_specs: no weights for {kind!r}")
 
@@ -300,6 +307,8 @@ def tensor_names(kind, idx, suffix=""):
         return f"W{idx}", f"b{idx}"
     if kind == "conv2d_3x3_p1":
         return f"Wc{idx}", f"bc{idx}"
+    if kind == "attention":
+        return f"W{suffix}{idx}", f"b{suffix}{idx}"   # e.g. Wq0, bq0
     raise ValueError(f"tensor_names: no weights for {kind!r}")
 
 
@@ -312,6 +321,7 @@ def weight_tensors(arch):
     callsite having to reinvent them."""
     li = 0
     ci = 0
+    ai = 0
     for kind, *args in arch:
         if kind == "linear":
             for suffix, nw, nb in tensor_specs(kind, *args):
@@ -323,6 +333,11 @@ def weight_tensors(arch):
                 wname, bname = tensor_names(kind, ci, suffix)
                 yield (kind, ci, suffix, nw, nb, wname, bname)
             ci += 1
+        elif kind == "attention":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, ai, suffix)
+                yield (kind, ai, suffix, nw, nb, wname, bname)
+            ai += 1
 
 
 def weight_size(kind, *args):
@@ -360,8 +375,13 @@ def gen_act_decls(arch):
     elif first[0] == "conv2d_3x3_p1":
         c_in, _ = first[1], first[2]
         sizes = [c_in * 28 * 28]
+    elif first[0] == "attention":
+        # Input X is [seq, d_in] flat; size = seq * d_in.
+        seq, d_in, _, _ = first[1], first[2], first[3], first[4]
+        sizes = [seq * d_in]
     else:
-        raise ValueError(f"first layer must be linear or conv2d_3x3_p1, got {first[0]!r}")
+        raise ValueError(f"first layer must be linear, conv2d_3x3_p1, or attention; "
+                         f"got {first[0]!r}")
 
     for kind, *args in arch:
         if kind == "linear":
@@ -372,6 +392,11 @@ def gen_act_decls(arch):
         elif kind == "maxpool_2x2":
             c = args[0]
             sizes.append(c * 14 * 14)
+        elif kind == "attention":
+            # Output is [seq, d_head] — same row count as the input,
+            # potentially different feature dim.
+            seq, _, d_head, _ = args
+            sizes.append(seq * d_head)
         elif kind == "flatten":
             # No size change, just shape interpretation.  Reuse same buffer.
             pass
