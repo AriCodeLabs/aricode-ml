@@ -157,12 +157,13 @@ aricode-ml/
 |                  |                            | k_proj / v_proj / out_proj (all        |
 |                  |                            | shaped d_model×d_model).               |
 | `embedding`      | `vocab_size, d_model, seq` | Token-ID lookup table.  Must be the    |
-|                  |                            | first arch entry; consumes a 1-byte-   |
-|                  |                            | per-token raw stream from the input    |
-|                  |                            | loader.  Loads HF                      |
+|                  |                            | first arch entry; consumes a 1/2/4-    |
+|                  |                            | byte-per-token raw stream from the     |
+|                  |                            | input loader (auto-sized from          |
+|                  |                            | vocab_size).  Loads HF                 |
 |                  |                            | `embeddings.word_embeddings.weight` /  |
-|                  |                            | `wte.weight` etc.  vocab_size ≤ 256    |
-|                  |                            | today (2/4-byte tokens are roadmap).   |
+|                  |                            | `wte.weight` etc.  Real HF vocabs      |
+|                  |                            | (BERT/distilbert: 30522) work.         |
 | `layernorm`      | `dim`                      | Affine LayerNorm over the last `dim`   |
 |                  |                            | elements (γ, β learnable; loads as     |
 |                  |                            | `LayerNorm.weight` / `LayerNorm.bias`).|
@@ -213,9 +214,9 @@ this repo doesn't approximate.
 
 ✗ Your model has layers we don't pack yet (RNN, positional encoding,
 arbitrary-spatial conv).  Single- and multi-head SDPA, LayerNorm,
-GELU, residuals, and embedding lookup all ship through v0.19.  The
-last piece for a fully end-to-end packed HF transformer is positional
-encoding (and a 2/4-byte token loader for vocab > 256).
+GELU, residuals, and full-vocab embedding lookup all ship through
+v0.20.  The remaining piece for a fully end-to-end packed HF
+transformer encoder is positional encoding.
 
 ## Roadmap
 
@@ -294,19 +295,25 @@ Shipped:
 - v0.19: embedding-table front-end.  `["embedding", vocab_size,
   d_model, seq]` arch entry; loads HuggingFace canonical names
   (`embeddings.word_embeddings.weight`, `wte.weight`, etc.) and
-  emits a per-token copy_slice lookup.  Token IDs come in as a raw
-  byte stream (1 byte per token, vocab ≤ 256 today; 2- and 4-byte
-  loaders are roadmap).  Regression: `examples/embedding_min/`
-  packs an embedding-only arch with token IDs `[3, 1, 4, 2]` and
-  matches PyTorch's `nn.Embedding` lookup within 1e-6.
+  emits a per-token copy_slice lookup.  Regression:
+  `examples/embedding_min/` packs an embedding-only arch with token
+  IDs `[3, 1, 4, 2]` and matches `nn.Embedding` within 1e-6.
+- v0.20: multi-byte token loader for real-vocab transformers.  Auto-
+  sizes the input byte stream by `vocab_size` — 1 byte for vocab
+  ≤ 256, 2 bytes for ≤ 65 536 (BERT, distilbert, GPT-2 small,
+  Llama-3 fits), 4 bytes for the long tail.  The embedding forward
+  decodes little-endian.  Regression:
+  `examples/embedding_2byte_min/` packs the distilbert vocab
+  (30522), uses tokens spanning the full byte range, and matches
+  PyTorch within 1e-6.
 
 Pending:
-- 2-byte / 4-byte token loaders for vocab > 256 (real HF transformer
-  vocab is 30K+).  Today's 1-byte loader is enough for synthetic
-  demos; production transformers need the bigger token range.
-- Positional encoding (sinusoidal or learned).  Embedding lookup is
-  shipped; positional add is the next layer up for a fully end-to-end
-  packed transformer encoder.
+- Positional encoding (sinusoidal or learned).  With v0.20 the
+  embedding-input path is production-ready; the only remaining
+  layer for a fully end-to-end packed transformer encoder is the
+  positional add.  Learned positional encoding can already be
+  hacked by stacking a second embedding through `add_residual`;
+  sinusoidal needs a small per-position helper.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).

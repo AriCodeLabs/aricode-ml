@@ -358,6 +358,21 @@ def needs_attention_lib(arch):
                for layer in arch)
 
 
+def _embedding_token_bytes(vocab_size):
+    """How many bytes per token does the input loader / embedding
+    forward consume?  Auto-sized from vocab_size — 1 byte for tiny
+    demo models (≤256), 2 bytes for typical HF transformer vocabs
+    (BERT/distilbert: 30522), 4 bytes for the largest (LLaMA: 32K
+    fits 2-byte; Llama-3 128K still fits; only specialty vocabs
+    (e.g. Whisper: 51865 — fits 2-byte) push past).  Most real
+    transformers will use the 2-byte path."""
+    if vocab_size <= 256:
+        return 1
+    if vocab_size <= 65536:
+        return 2
+    return 4
+
+
 # Affine LayerNorm: arr_f32_layernorm normalises in-place but doesn't
 # apply the learnable scale (γ) and shift (β) every real transformer
 # uses.  This helper does the affine pass after the builtin normalises.
@@ -1271,29 +1286,40 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
         elif kind == "gelu":
             lines += emit_gelu(f"a{cur_a}")
         elif kind == "embedding":
-            # Token-ID lookup: for each i in 0..seq, read the i-th
-            # token from the _toks_raw byte buffer (1 byte per token,
-            # vocab < 256) and copy d_model elements from row tok of
-            # the embedding matrix into the activation buffer.
-            #
-            # Embedding only supported as the FIRST layer today; the
-            # input loader emits _toks_raw via embed_file_bytes.
-            # vocab >= 256 needs 2-byte-per-token decoding (TODO).
+            # Token-ID lookup.  Picks 1, 2, or 4 bytes per token at pack
+            # time based on vocab_size, so real HF transformer vocabs
+            # (30K+ → 2 bytes) just work.  The input loader emits a
+            # raw byte stream into _toks_raw via embed_file_bytes;
+            # this loop decodes the i-th token via byte_at and copies
+            # d_model f32 elements from the matching row of W_emb.
             vocab_size, d_model, seq = args
             if cur_a != 0:
                 raise SystemExit(
                     f"embedding #{ei} must be the first layer; today the "
                     "packer only emits a token-input loader for the "
                     "leading position.")
-            if vocab_size > 256:
-                raise SystemExit(
-                    f"embedding #{ei}: vocab_size={vocab_size} exceeds the "
-                    "256-token limit of the 1-byte-per-token loader.  "
-                    "2-byte and 4-byte token decoding are roadmap items.")
+            tb = _embedding_token_bytes(vocab_size)
             dst = f"a{cur_a}"
+            lines.append(
+                f"    // embedding {ei}: vocab={vocab_size} d_model={d_model} "
+                f"seq={seq} ({tb} byte/token)")
             lines.append(f"    let _ei{ei}: i32 = 0;")
             lines.append(f"    while (_ei{ei} < {seq}) {{")
-            lines.append(f"        let _tok{ei}: i32 = byte_at(_toks_raw, _ei{ei});")
+            if tb == 1:
+                lines.append(
+                    f"        let _tok{ei}: i32 = byte_at(_toks_raw, _ei{ei});")
+            elif tb == 2:
+                lines.append(
+                    f"        let _tok{ei}: i32 = "
+                    f"byte_at(_toks_raw, _ei{ei} * 2) + "
+                    f"byte_at(_toks_raw, _ei{ei} * 2 + 1) * 256;")
+            else:   # tb == 4
+                lines.append(
+                    f"        let _tok{ei}: i32 = "
+                    f"byte_at(_toks_raw, _ei{ei} * 4) + "
+                    f"byte_at(_toks_raw, _ei{ei} * 4 + 1) * 256 + "
+                    f"byte_at(_toks_raw, _ei{ei} * 4 + 2) * 65536 + "
+                    f"byte_at(_toks_raw, _ei{ei} * 4 + 3) * 16777216;")
             lines.append(
                 f"        arr_f32_copy_slice(Wemb{ei}, _tok{ei} * {d_model}, "
                 f"{dst}, _ei{ei} * {d_model}, {d_model});")
