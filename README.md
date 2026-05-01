@@ -332,6 +332,43 @@ Shipped:
   `embeddings.LayerNorm`, etc.).  Without the clamp this test
   fails by max abs ~6.18; with it, 5.7e-6.
 
+- v0.26: real fine-tuned distilbert SST-2 deploy demo
+  (`examples/distilbert_sst2/`).  Downloads
+  `distilbert-base-uncased-finetuned-sst-2-english` from HF Hub,
+  re-keys the state_dict for the packer's resolvers, packs the
+  whole 6-block / 12-head / 67M-param sentiment classifier
+  through every primitive shipped through v0.21, and produces a
+  268 MB static ELF that classifies sentiment **without Python
+  at runtime, without torch, without CUDA, without virtualenv**.
+
+  End-to-end on *"I love this movie, it was fantastic"*
+  (10 BERT tokens padded to seq=16):
+
+      PyTorch [CLS] logits: [-4.131,  4.490]   →  positive
+      aricode [CLS] logits: [-4.131,  4.490]   →  positive
+      max abs diff:         4.2e-4
+      cold-start:           135 ms
+      binary:               268 MB static ELF
+
+  Cold-start vs the standard PyTorch + transformers download +
+  Python boot pipeline (~5-10 s on a warm cache, longer cold) is
+  ~30-70× faster.  Same prediction, same logits to within tanh-
+  approx-GELU + f32-noise tolerance.
+
+  Companion compiler fix (commit 353345a): bumped
+  CODEGEN_MAX_CODE from 16 MiB to 256 MiB so transformer-class
+  weight blobs fit in the .text payload region.  256 MiB is
+  mmap-backed virtual reservation — small models still pay
+  zero RSS for the larger reservation.
+
+  Open follow-up: int8 quantisation today only routes Linear and
+  Conv tensors through the int8 path (the other kinds —
+  embedding / MHA / LayerNorm — don't have int8 kernels yet), and
+  the int8 Linear matvec trips a bounds check on the FFN's
+  per-Linear in_f mismatch with the shared scratch buffer.  For
+  now distilbert deploys as f32; per-Linear scratch (or an
+  explicit n-arg in arr_i8_matvec_f32) closes that gap.
+
 - v0.25: follow-ups to v0.24's diagnosis.
   - **`math_exp` codegen hardening** (compiler commit fd57356):
     the polynomial path now clamps x to [-700, +700] via
