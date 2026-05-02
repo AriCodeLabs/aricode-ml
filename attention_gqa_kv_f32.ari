@@ -130,7 +130,7 @@ fn attn_gqa_kv_reset(s: i32) -> i32 {
     let n_kv_heads: i32 = arr_get(s, 23);
     let kh: i32 = 0;
     while (kh < n_kv_heads) {
-        kv.attn_kv_reset(arr_get(states_kv, kh));
+        kv.attn_kv_reset_f32(arr_get(states_kv, kh));
         kh = kh + 1;
     }
     arr_set(s, 25, 0);
@@ -151,10 +151,13 @@ fn _gqa_score_head(kv_st: i32, Q: i32, head_out: i32,
     let n: i32 = count + 1;
     arr_f32_matvec(Kc, Q, zero_bias, scores, n, d_head);
 
-    // Poison inactive tail with -60 so softmax assigns ~0 mass.
+    // Poison inactive tail with -60 (same sentinel attention_f32.ari
+    // and attention_kv_f32.ari use): exp(-60 - max) ≈ 1e-26 contributes
+    // negligible mass through the whole-buffer softmax.
+    let neg_big: f64 = 0.0 - 60.0;
     let j: i32 = n;
     while (j < max_seq) {
-        arr_f32_set(scores, j, 0.0 - 60.0);
+        arr_f32_set(scores, j, neg_big);
         j = j + 1;
     }
     arr_f32_softmax(scores);

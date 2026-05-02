@@ -1,6 +1,6 @@
 // aricode-ml: tests/test_kv_reset.ari
 //
-// Validates attn_kv_reset semantics — same allocated state, different
+// Validates attn_kv_reset_f32 semantics — same allocated state, different
 // prompts, outputs must match independent fresh-state runs token-for-
 // token.  This is the path multi-prompt serving uses; if it ever
 // regresses (e.g. count not zeroed, K/V cache not cleared), each
@@ -69,7 +69,7 @@ fn main() -> i32 {
     run_step(st, A1, row_in, outA1_shared, d);
     run_step(st, A2, row_in, outA2_shared, d);
 
-    kv.attn_kv_reset(st);
+    kv.attn_kv_reset_f32(st);
 
     let outB1_shared: i32 = arr_f32_new(d);
     let outB2_shared: i32 = arr_f32_new(d);

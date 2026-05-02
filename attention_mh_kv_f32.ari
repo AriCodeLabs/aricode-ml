@@ -75,12 +75,12 @@ fn attn_mh_kv_alloc_f32(max_seq: i32, d_model: i32, n_heads: i32) -> i32 {
 }
 
 // Reset all per-head caches (count=0, K/V zero) for a fresh sequence.
-fn attn_mh_kv_reset(s: i32) -> i32 {
+fn attn_mh_kv_reset_f32(s: i32) -> i32 {
     let states: i32 = arr_get(s, 10);
     let n_heads: i32 = arr_get(s, 21);
     let h: i32 = 0;
     while (h < n_heads) {
-        kv.attn_kv_reset(arr_get(states, h));
+        kv.attn_kv_reset_f32(arr_get(states, h));
         h = h + 1;
     }
     return 0;

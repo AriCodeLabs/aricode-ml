@@ -73,7 +73,7 @@ fn attn_kv_alloc_f32(max_seq: i32, d_in: i32, d_head: i32) -> i32 {
 // Reset cache state (zero count, zero K/V cache).  Used between
 // independent generations sharing the same allocated state.
 // ----------------------------------------------------------------------
-fn attn_kv_reset(s: i32) -> i32 {
+fn attn_kv_reset_f32(s: i32) -> i32 {
     arr_f32_fill(arr_get(s, 7), 0.0);
     arr_f32_fill(arr_get(s, 8), 0.0);
     arr_set(s, 16, 0);
@@ -141,13 +141,16 @@ fn attn_kv_step_f32(s: i32) -> i32 {
 
     // ---- Step 5: stable softmax over the WHOLE scores buffer ----
     // arr_f32_softmax always softmaxes every element of its argument.
-    // We poison the inactive tail with -60 so exp(-60 - max) ≈ 1e-26
-    // contributes negligible mass; the tail probabilities then come
-    // out near-zero and never leak into the V combine, which only
-    // touches the first n entries via arr_f32_matvec_T.
+    // We poison the inactive tail with the same -60 sentinel
+    // attention_f32.ari uses for causal masking (its `neg_big` local):
+    // exp(-60 - max) ≈ 1e-26 contributes negligible mass, so the tail
+    // probabilities come out near-zero and never leak into the V
+    // combine, which only touches the first n entries via
+    // arr_f32_matvec_T.
+    let neg_big: f64 = 0.0 - 60.0;
     let j: i32 = n;
     while (j < max_seq) {
-        arr_f32_set(scores, j, 0.0 - 60.0);
+        arr_f32_set(scores, j, neg_big);
         j = j + 1;
     }
     arr_f32_softmax(scores);
