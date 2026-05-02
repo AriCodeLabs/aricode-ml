@@ -1,0 +1,94 @@
+// aricode-ml: tests/test_rope_edges.ari
+//
+// Locks in two RoPE invariants that prepare scripts and the kernel
+// MUST agree on, but that the existing rope_min hand-computed test
+// only spot-checks for one (d_head=4, pos=1).
+//
+//   (1) pos=0 is identity.  cos(0)=1, sin(0)=0, so any vector left
+//       through rope_apply at pos=0 should come out unchanged.  If
+//       the table indexing is off by one (or rope_alloc seeds
+//       row 0 with theta-shifted values), this fails.
+//
+//   (2) magnitude preservation per pair.  RoPE rotates each (x, y)
+//       pair by the same angle, so x² + y² stays constant after
+//       application.  Tests at pos=3, d_head=8 (so 4 pairs) — would
+//       catch a sign error or pair-mis-pairing where one component
+//       gets squared incorrectly.
+
+import "../rope_f32.ari" as rope;
+
+fn close_within(got: f64, expect: f64, tol: f64) -> i32 {
+    // Workaround for the codegen return-type misclassification bug
+    // (see project_codegen_return_type_bug memory): callers must bind
+    // the result to an i32 var before comparing inline.
+    let diff: f64 = got - expect;
+    if (diff < 0.0) { diff = 0.0 - diff; }
+    if (diff > tol) { return 0; }
+    return 1;
+}
+
+fn main() -> i32 {
+    let ok: i32 = 1;
+
+    // ---- (1) pos=0 identity ----
+    let table0: i32 = rope.rope_alloc_f32(4, 4, 10000.0);
+    let v0: i32 = arr_f32_new(4);
+    arr_f32_set(v0, 0, 1.5);
+    arr_f32_set(v0, 1, 2.5);
+    arr_f32_set(v0, 2, 3.5);
+    arr_f32_set(v0, 3, 4.5);
+    rope.rope_apply_f32(table0, v0, 0, 4);
+
+    let r0: i32 = close_within(arr_f32_get(v0, 0), 1.5, 0.000001);
+    let r1: i32 = close_within(arr_f32_get(v0, 1), 2.5, 0.000001);
+    let r2: i32 = close_within(arr_f32_get(v0, 2), 3.5, 0.000001);
+    let r3: i32 = close_within(arr_f32_get(v0, 3), 4.5, 0.000001);
+    if (r0 == 0) { ok = 0; print_str("FAIL pos=0 idx 0:"); print_f64(arr_f32_get(v0, 0), 6); }
+    if (r1 == 0) { ok = 0; print_str("FAIL pos=0 idx 1:"); print_f64(arr_f32_get(v0, 1), 6); }
+    if (r2 == 0) { ok = 0; print_str("FAIL pos=0 idx 2:"); print_f64(arr_f32_get(v0, 2), 6); }
+    if (r3 == 0) { ok = 0; print_str("FAIL pos=0 idx 3:"); print_f64(arr_f32_get(v0, 3), 6); }
+
+    // ---- (2) magnitude preservation per pair, pos=3, d_head=8 ----
+    let d: i32 = 8;
+    let table1: i32 = rope.rope_alloc_f32(8, d, 10000.0);
+
+    // 4 known-magnitude pairs.  After rotation each pair's
+    // (x², y²) sum must be preserved within 1e-5.
+    let v1: i32 = arr_f32_new(d);
+    arr_f32_set(v1, 0, 0.6); arr_f32_set(v1, 1, 0.8);   // mag² = 1.0
+    arr_f32_set(v1, 2, 3.0); arr_f32_set(v1, 3, 4.0);   // mag² = 25.0
+    arr_f32_set(v1, 4, 0.0); arr_f32_set(v1, 5, 1.0);   // mag² = 1.0
+    arr_f32_set(v1, 6, 1.0); arr_f32_set(v1, 7, 0.0);   // mag² = 1.0
+
+    let pre_mag0: f64 = 1.0;
+    let pre_mag1: f64 = 25.0;
+    let pre_mag2: f64 = 1.0;
+    let pre_mag3: f64 = 1.0;
+
+    rope.rope_apply_f32(table1, v1, 3, d);
+
+    let post_mag0: f64 = arr_f32_get(v1, 0) * arr_f32_get(v1, 0)
+                       + arr_f32_get(v1, 1) * arr_f32_get(v1, 1);
+    let post_mag1: f64 = arr_f32_get(v1, 2) * arr_f32_get(v1, 2)
+                       + arr_f32_get(v1, 3) * arr_f32_get(v1, 3);
+    let post_mag2: f64 = arr_f32_get(v1, 4) * arr_f32_get(v1, 4)
+                       + arr_f32_get(v1, 5) * arr_f32_get(v1, 5);
+    let post_mag3: f64 = arr_f32_get(v1, 6) * arr_f32_get(v1, 6)
+                       + arr_f32_get(v1, 7) * arr_f32_get(v1, 7);
+
+    let m0: i32 = close_within(post_mag0, pre_mag0, 0.00001);
+    let m1: i32 = close_within(post_mag1, pre_mag1, 0.0001);
+    let m2: i32 = close_within(post_mag2, pre_mag2, 0.00001);
+    let m3: i32 = close_within(post_mag3, pre_mag3, 0.00001);
+    if (m0 == 0) { ok = 0; print_str("FAIL mag pair 0:"); print_f64(post_mag0, 6); }
+    if (m1 == 0) { ok = 0; print_str("FAIL mag pair 1:"); print_f64(post_mag1, 6); }
+    if (m2 == 0) { ok = 0; print_str("FAIL mag pair 2:"); print_f64(post_mag2, 6); }
+    if (m3 == 0) { ok = 0; print_str("FAIL mag pair 3:"); print_f64(post_mag3, 6); }
+
+    if (ok == 1) {
+        print_str("ROPE_EDGES_OK");
+    } else {
+        print_str("ROPE_EDGES_FAIL");
+    }
+    return 0;
+}

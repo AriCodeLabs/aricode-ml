@@ -1,0 +1,95 @@
+// aricode-ml: tests/test_kv_overflow.ari
+//
+// KV cache overflow behaviour.  attn_kv_step_f32 returns -1 (a
+// sentinel) when called with count >= max_seq instead of writing
+// past the cache and corrupting memory.  Without this guard, a
+// production server that drives generation past the configured
+// context window would silently overwrite an arbitrary heap object
+// with the next K/V row.
+//
+// Test:
+//   1. Allocate state with max_seq = 2.
+//   2. Step twice (counts 0 → 1 → 2), both calls return 0.
+//   3. Step a third time — count is already 2 = max_seq.  Must return
+//      -1 and not touch the output buffer (which we pre-fill with a
+//      sentinel that should survive untouched).
+
+import "../attention_kv_f32.ari" as kv;
+
+fn main() -> i32 {
+    let d: i32 = 4;
+    let max_seq: i32 = 2;
+    let ok: i32 = 1;
+
+    let st: i32 = kv.attn_kv_alloc_f32(max_seq, d, d);
+    let W_Q: i32 = arr_f32_new(d * d); arr_f32_fill(W_Q, 0.0);
+    let W_K: i32 = arr_f32_new(d * d); arr_f32_fill(W_K, 0.0);
+    let W_V: i32 = arr_f32_new(d * d); arr_f32_fill(W_V, 0.0);
+    let b: i32 = arr_f32_new(d); arr_f32_fill(b, 0.0);
+    arr_set(st, 1, W_Q); arr_set(st, 2, b);
+    arr_set(st, 3, W_K); arr_set(st, 4, b);
+    arr_set(st, 5, W_V); arr_set(st, 6, b);
+
+    let X: i32 = arr_f32_new(d);
+    arr_f32_set(X, 0, 0.1);
+    arr_f32_set(X, 1, 0.2);
+    arr_f32_set(X, 2, 0.3);
+    arr_f32_set(X, 3, 0.4);
+    arr_set(st, 0, X);
+
+    let out: i32 = arr_f32_new(d);
+    arr_set(st, 12, out);
+
+    // Step 1 — count 0 → 1, should succeed.
+    let r1: i32 = kv.attn_kv_step_f32(st);
+    if (r1 != 0) {
+        print_str("FAIL: step 1 returned");
+        print_int(r1);
+        ok = 0;
+    }
+
+    // Step 2 — count 1 → 2 = max_seq, should succeed (this is the
+    // last valid step; we hit the boundary EXACTLY).
+    let r2: i32 = kv.attn_kv_step_f32(st);
+    if (r2 != 0) {
+        print_str("FAIL: step 2 (boundary) returned");
+        print_int(r2);
+        ok = 0;
+    }
+
+    // Pre-fill out buffer with a recognisable sentinel.  After the
+    // overflow step the sentinel must survive untouched (the kernel
+    // bails BEFORE doing any matvec writes).
+    arr_f32_fill(out, 0.0 - 999.5);
+
+    // Step 3 — count 2 == max_seq, MUST return -1 and not write to out.
+    let r3: i32 = kv.attn_kv_step_f32(st);
+    if (r3 != 0 - 1) {
+        print_str("FAIL: step 3 (overflow) expected -1, returned");
+        print_int(r3);
+        ok = 0;
+    }
+
+    // Verify out wasn't touched.
+    let i: i32 = 0;
+    while (i < d) {
+        let v: f64 = arr_f32_get(out, i);
+        let dd: f64 = v - (0.0 - 999.5);
+        if (dd < 0.0) { dd = 0.0 - dd; }
+        if (dd > 0.000001) {
+            print_str("FAIL: out clobbered at idx");
+            print_int(i);
+            print_str("value");
+            print_f64(v, 6);
+            ok = 0;
+        }
+        i = i + 1;
+    }
+
+    if (ok == 1) {
+        print_str("KV_OVERFLOW_OK");
+    } else {
+        print_str("KV_OVERFLOW_FAIL");
+    }
+    return 0;
+}

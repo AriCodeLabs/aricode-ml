@@ -1,0 +1,115 @@
+// aricode-ml: tests/test_sampling_edges.ari
+//
+// Edge cases on the sampling primitives:
+//
+//   (1) sample_topk_filter_f32 with k=1 + sample_temperature_f32 must
+//       always return argmax — no matter the rng_unit draw, the top-1
+//       filter leaves a single non-sentinel logit and softmax → 1.0
+//       on that index.  If the filter has an off-by-one and zeroes
+//       the argmax, this trips.
+//
+//   (2) sample_topk_filter_f32 with k >= n is a no-op (the helper
+//       returns immediately).  Logits stay untouched.
+//
+//   (3) sample_temperature_f32 destroys logits in place (writes
+//       softmax probabilities) — this is documented behavior, but
+//       worth pinning so callers don't accidentally start expecting
+//       the original logits to survive.
+
+import "../sampling_f32.ari" as samp;
+
+fn close_within(got: f64, expect: f64, tol: f64) -> i32 {
+    let diff: f64 = got - expect;
+    if (diff < 0.0) { diff = 0.0 - diff; }
+    if (diff > tol) { return 0; }
+    return 1;
+}
+
+fn fill_distinct(L: i32, n: i32, argmax_at: i32) -> i32 {
+    // Fill so that argmax sits at `argmax_at`.  All other entries
+    // distinct + lower magnitudes.
+    let i: i32 = 0;
+    while (i < n) {
+        if (i == argmax_at) {
+            arr_f32_set(L, i, 5.0);
+        } else {
+            // Distinct ascending values capped well below 5.
+            arr_f32_set(L, i, int_to_float(i) * 0.1 - 1.0);
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    let ok: i32 = 1;
+
+    // ---- (1) topk=1 collapses to greedy regardless of rng_unit ----
+    let n: i32 = 8;
+    let argmax_idx: i32 = 5;
+
+    // Try several rng_unit draws — all must yield argmax_idx.
+    let rngs: i32 = arr_f32_new(4);
+    arr_f32_set(rngs, 0, 0.001);
+    arr_f32_set(rngs, 1, 0.5);
+    arr_f32_set(rngs, 2, 0.999);
+    arr_f32_set(rngs, 3, 0.0);
+
+    let r: i32 = 0;
+    while (r < 4) {
+        let L: i32 = arr_f32_new(n);
+        fill_distinct(L, n, argmax_idx);
+        samp.sample_topk_filter_f32(L, 1);
+        let unit: f64 = arr_f32_get(rngs, r);
+        let tok: i32 = samp.sample_temperature_f32(L, 1.0, unit);
+        if (tok != argmax_idx) {
+            print_str("FAIL: topk=1 with rng_unit");
+            print_f64(unit, 4);
+            print_str("returned:");
+            print_int(tok);
+            print_str("expected:");
+            print_int(argmax_idx);
+            ok = 0;
+        }
+        r = r + 1;
+    }
+
+    // ---- (2) topk filter with k >= n is no-op ----
+    let L2: i32 = arr_f32_new(n);
+    fill_distinct(L2, n, 3);
+    samp.sample_topk_filter_f32(L2, n);          // k == n
+    let untouched_5: i32 = close_within(arr_f32_get(L2, 3), 5.0, 0.000001);
+    let untouched_0: i32 = close_within(arr_f32_get(L2, 0), 0.0 - 1.0, 0.000001);
+    if (untouched_5 == 0) { ok = 0; print_str("FAIL: k==n nuked argmax:"); print_f64(arr_f32_get(L2, 3), 6); }
+    if (untouched_0 == 0) { ok = 0; print_str("FAIL: k==n perturbed idx 0:"); print_f64(arr_f32_get(L2, 0), 6); }
+
+    let L3: i32 = arr_f32_new(n);
+    fill_distinct(L3, n, 3);
+    samp.sample_topk_filter_f32(L3, n + 100);    // k > n
+    let untouched_5b: i32 = close_within(arr_f32_get(L3, 3), 5.0, 0.000001);
+    if (untouched_5b == 0) { ok = 0; print_str("FAIL: k>n nuked argmax:"); print_f64(arr_f32_get(L3, 3), 6); }
+
+    // ---- (3) sample_temperature writes softmax in place ----
+    let L4: i32 = arr_f32_new(4);
+    arr_f32_set(L4, 0, 0.0);
+    arr_f32_set(L4, 1, 0.0);
+    arr_f32_set(L4, 2, 5.0);
+    arr_f32_set(L4, 3, 0.0);
+    samp.sample_temperature_f32(L4, 1.0, 0.5);
+    // After the call L4 should hold a probability distribution
+    // summing to ~1.0.  The dominant entry (idx 2) should be > 0.9.
+    let sum: f64 = arr_f32_get(L4, 0) + arr_f32_get(L4, 1)
+                 + arr_f32_get(L4, 2) + arr_f32_get(L4, 3);
+    let sum_ok: i32 = close_within(sum, 1.0, 0.0001);
+    let dom_ok: i32 = 1;
+    if (arr_f32_get(L4, 2) < 0.9) { dom_ok = 0; }
+    if (sum_ok == 0) { ok = 0; print_str("FAIL: softmax in-place sum != 1:"); print_f64(sum, 6); }
+    if (dom_ok == 0) { ok = 0; print_str("FAIL: dominant prob < 0.9:"); print_f64(arr_f32_get(L4, 2), 6); }
+
+    if (ok == 1) {
+        print_str("SAMPLING_EDGES_OK");
+    } else {
+        print_str("SAMPLING_EDGES_FAIL");
+    }
+    return 0;
+}

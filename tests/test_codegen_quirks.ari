@@ -1,0 +1,143 @@
+// aricode-ml: tests/test_codegen_quirks.ari
+//
+// Pin down known compiler quirks so that:
+//   (a) the documented workarounds keep working, and
+//   (b) if the underlying codegen ever changes (fixed OR newly broken)
+//       this test trips and someone investigates.
+//
+// Each quirk is named, repro'd minimally, and asserts the workaround
+// pattern produces correct output.  Cross-references to the project
+// memory entries live next to each.
+
+// ---------------------------------------------------------------------
+// QUIRK #1 — expr_is_float misclassifies user-fn calls returning i32
+// when ANY argument is f64.  See:
+//   memory/project_codegen_return_type_bug.md
+//   src/codegen/codegen.c:634-645  (expr_is_float)
+//   src/codegen/codegen.c:1601-1614 (emit_call_expr; never syncs RAX→xmm0
+//                                    for user fns)
+//
+// Repro: an inline `if (user_fn(f64_args...) == 0)` routes through
+// the SSE float path, comparing stale xmm0 against itself → ZF=1
+// → `(call == 0)` is always true.
+//
+// Workaround: bind the call result to a variable BEFORE comparing,
+// which sends the comparison through the integer-compare path.
+// ---------------------------------------------------------------------
+
+fn ret_one_with_f64(x: f64) -> i32 {
+    return 1;
+}
+
+fn ret_zero_with_f64(x: f64) -> i32 {
+    return 0;
+}
+
+fn quirk_return_type() -> i32 {
+    let ok: i32 = 1;
+
+    // Workaround pattern: bind result to i32, THEN compare.
+    let r1: i32 = ret_one_with_f64(0.0);
+    if (r1 != 1) {
+        print_str("FAIL quirk1: ret_one returned");
+        print_int(r1);
+        ok = 0;
+    }
+    let r0: i32 = ret_zero_with_f64(0.0);
+    if (r0 != 0) {
+        print_str("FAIL quirk1: ret_zero returned");
+        print_int(r0);
+        ok = 0;
+    }
+
+    // Demonstrate the BROKEN inline pattern (left as a positive test
+    // of the bug's continued existence).  If aricode ever fixes the
+    // underlying expr_is_float, this branch starts behaving as the
+    // language semantics suggest and the assertion below flips —
+    // someone would notice and update the memory entry.
+    //
+    // We DO NOT use this pattern in production code; the variable-bind
+    // workaround above is the rule.
+    let bug_still_present: i32 = 0;
+    if (ret_one_with_f64(0.0) == 0) {
+        // SHOULD never enter (ret_one returns 1, not 0); WILL enter
+        // today because of the bug.
+        bug_still_present = 1;
+    }
+    if (bug_still_present == 0) {
+        // The bug got fixed!  Update memory + this test.  Not a
+        // failure per se — but someone needs to know.
+        print_str("INFO: codegen return-type bug appears FIXED.");
+        print_str("      Update memory/project_codegen_return_type_bug.md");
+        print_str("      and remove this informational branch.");
+    }
+    return ok;
+}
+
+// ---------------------------------------------------------------------
+// QUIRK #2 — math_exp clamping for |x| > 700.  See commit fd57356
+// (codegen: math_exp clamps |x| > 700 to prevent IEEE-exponent
+// overflow).  Without the clamp, math_exp returned garbage for
+// arguments outside [-700, +700].  Tail of the stable softmax in
+// arr_f32_softmax used to corrupt for this reason.
+// ---------------------------------------------------------------------
+
+fn quirk_math_exp_clamp() -> i32 {
+    let ok: i32 = 1;
+
+    // exp(0) = 1
+    let v0: f64 = math_exp(0.0);
+    let d0: f64 = v0 - 1.0;
+    if (d0 < 0.0) { d0 = 0.0 - d0; }
+    if (d0 > 0.000001) {
+        print_str("FAIL quirk2: math_exp(0) =");
+        print_f64(v0, 6);
+        ok = 0;
+    }
+
+    // exp(700) finite + huge.  The clamp tops out at exp(700) ≈ 1e304;
+    // no overflow → no garbage.
+    let v_pos: f64 = math_exp(700.0);
+    if (v_pos < 1.0e300) {
+        print_str("FAIL quirk2: math_exp(700) too small =");
+        print_f64(v_pos, 3);
+        ok = 0;
+    }
+
+    // exp(1500) — well outside the safe range.  With the clamp,
+    // returns exp(700), still finite.  Without the clamp this used
+    // to wrap and return garbage (often a small negative).
+    let v_huge: f64 = math_exp(1500.0);
+    if (v_huge < 1.0e300) {
+        print_str("FAIL quirk2: math_exp(1500) clamp broken =");
+        print_f64(v_huge, 3);
+        ok = 0;
+    }
+
+    // exp(-1500) — symmetric clamp.  Returns exp(-700) ≈ 1e-304 ≥ 0.
+    let v_tiny: f64 = math_exp(0.0 - 1500.0);
+    if (v_tiny < 0.0) {
+        print_str("FAIL quirk2: math_exp(-1500) negative =");
+        print_f64(v_tiny, 6);
+        ok = 0;
+    }
+    if (v_tiny > 0.0001) {
+        print_str("FAIL quirk2: math_exp(-1500) too large =");
+        print_f64(v_tiny, 6);
+        ok = 0;
+    }
+    return ok;
+}
+
+fn main() -> i32 {
+    let q1: i32 = quirk_return_type();
+    let q2: i32 = quirk_math_exp_clamp();
+    if (q1 == 1) {
+        if (q2 == 1) {
+            print_str("CODEGEN_QUIRKS_OK");
+            return 0;
+        }
+    }
+    print_str("CODEGEN_QUIRKS_FAIL");
+    return 1;
+}

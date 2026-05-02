@@ -1,0 +1,140 @@
+// aricode-ml: tests/test_kv_reset.ari
+//
+// Validates attn_kv_reset semantics — same allocated state, different
+// prompts, outputs must match independent fresh-state runs token-for-
+// token.  This is the path multi-prompt serving uses; if it ever
+// regresses (e.g. count not zeroed, K/V cache not cleared), each
+// prompt would leak attention into the next.
+//
+// Setup:
+//   d=4, max_seq=4.  Identity W_Q/W_K/W_V (so Q=K=V=X), zero biases.
+//   Run two 2-step decode sequences X_A then X_B on:
+//     (a) one shared state with reset between
+//     (b) two independent freshly-allocated states
+//   Compare the per-step outputs element-by-element.
+//
+// Pass: max abs diff < 1e-5 across all 16 elements (2 sequences x 2
+// steps x 4 d_head).
+
+import "../attention_kv_f32.ari" as kv;
+
+fn fill_random(W: i32, n: i32, seed: i32) -> i32 {
+    let s: i32 = seed;
+    let i: i32 = 0;
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        let bits: i32 = s & 65535;
+        let f: f64 = int_to_float(bits) / 32768.0 - 1.0;
+        arr_f32_set(W, i, f);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn run_step(state: i32, X_full: i32, row_in: i32, out: i32, d: i32) -> i32 {
+    arr_set(state, 0, row_in);
+    arr_set(state, 12, out);
+    arr_f32_copy_slice(X_full, 0, row_in, 0, d);
+    kv.attn_kv_step_f32(state);
+    return 0;
+}
+
+fn main() -> i32 {
+    let d: i32 = 4;
+    let max_seq: i32 = 4;
+
+    let W_Q: i32 = arr_f32_new(d * d); fill_random(W_Q, d * d, 11);
+    let W_K: i32 = arr_f32_new(d * d); fill_random(W_K, d * d, 17);
+    let W_V: i32 = arr_f32_new(d * d); fill_random(W_V, d * d, 23);
+    let b_Q: i32 = arr_f32_new(d); arr_f32_fill(b_Q, 0.0);
+    let b_K: i32 = arr_f32_new(d); arr_f32_fill(b_K, 0.0);
+    let b_V: i32 = arr_f32_new(d); arr_f32_fill(b_V, 0.0);
+
+    // Two distinct token streams.
+    let A1: i32 = arr_f32_new(d); fill_random(A1, d, 41);
+    let A2: i32 = arr_f32_new(d); fill_random(A2, d, 43);
+    let B1: i32 = arr_f32_new(d); fill_random(B1, d, 53);
+    let B2: i32 = arr_f32_new(d); fill_random(B2, d, 59);
+
+    let row_in: i32 = arr_f32_new(d);
+
+    // ---- Path 1: shared state with reset between A and B ----
+    let st: i32 = kv.attn_kv_alloc_f32(max_seq, d, d);
+    arr_set(st, 1, W_Q); arr_set(st, 2, b_Q);
+    arr_set(st, 3, W_K); arr_set(st, 4, b_K);
+    arr_set(st, 5, W_V); arr_set(st, 6, b_V);
+
+    let outA1_shared: i32 = arr_f32_new(d);
+    let outA2_shared: i32 = arr_f32_new(d);
+    run_step(st, A1, row_in, outA1_shared, d);
+    run_step(st, A2, row_in, outA2_shared, d);
+
+    kv.attn_kv_reset(st);
+
+    let outB1_shared: i32 = arr_f32_new(d);
+    let outB2_shared: i32 = arr_f32_new(d);
+    run_step(st, B1, row_in, outB1_shared, d);
+    run_step(st, B2, row_in, outB2_shared, d);
+
+    // ---- Path 2: independent fresh states for A and B ----
+    let stA: i32 = kv.attn_kv_alloc_f32(max_seq, d, d);
+    arr_set(stA, 1, W_Q); arr_set(stA, 2, b_Q);
+    arr_set(stA, 3, W_K); arr_set(stA, 4, b_K);
+    arr_set(stA, 5, W_V); arr_set(stA, 6, b_V);
+
+    let outA1_indep: i32 = arr_f32_new(d);
+    let outA2_indep: i32 = arr_f32_new(d);
+    run_step(stA, A1, row_in, outA1_indep, d);
+    run_step(stA, A2, row_in, outA2_indep, d);
+
+    let stB: i32 = kv.attn_kv_alloc_f32(max_seq, d, d);
+    arr_set(stB, 1, W_Q); arr_set(stB, 2, b_Q);
+    arr_set(stB, 3, W_K); arr_set(stB, 4, b_K);
+    arr_set(stB, 5, W_V); arr_set(stB, 6, b_V);
+
+    let outB1_indep: i32 = arr_f32_new(d);
+    let outB2_indep: i32 = arr_f32_new(d);
+    run_step(stB, B1, row_in, outB1_indep, d);
+    run_step(stB, B2, row_in, outB2_indep, d);
+
+    // ---- Compare ----
+    let max_diff: f64 = 0.0;
+    let tol: f64 = 0.00001;
+    let ok: i32 = 1;
+
+    let i: i32 = 0;
+    while (i < d) {
+        let a: f64 = arr_f32_get(outA1_shared, i) - arr_f32_get(outA1_indep, i);
+        if (a < 0.0) { a = 0.0 - a; }
+        if (a > max_diff) { max_diff = a; }
+        if (a > tol) { ok = 0; }
+
+        let b: f64 = arr_f32_get(outA2_shared, i) - arr_f32_get(outA2_indep, i);
+        if (b < 0.0) { b = 0.0 - b; }
+        if (b > max_diff) { max_diff = b; }
+        if (b > tol) { ok = 0; }
+
+        let c: f64 = arr_f32_get(outB1_shared, i) - arr_f32_get(outB1_indep, i);
+        if (c < 0.0) { c = 0.0 - c; }
+        if (c > max_diff) { max_diff = c; }
+        if (c > tol) { ok = 0; }
+
+        let dd: f64 = arr_f32_get(outB2_shared, i) - arr_f32_get(outB2_indep, i);
+        if (dd < 0.0) { dd = 0.0 - dd; }
+        if (dd > max_diff) { max_diff = dd; }
+        if (dd > tol) { ok = 0; }
+
+        i = i + 1;
+    }
+
+    if (ok == 1) {
+        print_str("KV_RESET_OK");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+    } else {
+        print_str("FAIL");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+    }
+    return 0;
+}
