@@ -15,12 +15,34 @@ Two halves:
   short JSON architecture spec and emits a single self-contained ELF
   binary with the model weights baked into `.text`.  No Python, no
   CUDA libs, no glibc, no runtime linker.  With `--quantize int8` a
-  2-conv MNIST CNN ships in 218 KB total.
+  2-conv MNIST CNN ships in 218 KB total; an entire GPT-2-small
+  decoder ships in 622 MB and cold-starts in ~0.7 s.
 
 aricode is **not** a way to train large models faster than CUDA — it
 won't be, by 1-2 orders of magnitude.  It's a deployment niche: the
 slot where PyTorch's 1 GB stack is too much (edge devices, FaaS cold
 starts, regulated environments, offline machines, archival).
+
+## Trophy demo: GPT-2-small as a static ELF
+
+`examples/gpt2_small/` packs HuggingFace GPT-2 (124 M params, 12
+blocks, 12 heads, max_seq=128) end-to-end through the v0.32 decoder
+pipeline (KV-cache attention, learned positional embedding, tied LM
+head, greedy sampling) and produces a single static binary that
+generates the same 16 tokens, in the same order, as the PyTorch
+reference:
+
+    prefix match : 16 / 16  (full PyTorch greedy match)
+    binary       : 622 MB static ELF (weights baked into .text)
+    cold-start   : ~0.7 s for 16-token greedy on a Ryzen 7 5800X
+
+No torch, no transformers, no virtualenv at runtime — just the ELF
+and a `prompt.bin`.  See `examples/gpt2_small/run_test.sh` for the
+full pipeline.
+
+For a Llama-family smoke test (RMSNorm + GQA-KV with RoPE +
+SwiGLU), `examples/tiny_llama_min/` packs a 1-block synthetic
+checkpoint and matches PyTorch token-for-token.
 
 ## Quick start: GPU train → CPU deploy
 
@@ -123,20 +145,38 @@ aricode-ml/
 ├── tools/
 │   ├── aricode_pack.py         model → .ari + .f32/.i8 (or single binary)
 │   └── README.md               packer-specific docs
-├── attention_f32.ari           single-head scaled dot-product attention
+├── attention_f32.ari           single-head SDPA (forward; for prefill / encoders)
+├── attention_kv_f32.ari        single-head SDPA + KV cache (decoder step)
+├── attention_mh_kv_f32.ari     multi-head SDPA + KV cache (GPT-2 family)
+├── attention_gqa_kv_f32.ari    grouped-query SDPA + KV cache + RoPE (Llama family)
+├── rope_f32.ari                rotary position embedding (interleaved-pair form)
+├── sampling_f32.ari            greedy + temperature sampling
 ├── conv2d.ari / conv2d_f32.ari conv forward + im2col + maxpool
 ├── dense.ari                   dense_forward + relu + mse_loss
 ├── loss.ari                    xent_backward (softmax-CE fused)
 ├── optimizer.ari               adam_update_moments, adam_apply, SGD, clip
 ├── math_ops.ari                math_pow_int, scalar wrappers
+├── docs/
+│   └── llama_plan.md           Llama family status — what's shipped, what's left
 ├── examples/
 │   ├── mnist/                  in-tree training demos (f32 + f64, SGD/AdamW,
 │   │                           sequential and 4-thread parallel)
 │   ├── mnist_infer/            train-on-GPU → deploy-on-CPU end to end
+│   ├── distilbert_sst2/        268 MB static ELF, real HF sentiment classifier
+│   ├── gpt2_small/             trophy decoder demo — 16/16 token greedy match
+│   ├── tiny_llama_min/         1-block Llama (RMSNorm + GQA-KV-RoPE + SwiGLU)
+│   ├── rmsnorm_min / swiglu_min / rope_min / gqa_min / mha_causal_min
+│   │                           per-primitive regressions for Track A ops
 │   └── threading/              parallel matvec micro-benchmarks
-└── tests/                      numerical sanity tests against analytical
-                                solutions (test_attention is a hand-checked
-                                2-token causal forward)
+└── tests/                      numerical sanity tests; in addition to the
+                                existing test_attention / test_dense /
+                                test_optimizer suites, Track A pins:
+                                test_attention_kv, test_attention_mh_kv,
+                                test_sampling, test_kv_reset, test_kv_overflow,
+                                test_rope_edges, test_sampling_edges,
+                                test_codegen_quirks (pins workaround for
+                                a known compiler quirk; see
+                                memory/project_codegen_return_type_bug.md)
 ```
 
 ### Layer vocabulary supported by `aricode-pack`
@@ -156,6 +196,22 @@ aricode-ml/
 |                  |                            | d_model/n_heads.  Loads q_proj /       |
 |                  |                            | k_proj / v_proj / out_proj (all        |
 |                  |                            | shaped d_model×d_model).               |
+| `multi_head_attention_kv` | `max_seq, d_model, n_heads` | Multi-head causal SDPA with a KV  |
+|                  |                            | cache; one decode step per call.       |
+|                  |                            | GPT-2 family (q_proj / k_proj /        |
+|                  |                            | v_proj / out_proj).                    |
+| `multi_head_attention_gqa_kv` | `max_seq, d_model, n_heads, n_kv_heads, theta` | Grouped-   |
+|                  |                            | query attention + KV cache + RoPE      |
+|                  |                            | (interleaved-pair form).  Llama        |
+|                  |                            | family — q_proj is `d_model²`, k/v     |
+|                  |                            | are `n_kv_heads * d_head * d_model`,   |
+|                  |                            | `theta` is `rope_theta` (10000.0 for   |
+|                  |                            | TinyLlama / Llama-2).                  |
+| `rmsnorm`        | `dim`                      | RMSNorm over the last `dim` entries    |
+|                  |                            | (γ only, no β).  Llama / Mistral.      |
+| `swiglu_ffn`     | `d_model, d_ffn`           | Bundled gate / up / down Linears +     |
+|                  |                            | `silu(gate(x)) * up(x)` step.  No      |
+|                  |                            | biases (Llama convention).             |
 | `embedding`      | `vocab_size, d_model, seq` | Token-ID lookup table.  Must be the    |
 |                  |                            | first arch entry; consumes a 1/2/4-    |
 |                  |                            | byte-per-token raw stream from the     |
@@ -218,12 +274,28 @@ ecosystems have years of quantisation and batched-attention work
 this repo doesn't approximate.
 
 ✗ Your model has layers we don't pack yet (RNN, sinusoidal
-positional encoding, arbitrary-spatial conv).  Through v0.21, every
-layer of a learned-positional Pre-LN transformer encoder ships and
-is regression-tested: token embedding (1/2/4-byte vocab), learned
-positional embedding, single- and multi-head SDPA, LayerNorm, GELU,
-residuals, batched Linear (FFN).  Stacking these into a multi-block
-encoder is example-wiring only.
+positional encoding, arbitrary-spatial conv).  Through v0.32, both
+encoders and decoders are covered: the encoder side closed at
+v0.21 (token embedding, learned positional, single- and multi-head
+SDPA, LayerNorm, GELU, residuals, batched Linear FFN) and the
+decoder side closed in Track A (KV-cache attention, RoPE, GQA,
+RMSNorm, SwiGLU, greedy / temperature sampling).
+
+## Architectures supported
+
+| Family    | Representative test                  | Notes                          |
+|-----------|--------------------------------------|--------------------------------|
+| MLP       | `examples/mnist/`                    | Linear / ReLU stack            |
+| CNN       | `examples/mnist_infer/`              | conv2d_3x3_p1 + maxpool        |
+| Encoder   | `examples/distilbert_sst2/`          | Real fine-tuned distilbert,    |
+|           |                                      | 6 blocks, 12 heads, 67 M       |
+|           |                                      | params, 268 MB ELF             |
+| Decoder   | `examples/gpt2_small/`               | GPT-2 124 M, 12 blocks, KV     |
+|           |                                      | cache, learned positional,     |
+|           |                                      | tied LM head — 16/16 token     |
+|           |                                      | greedy match                   |
+| GQA decoder | `examples/tiny_llama_min/`         | 1-block Llama-shaped: RMSNorm  |
+|           |                                      | + GQA-KV + RoPE + SwiGLU       |
 
 ## Roadmap
 
@@ -419,18 +491,68 @@ Shipped:
   distilbert is now purely a matter of state_dict keys + tokenizer
   glue.
 
+- **Track A — decoder family (v0.28 – v0.32).**  Closes the gap
+  from "encoder-only" to "any greedy autoregressive decoder."
+  Each commit pairs a stdlib op + a pack.py arch entry + a
+  regression demo.  The trophy is `examples/gpt2_small/` (16/16
+  greedy match against a real HF GPT-2 124M).
+  - **KV-cache attention** — `attention_kv_f32.ari` and
+    `attention_mh_kv_f32.ari` provide one-token-at-a-time SDPA
+    against an append-only KV cache, indexed by the per-block
+    descriptor allocated at startup.  Pack arch entry
+    `["multi_head_attention_kv", max_seq, d_model, n_heads]`.
+    Regressions: `examples/mha_causal_min/`,
+    `tests/test_attention_kv.ari`,
+    `tests/test_attention_mh_kv.ari`,
+    `tests/test_kv_reset.ari`, `tests/test_kv_overflow.ari`.
+  - **Sampling** — `sampling_f32.ari` ships argmax (greedy) and
+    temperature softmax sampling over a logit row.  Decoder
+    pack mode wires it onto the LM head output. Regressions:
+    `tests/test_sampling.ari`, `tests/test_sampling_edges.ari`.
+  - **RMSNorm** — `rmsnorm_f32.ari` (Llama / Mistral style; γ
+    only, no β).  Pack arch entry `["rmsnorm", dim]`.
+    Regression: `examples/rmsnorm_min/`.
+  - **SwiGLU FFN** — bundled gate / up / down Linears + SiLU,
+    no biases.  Pack arch entry `["swiglu_ffn", d_model, d_ffn]`.
+    Regression: `examples/swiglu_min/`.
+  - **RoPE** — `rope_f32.ari` precomputes the
+    `[max_seq × d_head]` (cos, sin) table at startup, then the
+    GQA decoder rotates Q and K per step in interleaved-pair form.
+    Regressions: `examples/rope_min/`, `tests/test_rope_edges.ari`.
+  - **GQA + RoPE attention** — `attention_gqa_kv_f32.ari` plus
+    pack arch entry `["multi_head_attention_gqa_kv", max_seq,
+    d_model, n_heads, n_kv_heads, theta]`.  Cached K is
+    already-rotated.  When `n_kv_heads == n_heads` it degrades
+    to MHA-KV with RoPE.  Regressions: `examples/gqa_min/`,
+    `examples/tiny_llama_min/`.
+  - **pack.py decoder mode** — `gen_decoder_main` replaces the
+    classifier-style argmax tail with a prefill + sample loop
+    (length controlled by `--max-new-tokens`).  Tied LM-head
+    fallback when `lm_head.weight` is absent (uses
+    `embeddings.word_embeddings.weight`).
+  - **Trophy demo** — `examples/gpt2_small/`: real HuggingFace
+    GPT-2 124 M (12 blocks, 12 heads, max_seq=128) packs end-to-
+    end, produces a 622 MB static ELF, generates 16 tokens at
+    greedy temperature in ~0.7 s, and matches the PyTorch
+    reference token-for-token.  Companion compiler bumps:
+    `CODEGEN_MAX_CODE` 16 MiB → 256 MiB → 1 GiB (commits
+    353345a, 2e96cf0) so transformer-class weight blobs fit in
+    `.text`; `CODEGEN_MAX_VARS` 256 → 2048 (9712f8d) so the
+    decoder's main() locals fit; `math_exp` clamping (fd57356,
+    edge test pinned by `tests/test_codegen_quirks.ari`).
+
 Pending:
+- Real Llama-2-7B / TinyLlama-1.1B end-to-end deploy.  Every
+  primitive ships and `examples/tiny_llama_min/` validates the
+  pipeline against a 1-block synthetic checkpoint.  Outstanding
+  work is checkpoint wrangling (SentencePiece tokenizer +
+  7B-shaped weights) and possibly int8 quantisation for the
+  7B (28 GB f32 → 7 GB int8).  See `docs/llama_plan.md`.
 - Sinusoidal positional encoding (no params, computed from position).
   Today's learned variant covers BERT/distilbert/GPT-2; the
   Attention-Is-All-You-Need / Llama-2 sinusoidal flavour needs a
   small per-position helper.  Lower priority since most practical
-  HF encoder checkpoints use the learned form.
-- Real distilbert pack: drop a HuggingFace fine-tuned checkpoint in
-  and run sentence classification end-to-end.  All the building
-  blocks ship through v0.22.  Outstanding work: tokenizer pre-step
-  (the packer doesn't run a wordpiece tokenizer; users feed token
-  IDs directly), and an arch.json template for the standard 6-block
-  / 12-block distilbert / BERT layouts.
+  HF encoder checkpoints use the learned form, and Llama uses RoPE.
 - generic-spatial conv2d (arbitrary H × W) — unlocks CIFAR-10 and
   any architecture with maxpool between conv layers.
 - ARM / RISC-V back-end (today: x86_64 + AVX2 only).
