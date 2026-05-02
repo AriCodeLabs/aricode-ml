@@ -1466,14 +1466,15 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
         arch_by_idx = {("conv2d_3x3_p1", i): _conv_c_in(layer)
                        for i, layer in enumerate(
                            [l for l in arch if l[0] == "conv2d_3x3_p1"])}
-        QUANTISABLE = ("linear", "conv2d_3x3_p1")
+        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn")
         lines = []
         for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
             c_in = arch_by_idx.get((kind, idx))
             if kind not in QUANTISABLE:
                 # Not int8-supported (attention / MHA / embedding /
-                # positional_embedding / layernorm) — staged as f32 by
-                # the main pack(), embed via embed_file directly.
+                # positional_embedding / layernorm / rmsnorm) — staged
+                # as f32 by the main pack(), embed via embed_file
+                # directly.
                 lines.append(
                     f"    let {wname}: i32 = "
                     f"embed_file(\"{embed_dir}/{out_name}_{wname}.f32\");")
@@ -1482,10 +1483,19 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
                         f"    let {bname}: i32 = "
                         f"embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
                 continue
-            scale_w = scales[(kind, idx, "W")]
+            scale_w = scales[(kind, idx, suffix, "W")]
             if kind == "linear":
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
+            elif kind == "swiglu_ffn":
+                # 3 weight tensors per layer (gate / up / down), each
+                # int8 with its own scale.  No biases (Llama).  Stored
+                # as embed_file_bytes; the runtime swiglu path reads
+                # them through arr_i8_matvec_f32(W, x, b, y, m, n, scale).
+                lines.append(
+                    f"    let {wname}: i32 = "
+                    f"embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                # nb == 0 for swiglu — skip bias emit entirely.
             elif kind == "conv2d_3x3_p1" and c_in == 1:
                 # Single-channel conv: int8 weights stay int8.
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
@@ -1550,7 +1560,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             in_f, out_f = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            sc = scales.get(("linear", idx, "W")) if scales else None
+            sc = scales.get(("linear", idx, "", "W")) if scales else None
             cur_size = sizes_for_seq[cur_a]
             seq_in = cur_size // in_f if (cur_size >= in_f and cur_size % in_f == 0) else 1
             lines += emit_linear(idx, in_f, out_f, src, dst,
@@ -1561,7 +1571,7 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             c_in, c_out = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            conv_scale = scales.get(("conv2d_3x3_p1", idx, "W")) if scales else None
+            conv_scale = scales.get(("conv2d_3x3_p1", idx, "", "W")) if scales else None
             if c_in == 1:
                 # Fast path: single-channel input goes straight into the
                 # AVX2 builtin.  Pad once, call once.  The int8 variant
@@ -1652,21 +1662,50 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
         elif kind == "swiglu_ffn":
             # Llama-style FFN: down(silu(gate(x)) * up(x)).  Three
             # matvecs + one element-wise silu*mul.  No biases.
+            #
+            # int8 path (per-tensor scale per projection — gate/up/down
+            # have independently-scaled distributions; sharing one scale
+            # across all three drifts noticeably on real Llama checkpoints):
+            #   arr_i8_matvec_f32(W, x, b, y, m, n, scale)
+            # f32 path:
+            #   arr_f32_matvec(W, x, b, y, m, n)
             d_model, d_ffn = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            lines.append(f"    // swiglu_ffn {idx}: d_model={d_model} d_ffn={d_ffn}")
-            lines.append(
-                f"    arr_f32_matvec(Wswgate{idx}, {src}, _zb_swg, "
-                f"_swg_gate_{idx}, {d_ffn}, {d_model});")
-            lines.append(
-                f"    arr_f32_matvec(Wswup{idx}, {src}, _zb_swg, "
-                f"_swg_up_{idx}, {d_ffn}, {d_model});")
+            sc_gate = scales.get(("swiglu_ffn", idx, "gate", "W")) if scales else None
+            sc_up   = scales.get(("swiglu_ffn", idx, "up",   "W")) if scales else None
+            sc_down = scales.get(("swiglu_ffn", idx, "down", "W")) if scales else None
+            # arr_i8_matvec_f32(W, x, y, m, scale) — 5 args (n is taken
+            # from x's length header).  No bias term: Llama's FFN omits
+            # them, so this path skips the zero-bias scratch entirely.
+            lines.append(f"    // swiglu_ffn {idx}: d_model={d_model} d_ffn={d_ffn}"
+                         f"{' [int8]' if sc_gate is not None else ''}")
+            if sc_gate is not None:
+                lines.append(
+                    f"    arr_i8_matvec_f32(Wswgate{idx}, {src}, "
+                    f"_swg_gate_{idx}, {d_ffn}, {sc_gate!r});")
+            else:
+                lines.append(
+                    f"    arr_f32_matvec(Wswgate{idx}, {src}, _zb_swg, "
+                    f"_swg_gate_{idx}, {d_ffn}, {d_model});")
+            if sc_up is not None:
+                lines.append(
+                    f"    arr_i8_matvec_f32(Wswup{idx}, {src}, "
+                    f"_swg_up_{idx}, {d_ffn}, {sc_up!r});")
+            else:
+                lines.append(
+                    f"    arr_f32_matvec(Wswup{idx}, {src}, _zb_swg, "
+                    f"_swg_up_{idx}, {d_ffn}, {d_model});")
             lines.append(
                 f"    silu_mul_f32(_swg_gate_{idx}, _swg_up_{idx}, {d_ffn});")
-            lines.append(
-                f"    arr_f32_matvec(Wswdown{idx}, _swg_up_{idx}, _zb_swg, "
-                f"{dst}, {d_model}, {d_ffn});")
+            if sc_down is not None:
+                lines.append(
+                    f"    arr_i8_matvec_f32(Wswdown{idx}, _swg_up_{idx}, "
+                    f"{dst}, {d_model}, {sc_down!r});")
+            else:
+                lines.append(
+                    f"    arr_f32_matvec(Wswdown{idx}, _swg_up_{idx}, _zb_swg, "
+                    f"{dst}, {d_model}, {d_ffn});")
             cur_a += 1
         elif kind == "attention":
             # Single-head scaled dot-product attention.
@@ -2909,7 +2948,13 @@ def main():
     src_path  = out_base.with_suffix(".ari")
     embed_dir = str(out_base.parent.resolve())
 
-    scales = {}   # (kind, idx, "W"|"b") → f32 scale, populated for int8
+    scales = {}   # (kind, idx, suffix, "W"|"b") → f32 scale, populated
+                  #   for int8.  Suffix is "" for single-tensor layers
+                  #   (linear, conv2d_3x3_p1) and "gate"/"up"/"down" for
+                  #   swiglu_ffn (which carries 3 weight tensors per layer
+                  #   that need INDEPENDENT scales since their value
+                  #   distributions differ — gate/up grow ~3-5× wider
+                  #   than down on real Llama checkpoints).
 
     if args.quantize == "int8" and not args.embed:
         # int8 only makes sense as a single-binary deploy; the
@@ -2928,20 +2973,23 @@ def main():
         # prologue didn't even include the helper for, producing
         # "Undefined function" compile errors on transformer-class
         # models.
-        QUANTISABLE = ("linear", "conv2d_3x3_p1")
+        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn")
         import numpy as _np
         wrote = []
         for kind, idx, suffix, W, b in collected:
             wname, bname = tensor_names(kind, idx, suffix)
             if kind in QUANTISABLE:
-                # Weight → int8 (per-tensor symmetric scale).
+                # Weight → int8 (per-tensor symmetric scale).  For
+                # multi-tensor layers (swiglu_ffn) each suffix gets
+                # its OWN scale; gate/up share roughly the same
+                # distribution but down is consistently tighter.
                 abs_max = float(_np.abs(W).max()) if W.size else 0.0
                 scale = abs_max / 127.0 if abs_max > 0 else 0.0
                 if scale == 0.0:
                     q = _np.zeros(W.shape, dtype=_np.int8)
                 else:
                     q = _np.round(W / scale).clip(-128, 127).astype(_np.int8)
-                scales[(kind, idx, "W")] = scale
+                scales[(kind, idx, suffix, "W")] = scale
                 wp = out_base.parent / f"{out_base.name}_{wname}.i8"
                 q.tofile(wp)
                 wrote.append(wp)
