@@ -115,6 +115,16 @@ fn attn_mh_kv_step_f32(s: i32) -> i32 {
     let n_heads: i32 = arr_get(s, 21);
     let d_head: i32  = arr_get(s, 22);
 
+    // Early overflow bail: every per-head state runs in lock-step
+    // (count advanced together by this wrapper), so peeking head 0's
+    // count is sufficient.  Returns -1 BEFORE any head writes head_out
+    // / concat / out — caller sees the same sentinel attn_kv_step_f32
+    // returns and can stop generating.
+    let probe_state: i32 = arr_get(arr_get(s, 10), 0);
+    if (arr_get(probe_state, 16) >= arr_get(probe_state, 13)) {
+        return 0 - 1;
+    }
+
     let h: i32 = 0;
     while (h < n_heads) {
         arr_f32_copy_slice(W_Q, h * d_head * d_model, Wq_s, 0, d_head * d_model);

@@ -106,6 +106,55 @@ fn main() -> i32 {
     if (sum_ok == 0) { ok = 0; print_str("FAIL: softmax in-place sum != 1:"); print_f64(sum, 6); }
     if (dom_ok == 0) { ok = 0; print_str("FAIL: dominant prob < 0.9:"); print_f64(arr_f32_get(L4, 2), 6); }
 
+    // ---- (4) sample_temperature with T<=0 must NOT NaN — falls back
+    // to greedy (the T → 0+ limit collapses to argmax). ----
+    let L5: i32 = arr_f32_new(n);
+    fill_distinct(L5, n, 5);
+    let tok0: i32 = samp.sample_temperature_f32(L5, 0.0, 0.5);
+    if (tok0 != 5) {
+        print_str("FAIL: temperature=0 returned");
+        print_int(tok0);
+        print_str("expected greedy argmax 5");
+        ok = 0;
+    }
+    let L6: i32 = arr_f32_new(n);
+    fill_distinct(L6, n, 2);
+    let tok_neg: i32 = samp.sample_temperature_f32(L6, 0.0 - 0.5, 0.7);
+    if (tok_neg != 2) {
+        print_str("FAIL: temperature=-0.5 returned");
+        print_int(tok_neg);
+        ok = 0;
+    }
+
+    // ---- (5) sample_topk_filter with k<=0 must keep ONLY the argmax
+    // and poison everything else (no silent kth=logits[0] corruption). ----
+    let L7: i32 = arr_f32_new(n);
+    fill_distinct(L7, n, 4);   // argmax at idx 4
+    samp.sample_topk_filter_f32(L7, 0);
+    // Argmax preserved.
+    let kept: i32 = close_within(arr_f32_get(L7, 4), 5.0, 0.000001);
+    if (kept == 0) {
+        ok = 0;
+        print_str("FAIL: k=0 nuked argmax:");
+        print_f64(arr_f32_get(L7, 4), 6);
+    }
+    // Every other slot is large-negative.
+    let neg_thresh: f64 = 0.0 - 1000.0;
+    let pi: i32 = 0;
+    while (pi < n) {
+        if (pi != 4) {
+            let val: f64 = arr_f32_get(L7, pi);
+            if (val > neg_thresh) {
+                ok = 0;
+                print_str("FAIL: k=0 left non-argmax untouched at idx");
+                print_int(pi);
+                print_str("value");
+                print_f64(val, 6);
+            }
+        }
+        pi = pi + 1;
+    }
+
     if (ok == 1) {
         print_str("SAMPLING_EDGES_OK");
     } else {

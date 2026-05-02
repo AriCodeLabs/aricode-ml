@@ -31,6 +31,15 @@ fn sample_greedy_f32(logits: i32) -> i32 {
 fn sample_temperature_f32(logits: i32, temperature: f64, rng_unit: f64) -> i32 {
     let n: i32 = arr_len(logits);
 
+    // Guard: temperature ≤ 0 would propagate NaN/inf through 1/T and
+    // poison the entire distribution.  Treat T ≤ 0 as "go fully greedy"
+    // — return argmax directly without touching the buffer.  This
+    // matches the conceptual limit: as T → 0+, softmax collapses to a
+    // delta on the argmax.
+    if (temperature <= 0.0) {
+        return sample_greedy_f32(logits);
+    }
+
     // Scale by 1/temperature.
     let inv_t: f64 = 1.0 / temperature;
     let i: i32 = 0;
@@ -81,13 +90,33 @@ fn sample_temperature_f32(logits: i32, temperature: f64, rng_unit: f64) -> i32 {
 fn sample_topk_filter_f32(logits: i32, k: i32) -> i32 {
     let n: i32 = arr_len(logits);
     if (k >= n) { return 0; }
+    // Guard: k ≤ 0 is meaningless ("keep zero logits") and the partial
+    // sort below would loop zero times and leave kth seeded with
+    // logits[0], silently corrupting the filter.  Treat k ≤ 0 as the
+    // closest sensible thing: keep the single argmax.
+    if (k <= 0) {
+        let best_v: f64 = arr_f32_get(logits, 0);
+        let best_i: i32 = 0;
+        let bi: i32 = 1;
+        while (bi < n) {
+            let v: f64 = arr_f32_get(logits, bi);
+            if (v > best_v) { best_v = v; best_i = bi; }
+            bi = bi + 1;
+        }
+        let neg_big0: f64 = 0.0 - 1.0e6;
+        let bj: i32 = 0;
+        while (bj < n) {
+            if (bj != best_i) { arr_f32_set(logits, bj, neg_big0); }
+            bj = bj + 1;
+        }
+        return 0;
+    }
 
     // Find the k-th largest value via partial sort: copy logits, run
     // a length-k max-heap-style scan.  For typical vocab (~50k) and
     // k (~50), the O(n*k) scan is fine and avoids an allocator
     // dependency.
     let kth: f64 = arr_f32_get(logits, 0);
-    let kth_count: i32 = 0;
 
     // Find the k-th largest by repeated max-with-exclusion.  Tracks
     // values >= prev_max via a strict-less filter; stops once we've

@@ -358,6 +358,19 @@ fn attention_forward_f32(desc: i32) -> i32 {
 """
 
 
+# Arch ops that don't change activation shape and don't carry a per-
+# layer counter — `gen_act_decls`, `residual_slots`, and `gen_scratch`
+# all need to peek past these to find the first size-defining layer.
+# Adding a new shape-preserving op?  Append it here and every caller
+# picks it up — beats the prior 3-site sed sweep that the rmsnorm
+# addition required.  Note: `swiglu_ffn` is intentionally NOT pseudo
+# (its FFN has a 3-Linear data path that allocates a fresh activation
+# buffer and the residual_slots size walker cares about it).
+PSEUDO_OPS = ("save_residual", "add_residual", "flatten",
+              "relu", "sigmoid", "tanh", "softmax", "gelu",
+              "layernorm", "rmsnorm", "positional_embedding")
+
+
 def needs_attention_lib(arch):
     # Multi-head attention also dispatches into single-head's
     # attention_forward_f32, so the library is needed for either kind.
@@ -614,10 +627,7 @@ def residual_slots(arch):
     # first-layer dispatch, including the same look-past-pseudo-ops
     # logic so an arch that opens with save_residual (the standard
     # Pre-LN transformer pattern) sizes correctly.
-    pseudo = ("save_residual", "add_residual", "flatten",
-              "relu", "sigmoid", "tanh", "softmax", "gelu",
-              "layernorm", "rmsnorm", "positional_embedding")
-    first = next((l for l in arch if l[0] not in pseudo), None)
+    first = next((l for l in arch if l[0] not in PSEUDO_OPS), None)
     if first is None:
         first = arch[0]
     if first[0] == "linear":
@@ -628,7 +638,20 @@ def residual_slots(arch):
         cur_size = first[1] * first[2]
     elif first[0] == "multi_head_attention":
         cur_size = first[1] * first[2]   # seq * d_model
+    elif first[0] == "multi_head_attention_kv":
+        # ["multi_head_attention_kv", max_seq, d_model, n_heads]
+        # Single-token decoder mode → activation is just d_model wide.
+        cur_size = first[2]
+    elif first[0] == "multi_head_attention_gqa_kv":
+        # ["multi_head_attention_gqa_kv", max_seq, d_model, n_heads,
+        #  n_kv_heads, theta]
+        cur_size = first[2]
     elif first[0] == "layernorm":
+        cur_size = first[1]
+    elif first[0] == "rmsnorm":
+        cur_size = first[1]
+    elif first[0] == "swiglu_ffn":
+        # ["swiglu_ffn", d_model, d_ffn] — input dim = d_model.
         cur_size = first[1]
     elif first[0] == "embedding":
         # ["embedding", vocab, d_model, seq] → output sized seq * d_model.
@@ -671,7 +694,16 @@ def residual_slots(arch):
         elif kind == "multi_head_attention":
             seq, d_model, _, _ = args
             cur_size = seq * d_model
-        # layernorm, flatten, in-place activations: unchanged size
+        elif kind == "multi_head_attention_kv":
+            # Single-token decoder; output is d_model.
+            cur_size = args[1]
+        elif kind == "multi_head_attention_gqa_kv":
+            cur_size = args[1]
+        elif kind == "swiglu_ffn":
+            # Output dim = d_model (first arg).
+            cur_size = args[0]
+        # layernorm, rmsnorm, flatten, embedding-after-first, in-place
+        # activations: unchanged size.
     if stack:
         raise ValueError(
             f"{len(stack)} save_residual entries with no matching add_residual")
@@ -1041,10 +1073,7 @@ def gen_act_decls(arch):
     # The standard Pre-LN transformer pattern starts with
     # save_residual + layernorm; without this skip, gen_act_decls
     # would either crash or pick the wrong size.
-    pseudo = ("save_residual", "add_residual", "flatten",
-              "relu", "sigmoid", "tanh", "softmax", "gelu",
-              "layernorm", "rmsnorm", "positional_embedding")
-    first = next((l for l in arch if l[0] not in pseudo), None)
+    first = next((l for l in arch if l[0] not in PSEUDO_OPS), None)
     if first is None:
         # Pure LN/activation chain — fall back to first layer's dim
         # (only meaningful for layernorm; activations don't carry a dim).
@@ -1348,10 +1377,7 @@ def gen_scratch(arch):
     if linear_layers_in or mha_dims:
         # Detect whether ANY Linear is batched by walking arch with a
         # cur_size tracker (mirrors gen_act_decls' batch logic).
-        first_lin = next((l for l in arch if l[0] not in
-                          ("save_residual", "add_residual", "flatten",
-                           "relu", "sigmoid", "tanh", "softmax", "gelu",
-                           "layernorm", "rmsnorm", "positional_embedding")), None)
+        first_lin = next((l for l in arch if l[0] not in PSEUDO_OPS), None)
         if first_lin is not None:
             if first_lin[0] == "linear":
                 cur = first_lin[1]
@@ -1393,6 +1419,9 @@ def gen_scratch(arch):
                 cur = args[1]   # single-row d_model
             elif kind == "multi_head_attention_gqa_kv":
                 cur = args[1]   # single-row d_model (GQA mirrors MHA-KV)
+            elif kind == "swiglu_ffn":
+                # Output dim = d_model (first arg).
+                cur = args[0]
             elif kind == "embedding":
                 cur = args[2] * args[1]   # seq * d_model
         if any_batched:
@@ -1417,6 +1446,10 @@ def gen_scratch(arch):
                     cur2 = first_lin[1] * first_lin[2]
                 elif first_lin[0] == "multi_head_attention_kv":
                     cur2 = first_lin[2]
+                elif first_lin[0] == "multi_head_attention_gqa_kv":
+                    cur2 = first_lin[2]
+                elif first_lin[0] == "swiglu_ffn":
+                    cur2 = first_lin[1]
                 elif first_lin[0] == "embedding":
                     cur2 = first_lin[3] * first_lin[2]
             li2 = 0
@@ -1444,6 +1477,8 @@ def gen_scratch(arch):
                     cur2 = args[1]
                 elif kind == "multi_head_attention_gqa_kv":
                     cur2 = args[1]
+                elif kind == "swiglu_ffn":
+                    cur2 = args[0]
                 elif kind == "embedding":
                     cur2 = args[2] * args[1]
         # MHA's output projection still uses the shared _row_in /
@@ -2638,6 +2673,8 @@ def main():
                     f"attention.{hf_key}.weight",
                     f"layers.{mi}.attn.{hf_key}.weight",
                     f"layers.{mi}.{hf_key}.weight",
+                    # Llama prefill mode (mirrors the GQA-KV path).
+                    f"model.layers.{mi}.self_attn.{hf_key}.weight",
                     # distilbert: transformer.layer.{i}.attention.q_lin.weight
                     f"transformer.layer.{mi}.attention.{dbert_key}.weight",
                     f"layer.{mi}.attention.{dbert_key}.weight",
@@ -2647,7 +2684,7 @@ def main():
                 bkey = sd_lookup(sd, candidates_b)
                 if wkey is None or bkey is None:
                     raise SystemExit(
-                        f"multi_head_attention #{mi}: missing {key_stem} "
+                        f"multi_head_attention #{mi}: missing {proj} "
                         f"weight or bias.  Tried: {candidates_w[0]} / "
                         f"{candidates_w[3]}.  Available: {sorted(sd.keys())}"
                     )
@@ -2655,7 +2692,7 @@ def main():
                 b = sd[bkey].detach().cpu().numpy().astype("float32")
                 if W.shape != (d_model, d_model) or b.shape != (d_model,):
                     raise SystemExit(
-                        f"multi_head_attention #{mi} {key_stem}: shape "
+                        f"multi_head_attention #{mi} {proj}: shape "
                         f"mismatch.  expected ({d_model},{d_model}) + "
                         f"({d_model},); got {tuple(W.shape)} + "
                         f"{tuple(b.shape)}."
@@ -2683,6 +2720,8 @@ def main():
                     f"attention.{hf_key}.weight",
                     f"layers.{mi}.attn.{hf_key}.weight",
                     f"layers.{mi}.{hf_key}.weight",
+                    # Llama-style decoder (mirrors GQA-KV path).
+                    f"model.layers.{mi}.self_attn.{hf_key}.weight",
                     f"transformer.layer.{mi}.attention.{dbert_key}.weight",
                     f"layer.{mi}.attention.{dbert_key}.weight",
                 ]
