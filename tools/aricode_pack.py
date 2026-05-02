@@ -612,6 +612,60 @@ def needs_gelu_helper(arch):
     return any(layer[0] == "gelu" for layer in arch)
 
 
+def first_size_for(layer):
+    """Return the activation element count produced by `layer` when it
+    is the first non-pseudo layer in an arch.  Consolidates the four
+    duplicated dispatches in `residual_slots`, `gen_act_decls`, and the
+    two `gen_scratch` `cur` trackers — every call site computed the
+    same `sizes[0]` from the same first-layer tuple.
+
+    Adding a new arch op?  Add a single branch here and the four
+    callers pick it up automatically.  Past bug: `multi_head_attention_
+    gqa_kv` was added to gen_act_decls but missed in gen_scratch's
+    first_lin block; the four sites went out of sync silently because
+    GQA arches happened to start with `embedding` (which supplied
+    `cur` instead).  An arch leading with GQA-KV would have crashed.
+    """
+    kind = layer[0]
+    if kind == "linear":
+        # ["linear", in_features, out_features] — input element count is
+        # in_features (single-row default; batched callers reshape).
+        return layer[1]
+    if kind == "conv2d_3x3_p1":
+        # ["conv2d_3x3_p1", c_in, c_out] — flattened [c_in, 28, 28].
+        return layer[1] * 28 * 28
+    if kind == "attention":
+        # ["attention", seq, d_in, d_head, causal] — flat [seq, d_in].
+        return layer[1] * layer[2]
+    if kind == "multi_head_attention":
+        # ["multi_head_attention", seq, d_model, n_heads, causal] —
+        # flat [seq, d_model].
+        return layer[1] * layer[2]
+    if kind == "multi_head_attention_kv":
+        # ["multi_head_attention_kv", max_seq, d_model, n_heads] —
+        # decoder mode operates on a single token, so the activation
+        # is just d_model wide.
+        return layer[2]
+    if kind == "multi_head_attention_gqa_kv":
+        # ["multi_head_attention_gqa_kv", max_seq, d_model, n_heads,
+        #  n_kv_heads, theta] — same single-token contract as MHA-KV.
+        return layer[2]
+    if kind == "embedding":
+        # ["embedding", vocab, d_model, seq] → output [seq, d_model].
+        return layer[3] * layer[2]
+    if kind == "layernorm":
+        # ["layernorm", dim] — single-row default (K=1); see
+        # gen_act_decls for the K>1 workaround.
+        return layer[1]
+    if kind == "rmsnorm":
+        # ["rmsnorm", dim] — same single-row default as LayerNorm.
+        return layer[1]
+    if kind == "swiglu_ffn":
+        # ["swiglu_ffn", d_model, d_ffn] — input dim = d_model.
+        return layer[1]
+    raise ValueError(f"first_size_for: no rule for first-layer kind {kind!r}")
+
+
 def residual_slots(arch):
     """Walk the arch and return a list of (slot_idx, n_elems) for every
     `save_residual` entry, in source order.  The slot's element count is
@@ -630,36 +684,7 @@ def residual_slots(arch):
     first = next((l for l in arch if l[0] not in PSEUDO_OPS), None)
     if first is None:
         first = arch[0]
-    if first[0] == "linear":
-        cur_size = first[1]
-    elif first[0] == "conv2d_3x3_p1":
-        cur_size = first[1] * 28 * 28
-    elif first[0] == "attention":
-        cur_size = first[1] * first[2]
-    elif first[0] == "multi_head_attention":
-        cur_size = first[1] * first[2]   # seq * d_model
-    elif first[0] == "multi_head_attention_kv":
-        # ["multi_head_attention_kv", max_seq, d_model, n_heads]
-        # Single-token decoder mode → activation is just d_model wide.
-        cur_size = first[2]
-    elif first[0] == "multi_head_attention_gqa_kv":
-        # ["multi_head_attention_gqa_kv", max_seq, d_model, n_heads,
-        #  n_kv_heads, theta]
-        cur_size = first[2]
-    elif first[0] == "layernorm":
-        cur_size = first[1]
-    elif first[0] == "rmsnorm":
-        cur_size = first[1]
-    elif first[0] == "swiglu_ffn":
-        # ["swiglu_ffn", d_model, d_ffn] — input dim = d_model.
-        cur_size = first[1]
-    elif first[0] == "embedding":
-        # ["embedding", vocab, d_model, seq] → output sized seq * d_model.
-        _, d_model, seq = first[1], first[2], first[3]
-        cur_size = seq * d_model
-    else:
-        raise ValueError(
-            f"residual_slots: unsupported first-layer kind {first[0]!r}")
+    cur_size = first_size_for(first)
     slots = []
     stack = []
     next_idx = 0
@@ -953,86 +978,83 @@ def tensor_names(kind, idx, suffix=""):
     raise ValueError(f"tensor_names: no weights for {kind!r}")
 
 
+# Per-kind counter map used by `arch_walk`.  Maps each weight-bearing
+# arch op to a counter slot; ops absent from the table (`save_residual`,
+# `add_residual`, `flatten`, `relu`, `sigmoid`, `tanh`, `softmax`,
+# `gelu`, `maxpool_2x2`) yield idx=None.
+#
+# Crucial aliasing — multi_head_attention and multi_head_attention_kv
+# share the `multi_head_attention` slot so a state dict keyed for one
+# form loads cleanly into the other (prefill ↔ decode interchange).
+# The `tensor_names` helper relies on this: search for "Same weight
+# tensor names as multi_head_attention" near MHA-KV.  The GQA-KV
+# variant gets its own slot since Llama decoders use the distinct
+# Wgqa{*}/bgqa{*} naming.
+_ARCH_WALK_COUNTER_KEY = {
+    "linear":                       "linear",
+    "conv2d_3x3_p1":                "conv2d_3x3_p1",
+    "attention":                    "attention",
+    "multi_head_attention":         "multi_head_attention",
+    "multi_head_attention_kv":      "multi_head_attention",   # SHARED
+    "multi_head_attention_gqa_kv":  "multi_head_attention_gqa_kv",
+    "layernorm":                    "layernorm",
+    "rmsnorm":                      "rmsnorm",
+    "swiglu_ffn":                   "swiglu_ffn",
+    "embedding":                    "embedding",
+    "positional_embedding":         "positional_embedding",
+}
+# `maxpool_2x2` carries no learnable weights and therefore has no
+# `tensor_specs` entry — including it in the counter map would make
+# `weight_tensors` crash trying to enumerate it.  `gen_scratch` and
+# `gen_forward` track maxpool's per-layer `pool_a{pi}` argmax buffer
+# manually with a local `pi` counter; the cost is one extra line at
+# each of those two sites in exchange for `weight_tensors` staying a
+# clean two-line loop.
+
+
+def arch_walk(arch):
+    """Yield (kind, idx, args) for each layer in arch, with `idx` being
+    the per-kind running counter that today is reconstructed manually
+    in five separate walkers (weight_tensors, gen_scratch's two passes,
+    gen_forward, and main()'s state-dict resolver).  Pseudo / no-counter
+    ops (residuals, flatten, activations, maxpool) yield idx=None.
+
+    Yield-then-increment ordering: the value yielded for the n-th
+    occurrence of a kind is `n` (0-based), and the counter is bumped
+    AFTER the yield.  Flipping this shifts every weight-tensor name by
+    +1 (silent state-dict miss at runtime); the previous five walkers
+    all used this ordering so we preserve it byte-for-byte.
+
+    `multi_head_attention_kv` shares the `multi_head_attention`
+    counter (see `_ARCH_WALK_COUNTER_KEY`).  `multi_head_attention_
+    gqa_kv` has its own counter.  Adding a new arch op?  Append it to
+    `_ARCH_WALK_COUNTER_KEY` and every consumer picks it up.
+    """
+    counters = {key: 0 for key in set(_ARCH_WALK_COUNTER_KEY.values())}
+    for layer in arch:
+        kind, *args = layer
+        slot = _ARCH_WALK_COUNTER_KEY.get(kind)
+        if slot is None:
+            yield (kind, None, args)
+            continue
+        idx = counters[slot]
+        yield (kind, idx, args)
+        counters[slot] += 1
+
+
 def weight_tensors(arch):
     """Yield (kind, idx, suffix, nw, nb, wname, bname) per (W, b) tensor
-    pair across the whole arch, in source order.  This is the iteration
-    shape every weight-emission site should use — handles the multi-
-    tensor case transparently (attention yields three entries per layer
-    with q/k/v suffixes) and exposes the canonical names without each
-    callsite having to reinvent them."""
-    li = 0
-    ci = 0
-    ai = 0
-    ni = 0
-    mi = 0
-    gi = 0   # multi_head_attention_gqa_kv counter (separate from mi so
-             # mixed Llama+GPT-2 archs don't reuse Wm/Wgqa naming slots)
-    ei = 0
-    pei = 0
-    ri = 0
-    si = 0
-    for kind, *args in arch:
-        if kind == "linear":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, li, suffix)
-                yield (kind, li, suffix, nw, nb, wname, bname)
-            li += 1
-        elif kind == "conv2d_3x3_p1":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, ci, suffix)
-                yield (kind, ci, suffix, nw, nb, wname, bname)
-            ci += 1
-        elif kind == "attention":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, ai, suffix)
-                yield (kind, ai, suffix, nw, nb, wname, bname)
-            ai += 1
-        elif kind == "multi_head_attention":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, mi, suffix)
-                yield (kind, mi, suffix, nw, nb, wname, bname)
-            mi += 1
-        elif kind == "multi_head_attention_kv":
-            # Shares the `mi` counter with the one-shot variant: weight
-            # tensor names (Wmq{i}/bmq{i}/...) are identical so a state
-            # dict keyed for one form loads cleanly into the other.
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, mi, suffix)
-                yield (kind, mi, suffix, nw, nb, wname, bname)
-            mi += 1
-        elif kind == "multi_head_attention_gqa_kv":
-            # Distinct counter (`gi`) from the MHA-KV variant — Llama
-            # decoders use Wgqa{*}/bgqa{*} naming and never collide with
-            # GPT-2-style Wm{*}/bm{*}.
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, gi, suffix)
-                yield (kind, gi, suffix, nw, nb, wname, bname)
-            gi += 1
-        elif kind == "layernorm":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, ni, suffix)
-                yield (kind, ni, suffix, nw, nb, wname, bname)
-            ni += 1
-        elif kind == "rmsnorm":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, ri, suffix)
-                yield (kind, ri, suffix, nw, nb, wname, bname)
-            ri += 1
-        elif kind == "swiglu_ffn":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, si, suffix)
-                yield (kind, si, suffix, nw, nb, wname, bname)
-            si += 1
-        elif kind == "embedding":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, ei, suffix)
-                yield (kind, ei, suffix, nw, nb, wname, bname)
-            ei += 1
-        elif kind == "positional_embedding":
-            for suffix, nw, nb in tensor_specs(kind, *args):
-                wname, bname = tensor_names(kind, pei, suffix)
-                yield (kind, pei, suffix, nw, nb, wname, bname)
-            pei += 1
+    pair across the whole arch, in source order.  Thin adapter over
+    `arch_walk` — handles the multi-tensor case transparently
+    (attention yields three entries per layer with q/k/v suffixes) and
+    exposes the canonical names without each callsite having to
+    reinvent them."""
+    for kind, idx, args in arch_walk(arch):
+        if idx is None:
+            continue
+        for suffix, nw, nb in tensor_specs(kind, *args):
+            wname, bname = tensor_names(kind, idx, suffix)
+            yield (kind, idx, suffix, nw, nb, wname, bname)
 
 
 def weight_size(kind, *args):
@@ -1082,52 +1104,7 @@ def gen_act_decls(arch):
             raise ValueError(
                 f"arch must include at least one size-defining layer; "
                 f"got pseudo-only with first={first[0]!r}")
-    if first[0] == "linear":
-        sizes = [first[1]]
-    elif first[0] == "conv2d_3x3_p1":
-        c_in, _ = first[1], first[2]
-        sizes = [c_in * 28 * 28]
-    elif first[0] == "attention":
-        # Input X is [seq, d_in] flat; size = seq * d_in.
-        seq, d_in, _, _ = first[1], first[2], first[3], first[4]
-        sizes = [seq * d_in]
-    elif first[0] == "multi_head_attention":
-        # Input X is [seq, d_model] flat; size = seq * d_model.
-        seq, d_model, _, _ = first[1], first[2], first[3], first[4]
-        sizes = [seq * d_model]
-    elif first[0] == "multi_head_attention_kv":
-        # Decoder mode — single-token input, d_model wide.
-        _, d_model, _ = first[1], first[2], first[3]
-        sizes = [d_model]
-    elif first[0] == "multi_head_attention_gqa_kv":
-        # GQA decoder mode — single-token input, d_model wide.  Args:
-        # (max_seq, d_model, n_heads, n_kv_heads, theta).
-        _, d_model = first[1], first[2]
-        sizes = [d_model]
-    elif first[0] == "embedding":
-        # Embedding's input is a sequence of token IDs (held in a
-        # separate scratch buffer the input loader fills).  Its OUTPUT
-        # is the [seq, d_model] f32 tensor that becomes a0.
-        _vocab, d_model, seq = first[1], first[2], first[3]
-        sizes = [seq * d_model]
-    elif first[0] == "layernorm":
-        # Input is [K, dim] flat where K = arr_len(input) / dim.  When
-        # LayerNorm is first, the packer can't know K from the arch
-        # alone — default to K=1 (single-row input, common for test
-        # rigs and one-shot inference).  For batch-style usage with
-        # K > 1, prepend a no-op layer (or a placeholder linear with
-        # in_features=K*dim) to fix the input size.
-        sizes = [first[1]]   # = dim
-    elif first[0] == "rmsnorm":
-        # Same single-row default as LayerNorm; same arch-JSON
-        # workaround applies for batched use.
-        sizes = [first[1]]
-    elif first[0] == "swiglu_ffn":
-        # Input dimension is d_model (first arg).
-        sizes = [first[1]]
-    else:
-        raise ValueError(f"first layer must be linear, conv2d_3x3_p1, attention, "
-                         f"or layernorm; got {first[0]!r}")
+    sizes = [first_size_for(first)]
 
     for kind, *args in arch:
         if kind == "linear":
@@ -1234,12 +1211,6 @@ def gen_scratch(arch):
     if multi_convs:
         max_c_in = max(c_in for c_in, _ in multi_convs)
         lines.append(f"    let padded_multi: i32 = arr_f32_new({max_c_in * 900});")
-    pi = 0
-    ai = 0
-    mi = 0
-    gi = 0    # multi_head_attention_gqa_kv counter
-    pei = 0   # positional_embedding counter (for scratch buffer naming)
-    si = 0    # swiglu_ffn counter
     # SwiGLU FFN needs a zero-bias scratch sized to max(d_ffn) across
     # all swiglu layers; matvec wants a real bias buffer (not NULL),
     # and Llama's FFN has zero biases by convention.  One shared buffer
@@ -1249,7 +1220,9 @@ def gen_scratch(arch):
         zb = max(swiglu_dffns)
         lines.append(f"    let _zb_swg: i32 = arr_f32_new({zb});")
         lines.append(f"    arr_f32_fill(_zb_swg, 0.0);")
-    for kind, *args in arch:
+    pi = 0   # maxpool_2x2 counter (manual; not in arch_walk because it
+             # has no tensor_specs entry — see _ARCH_WALK_COUNTER_KEY)
+    for kind, idx, args in arch_walk(arch):
         if kind == "maxpool_2x2":
             c = args[0]
             lines.append(f"    let pool_a{pi}: i32 = arr_f32_new({c * 14 * 14});")
@@ -1257,9 +1230,8 @@ def gen_scratch(arch):
         elif kind == "attention":
             seq, d_in, d_head, causal = args
             lines.append(
-                f"    let attn_desc_{ai}: i32 = "
+                f"    let attn_desc_{idx}: i32 = "
                 f"attn_alloc_desc_f32({seq}, {d_in}, {d_head}, {causal});")
-            ai += 1
         elif kind == "embedding":
             # No descriptor or scratch needed — the embedding forward
             # reads token IDs directly from the input-loader-emitted
@@ -1275,8 +1247,7 @@ def gen_scratch(arch):
             max_pos, d_model, seq = args
             if not decoder_mode:
                 lines.append(
-                    f"    let pe_window_{pei}: i32 = arr_f32_new({seq * d_model});")
-            pei += 1
+                    f"    let pe_window_{idx}: i32 = arr_f32_new({seq * d_model});")
         elif kind == "multi_head_attention":
             seq, d_model, n_heads, causal = args
             d_head = d_model // n_heads
@@ -1288,20 +1259,19 @@ def gen_scratch(arch):
             # loop, so reusing one scratch would let the V slice clobber
             # Q before Q's matvec runs.
             lines.append(
-                f"    let mha_desc_{mi}: i32 = "
+                f"    let mha_desc_{idx}: i32 = "
                 f"attn_alloc_desc_f32({seq}, {d_model}, {d_head}, {causal});")
             for proj in ("q", "k", "v"):
                 lines.append(
-                    f"    let mha_W{proj}slice_{mi}: i32 = "
+                    f"    let mha_W{proj}slice_{idx}: i32 = "
                     f"arr_f32_new({d_head * d_model});")
                 lines.append(
-                    f"    let mha_b{proj}slice_{mi}: i32 = "
+                    f"    let mha_b{proj}slice_{idx}: i32 = "
                     f"arr_f32_new({d_head});")
             lines.append(
-                f"    let mha_head_out_{mi}: i32 = arr_f32_new({seq * d_head});")
+                f"    let mha_head_out_{idx}: i32 = arr_f32_new({seq * d_head});")
             lines.append(
-                f"    let mha_concat_{mi}: i32 = arr_f32_new({seq * d_model});")
-            mi += 1
+                f"    let mha_concat_{idx}: i32 = arr_f32_new({seq * d_model});")
         elif kind == "multi_head_attention_kv":
             # Decode-time MHA: one persistent attn_mh_kv state per layer
             # holds the K/V cache plus all per-head slice scratches.
@@ -1311,19 +1281,22 @@ def gen_scratch(arch):
             # rebinding.  The X (input) and out (output) slots stay
             # rebindable since the per-step forward chooses fresh
             # activation buffers each iteration.
+            #
+            # `idx` here is the SHARED multi_head_attention counter
+            # (mi-equivalent), so the Wmq{idx}/bmq{idx} names line up
+            # with whatever weight_tensors / gen_load emitted.
             max_seq, d_model, n_heads = args
             lines.append(
-                f"    let mhkv_state_{mi}: i32 = "
+                f"    let mhkv_state_{idx}: i32 = "
                 f"attn_mh_kv_alloc_f32({max_seq}, {d_model}, {n_heads});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 1, Wmq{mi});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 2, bmq{mi});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 3, Wmk{mi});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 4, bmk{mi});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 5, Wmv{mi});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 6, bmv{mi});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 7, Wmo{mi});")
-            lines.append(f"    arr_set(mhkv_state_{mi}, 8, bmo{mi});")
-            mi += 1
+            lines.append(f"    arr_set(mhkv_state_{idx}, 1, Wmq{idx});")
+            lines.append(f"    arr_set(mhkv_state_{idx}, 2, bmq{idx});")
+            lines.append(f"    arr_set(mhkv_state_{idx}, 3, Wmk{idx});")
+            lines.append(f"    arr_set(mhkv_state_{idx}, 4, bmk{idx});")
+            lines.append(f"    arr_set(mhkv_state_{idx}, 5, Wmv{idx});")
+            lines.append(f"    arr_set(mhkv_state_{idx}, 6, bmv{idx});")
+            lines.append(f"    arr_set(mhkv_state_{idx}, 7, Wmo{idx});")
+            lines.append(f"    arr_set(mhkv_state_{idx}, 8, bmo{idx});")
         elif kind == "multi_head_attention_gqa_kv":
             # Llama-style GQA decode step: persistent state holds RoPE
             # table + n_kv_heads KV caches + per-head slice scratches.
@@ -1332,24 +1305,22 @@ def gen_scratch(arch):
             # internal zero-fill scratches.
             max_seq, d_model, n_heads, n_kv_heads, theta = args
             lines.append(
-                f"    let gqa_state_{gi}: i32 = "
+                f"    let gqa_state_{idx}: i32 = "
                 f"attn_gqa_kv_alloc_f32({max_seq}, {d_model}, {n_heads}, "
                 f"{n_kv_heads}, {theta!r});")
-            lines.append(f"    arr_set(gqa_state_{gi}, 1, Wgqaq{gi});")
-            lines.append(f"    arr_set(gqa_state_{gi}, 3, Wgqak{gi});")
-            lines.append(f"    arr_set(gqa_state_{gi}, 5, Wgqav{gi});")
-            lines.append(f"    arr_set(gqa_state_{gi}, 7, Wgqao{gi});")
-            gi += 1
+            lines.append(f"    arr_set(gqa_state_{idx}, 1, Wgqaq{idx});")
+            lines.append(f"    arr_set(gqa_state_{idx}, 3, Wgqak{idx});")
+            lines.append(f"    arr_set(gqa_state_{idx}, 5, Wgqav{idx});")
+            lines.append(f"    arr_set(gqa_state_{idx}, 7, Wgqao{idx});")
         elif kind == "swiglu_ffn":
             # Per-layer gate / up scratches sized to d_ffn.  silu_mul
             # writes silu(gate)*up into the up buffer in place; the
             # final down matvec reads from the up buffer.
             d_model, d_ffn = args
             lines.append(
-                f"    let _swg_gate_{si}: i32 = arr_f32_new({d_ffn});")
+                f"    let _swg_gate_{idx}: i32 = arr_f32_new({d_ffn});")
             lines.append(
-                f"    let _swg_up_{si}: i32 = arr_f32_new({d_ffn});")
-            si += 1
+                f"    let _swg_up_{idx}: i32 = arr_f32_new({d_ffn});")
     # Residual slot buffers: one per save_residual entry, sized to the
     # activation count at the save point (= same as the matched add).
     for slot_idx, n_elems in residual_slots(arch):
@@ -1378,28 +1349,7 @@ def gen_scratch(arch):
         # Detect whether ANY Linear is batched by walking arch with a
         # cur_size tracker (mirrors gen_act_decls' batch logic).
         first_lin = next((l for l in arch if l[0] not in PSEUDO_OPS), None)
-        if first_lin is not None:
-            if first_lin[0] == "linear":
-                cur = first_lin[1]
-            elif first_lin[0] == "conv2d_3x3_p1":
-                cur = first_lin[1] * 28 * 28
-            elif first_lin[0] == "attention":
-                cur = first_lin[1] * first_lin[2]
-            elif first_lin[0] == "multi_head_attention":
-                cur = first_lin[1] * first_lin[2]
-            elif first_lin[0] == "multi_head_attention_kv":
-                # Always operates on a single token → cur is just d_model.
-                cur = first_lin[2]
-            elif first_lin[0] == "multi_head_attention_gqa_kv":
-                # Llama-style GQA — same single-token contract.
-                cur = first_lin[2]
-            elif first_lin[0] == "embedding":
-                # ["embedding", vocab, d_model, seq] → output [seq, d_model]
-                cur = first_lin[3] * first_lin[2]
-            else:
-                cur = 0
-        else:
-            cur = 0
+        cur = first_size_for(first_lin) if first_lin is not None else 0
         any_batched = False
         for kind, *args in arch:
             if kind == "linear":
@@ -1430,28 +1380,9 @@ def gen_scratch(arch):
             # Linears actually emit the batched loop (and therefore
             # need their per-Linear scratch).  Linears that fit the
             # seq=1 path don't need it.
-            cur2 = cur_first if (cur_first := cur) else 0
             # Re-walk: replicate the cur tracking from earlier so we
             # only allocate scratch for Linears that actually batch.
-            # (Hoisted out so the walker logic stays readable.)
-            cur2 = 0
-            if first_lin is not None:
-                if first_lin[0] == "linear":
-                    cur2 = first_lin[1]
-                elif first_lin[0] == "conv2d_3x3_p1":
-                    cur2 = first_lin[1] * 28 * 28
-                elif first_lin[0] == "attention":
-                    cur2 = first_lin[1] * first_lin[2]
-                elif first_lin[0] == "multi_head_attention":
-                    cur2 = first_lin[1] * first_lin[2]
-                elif first_lin[0] == "multi_head_attention_kv":
-                    cur2 = first_lin[2]
-                elif first_lin[0] == "multi_head_attention_gqa_kv":
-                    cur2 = first_lin[2]
-                elif first_lin[0] == "swiglu_ffn":
-                    cur2 = first_lin[1]
-                elif first_lin[0] == "embedding":
-                    cur2 = first_lin[3] * first_lin[2]
+            cur2 = first_size_for(first_lin) if first_lin is not None else 0
             li2 = 0
             for kind, *args in arch:
                 if kind == "linear":
@@ -1601,17 +1532,8 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     """
     lines = []
     cur_a = 0
-    li = 0
-    ci = 0
-    pi = 0
-    ai = 0
-    ni = 0
-    mi = 0
-    gi = 0   # multi_head_attention_gqa_kv counter
-    ei = 0
-    pei = 0
-    ri = 0
-    si = 0
+    pi = 0   # maxpool_2x2 counter (manual; not in arch_walk because
+             # maxpool has no tensor_specs entry)
     # Stack of (slot_idx, n_elems) for every save_residual we've emitted
     # but not yet matched with an add_residual.  Pre-validated by
     # residual_slots (called from gen_scratch); here we just track
@@ -1623,39 +1545,38 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     # emit a per-row loop.  Could share the list with gen_act_decls'
     # return value, but recomputing is cheaper than threading through.
     _, sizes_for_seq = gen_act_decls(arch)
-    for kind, *args in arch:
+    for kind, idx, args in arch_walk(arch):
         if kind == "linear":
             in_f, out_f = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            sc = scales.get(("linear", li, "W")) if scales else None
+            sc = scales.get(("linear", idx, "W")) if scales else None
             cur_size = sizes_for_seq[cur_a]
             seq_in = cur_size // in_f if (cur_size >= in_f and cur_size % in_f == 0) else 1
-            lines += emit_linear(li, in_f, out_f, src, dst,
-                                 f"W{li}", f"b{li}", quant_scale=sc,
+            lines += emit_linear(idx, in_f, out_f, src, dst,
+                                 f"W{idx}", f"b{idx}", quant_scale=sc,
                                  seq=seq_in)
             cur_a += 1
-            li += 1
         elif kind == "conv2d_3x3_p1":
             c_in, c_out = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            conv_scale = scales.get(("conv2d_3x3_p1", ci, "W")) if scales else None
+            conv_scale = scales.get(("conv2d_3x3_p1", idx, "W")) if scales else None
             if c_in == 1:
                 # Fast path: single-channel input goes straight into the
                 # AVX2 builtin.  Pad once, call once.  The int8 variant
                 # carries the per-tensor scale and reads weights as i8;
                 # otherwise fall back to the f32 conv builtin.
                 lines.append(f"    arr_f32_fill(padded, 0.0);")
-                lines.append(f"    let _y{ci}: i32 = 0;")
-                lines.append(f"    while (_y{ci} < 28) {{")
-                lines.append(f"        arr_f32_copy_slice({src}, _y{ci} * 28, padded, (_y{ci} + 1) * 30 + 1, 28);")
-                lines.append(f"        _y{ci} = _y{ci} + 1;")
+                lines.append(f"    let _y{idx}: i32 = 0;")
+                lines.append(f"    while (_y{idx} < 28) {{")
+                lines.append(f"        arr_f32_copy_slice({src}, _y{idx} * 28, padded, (_y{idx} + 1) * 30 + 1, 28);")
+                lines.append(f"        _y{idx} = _y{idx} + 1;")
                 lines.append(f"    }}")
                 if conv_scale is not None:
-                    lines.append(f"    arr_i8_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out}, {conv_scale!r});")
+                    lines.append(f"    arr_i8_conv2d_3x3_p1(padded, Wc{idx}, bc{idx}, {dst}, {c_out}, {conv_scale!r});")
                 else:
-                    lines.append(f"    arr_f32_conv2d_3x3_p1(padded, Wc{ci}, bc{ci}, {dst}, {c_out});")
+                    lines.append(f"    arr_f32_conv2d_3x3_p1(padded, Wc{idx}, bc{idx}, {dst}, {c_out});")
             else:
                 # Multi-channel input: pad each input channel into the
                 # shared padded_multi [C_in, 30, 30] buffer and call the
@@ -1664,25 +1585,24 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
                 # — the kernel does the load-modify-store accumulation
                 # internally and broadcasts bias once per c_out.
                 lines.append(f"    arr_f32_fill(padded_multi, 0.0);")
-                lines.append(f"    let _cin{ci}: i32 = 0;")
-                lines.append(f"    while (_cin{ci} < {c_in}) {{")
-                lines.append(f"        let _yc{ci}: i32 = 0;")
-                lines.append(f"        while (_yc{ci} < 28) {{")
-                lines.append(f"            arr_f32_copy_slice({src}, _cin{ci} * 784 + _yc{ci} * 28, padded_multi, _cin{ci} * 900 + (_yc{ci} + 1) * 30 + 1, 28);")
-                lines.append(f"            _yc{ci} = _yc{ci} + 1;")
+                lines.append(f"    let _cin{idx}: i32 = 0;")
+                lines.append(f"    while (_cin{idx} < {c_in}) {{")
+                lines.append(f"        let _yc{idx}: i32 = 0;")
+                lines.append(f"        while (_yc{idx} < 28) {{")
+                lines.append(f"            arr_f32_copy_slice({src}, _cin{idx} * 784 + _yc{idx} * 28, padded_multi, _cin{idx} * 900 + (_yc{idx} + 1) * 30 + 1, 28);")
+                lines.append(f"            _yc{idx} = _yc{idx} + 1;")
                 lines.append(f"        }}")
-                lines.append(f"        _cin{ci} = _cin{ci} + 1;")
+                lines.append(f"        _cin{idx} = _cin{idx} + 1;")
                 lines.append(f"    }}")
                 if conv_scale is not None and multi_int8_runtime:
                     # int8 weights stay int8 in RAM — no startup dequant.
-                    lines.append(f"    arr_i8_conv2d_3x3_p1_multi(padded_multi, Wc{ci}, bc{ci}, {dst}, {c_out}, {conv_scale!r});")
+                    lines.append(f"    arr_i8_conv2d_3x3_p1_multi(padded_multi, Wc{idx}, bc{idx}, {dst}, {c_out}, {conv_scale!r});")
                 else:
                     # f32 multi-channel kernel handles both the
                     # plain-f32 case and the int8-dequantised-at-startup
-                    # case (Wc{ci} is f32 in RAM in both).
-                    lines.append(f"    arr_f32_conv2d_3x3_p1_multi(padded_multi, {c_in}, Wc{ci}, bc{ci}, {dst}, {c_out});")
+                    # case (Wc{idx} is f32 in RAM in both).
+                    lines.append(f"    arr_f32_conv2d_3x3_p1_multi(padded_multi, {c_in}, Wc{idx}, bc{idx}, {dst}, {c_out});")
             cur_a += 1
-            ci += 1
         elif kind == "maxpool_2x2":
             c = args[0]
             src = f"a{cur_a}"
@@ -1722,35 +1642,32 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             dim = args[0]
             src = f"a{cur_a}"
             lines.append(
-                f"    layernorm_affine_f32({src}, {dim}, Wn{ni}, bn{ni});")
-            ni += 1
+                f"    layernorm_affine_f32({src}, {dim}, Wn{idx}, bn{idx});")
         elif kind == "rmsnorm":
             # In-place RMSNorm with affine γ (no β).  Llama / Mistral.
             dim = args[0]
             src = f"a{cur_a}"
             lines.append(
-                f"    rmsnorm_affine_f32({src}, {dim}, Wr{ri});")
-            ri += 1
+                f"    rmsnorm_affine_f32({src}, {dim}, Wr{idx});")
         elif kind == "swiglu_ffn":
             # Llama-style FFN: down(silu(gate(x)) * up(x)).  Three
             # matvecs + one element-wise silu*mul.  No biases.
             d_model, d_ffn = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            lines.append(f"    // swiglu_ffn {si}: d_model={d_model} d_ffn={d_ffn}")
+            lines.append(f"    // swiglu_ffn {idx}: d_model={d_model} d_ffn={d_ffn}")
             lines.append(
-                f"    arr_f32_matvec(Wswgate{si}, {src}, _zb_swg, "
-                f"_swg_gate_{si}, {d_ffn}, {d_model});")
+                f"    arr_f32_matvec(Wswgate{idx}, {src}, _zb_swg, "
+                f"_swg_gate_{idx}, {d_ffn}, {d_model});")
             lines.append(
-                f"    arr_f32_matvec(Wswup{si}, {src}, _zb_swg, "
-                f"_swg_up_{si}, {d_ffn}, {d_model});")
+                f"    arr_f32_matvec(Wswup{idx}, {src}, _zb_swg, "
+                f"_swg_up_{idx}, {d_ffn}, {d_model});")
             lines.append(
-                f"    silu_mul_f32(_swg_gate_{si}, _swg_up_{si}, {d_ffn});")
+                f"    silu_mul_f32(_swg_gate_{idx}, _swg_up_{idx}, {d_ffn});")
             lines.append(
-                f"    arr_f32_matvec(Wswdown{si}, _swg_up_{si}, _zb_swg, "
+                f"    arr_f32_matvec(Wswdown{idx}, _swg_up_{idx}, _zb_swg, "
                 f"{dst}, {d_model}, {d_ffn});")
             cur_a += 1
-            si += 1
         elif kind == "attention":
             # Single-head scaled dot-product attention.
             # The descriptor was allocated once in gen_scratch; here we
@@ -1761,18 +1678,17 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             seq, d_in, d_head, causal = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            d = f"attn_desc_{ai}"
+            d = f"attn_desc_{idx}"
             lines.append(f"    arr_set({d},  0, {src});")
-            lines.append(f"    arr_set({d},  1, Wq{ai});")
-            lines.append(f"    arr_set({d},  2, bq{ai});")
-            lines.append(f"    arr_set({d},  3, Wk{ai});")
-            lines.append(f"    arr_set({d},  4, bk{ai});")
-            lines.append(f"    arr_set({d},  5, Wv{ai});")
-            lines.append(f"    arr_set({d},  6, bv{ai});")
+            lines.append(f"    arr_set({d},  1, Wq{idx});")
+            lines.append(f"    arr_set({d},  2, bq{idx});")
+            lines.append(f"    arr_set({d},  3, Wk{idx});")
+            lines.append(f"    arr_set({d},  4, bk{idx});")
+            lines.append(f"    arr_set({d},  5, Wv{idx});")
+            lines.append(f"    arr_set({d},  6, bv{idx});")
             lines.append(f"    arr_set({d}, 11, {dst});")
             lines.append(f"    attention_forward_f32({d});")
             cur_a += 1
-            ai += 1
         elif kind == "multi_head_attention":
             # Multi-head SDPA = single-head SDPA per head, with weights
             # sliced from (d_model, d_model) into per-head (d_head, d_model)
@@ -1783,13 +1699,13 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             d_head = d_model // n_heads
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            d = f"mha_desc_{mi}"
-            ho = f"mha_head_out_{mi}"
-            cc = f"mha_concat_{mi}"
-            lines.append(f"    // multi_head_attention {mi}: "
+            d = f"mha_desc_{idx}"
+            ho = f"mha_head_out_{idx}"
+            cc = f"mha_concat_{idx}"
+            lines.append(f"    // multi_head_attention {idx}: "
                          f"d_model={d_model} n_heads={n_heads} d_head={d_head}")
-            lines.append(f"    let _mh{mi}: i32 = 0;")
-            lines.append(f"    while (_mh{mi} < {n_heads}) {{")
+            lines.append(f"    let _mh{idx}: i32 = 0;")
+            lines.append(f"    while (_mh{idx} < {n_heads}) {{")
             # Slice per-head Q/K/V W and b out of the full d_model tensors
             # into separate scratches; the project pass inside
             # attention_forward_f32 reads all three in the same loop, so
@@ -1797,18 +1713,18 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             # weights stay in their (d_model, d_model) layout and we
             # copy the contiguous d_head-row chunk for the current head.
             for proj in ("q", "k", "v"):
-                W_full = f"Wm{proj}{mi}"
-                b_full = f"bm{proj}{mi}"
-                ws = f"mha_W{proj}slice_{mi}"
-                bs = f"mha_b{proj}slice_{mi}"
+                W_full = f"Wm{proj}{idx}"
+                b_full = f"bm{proj}{idx}"
+                ws = f"mha_W{proj}slice_{idx}"
+                bs = f"mha_b{proj}slice_{idx}"
                 slot_w = {"q": 1, "k": 3, "v": 5}[proj]
                 slot_b = {"q": 2, "k": 4, "v": 6}[proj]
                 lines.append(
                     f"        arr_f32_copy_slice({W_full}, "
-                    f"_mh{mi} * {d_head * d_model}, {ws}, 0, {d_head * d_model});")
+                    f"_mh{idx} * {d_head * d_model}, {ws}, 0, {d_head * d_model});")
                 lines.append(
                     f"        arr_f32_copy_slice({b_full}, "
-                    f"_mh{mi} * {d_head}, {bs}, 0, {d_head});")
+                    f"_mh{idx} * {d_head}, {bs}, 0, {d_head});")
                 lines.append(f"        arr_set({d}, {slot_w}, {ws});")
                 lines.append(f"        arr_set({d}, {slot_b}, {bs});")
             lines.append(f"        arr_set({d}, 0, {src});")
@@ -1816,59 +1732,61 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(f"        attention_forward_f32({d});")
             # Concat: per row, copy d_head elements from ho into cc at
             # offset row*d_model + h*d_head.
-            lines.append(f"        let _mr{mi}: i32 = 0;")
-            lines.append(f"        while (_mr{mi} < {seq}) {{")
+            lines.append(f"        let _mr{idx}: i32 = 0;")
+            lines.append(f"        while (_mr{idx} < {seq}) {{")
             lines.append(
-                f"            arr_f32_copy_slice({ho}, _mr{mi} * {d_head}, "
-                f"{cc}, _mr{mi} * {d_model} + _mh{mi} * {d_head}, {d_head});")
-            lines.append(f"            _mr{mi} = _mr{mi} + 1;")
+                f"            arr_f32_copy_slice({ho}, _mr{idx} * {d_head}, "
+                f"{cc}, _mr{idx} * {d_model} + _mh{idx} * {d_head}, {d_head});")
+            lines.append(f"            _mr{idx} = _mr{idx} + 1;")
             lines.append(f"        }}")
-            lines.append(f"        _mh{mi} = _mh{mi} + 1;")
+            lines.append(f"        _mh{idx} = _mh{idx} + 1;")
             lines.append(f"    }}")
             # Output projection: dst[r] = Wo · cc[r] + bo, per row.
-            lines.append(f"    let _mp{mi}: i32 = 0;")
-            lines.append(f"    while (_mp{mi} < {seq}) {{")
+            lines.append(f"    let _mp{idx}: i32 = 0;")
+            lines.append(f"    while (_mp{idx} < {seq}) {{")
             lines.append(
-                f"        arr_f32_copy_slice({cc}, _mp{mi} * {d_model}, "
+                f"        arr_f32_copy_slice({cc}, _mp{idx} * {d_model}, "
                 f"_row_in, 0, {d_model});")
             lines.append(
-                f"        arr_f32_matvec(Wmo{mi}, _row_in, bmo{mi}, "
+                f"        arr_f32_matvec(Wmo{idx}, _row_in, bmo{idx}, "
                 f"_row_out, {d_model}, {d_model});")
             lines.append(
                 f"        arr_f32_copy_slice(_row_out, 0, {dst}, "
-                f"_mp{mi} * {d_model}, {d_model});")
-            lines.append(f"        _mp{mi} = _mp{mi} + 1;")
+                f"_mp{idx} * {d_model}, {d_model});")
+            lines.append(f"        _mp{idx} = _mp{idx} + 1;")
             lines.append(f"    }}")
             cur_a += 1
-            mi += 1
         elif kind == "multi_head_attention_kv":
             # KV-cached MHA decode step.  All heads + Q/K/V/O projection
             # + cache append + scaled-softmax-against-cache + concat
             # happens inside attn_mh_kv_step_f32 against the persistent
-            # mhkv_state_{mi} (allocated and weight-bound in gen_scratch).
+            # mhkv_state_{idx} (allocated and weight-bound in gen_scratch).
             # Per token we just rebind input + output and call once.
+            #
+            # `idx` here is the SHARED multi_head_attention counter
+            # (mi-equivalent), so the Wmq{idx} / mhkv_state_{idx} names
+            # match what gen_scratch and weight_tensors emitted.
             max_seq, d_model, n_heads = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            s = f"mhkv_state_{mi}"
-            lines.append(f"    // multi_head_attention_kv {mi}: "
+            s = f"mhkv_state_{idx}"
+            lines.append(f"    // multi_head_attention_kv {idx}: "
                          f"d_model={d_model} n_heads={n_heads} max_seq={max_seq}")
             lines.append(f"    arr_set({s}, 0, {src});")
             lines.append(f"    arr_set({s}, 9, {dst});")
             lines.append(f"    attn_mh_kv_step_f32({s});")
             cur_a += 1
-            mi += 1
         elif kind == "multi_head_attention_gqa_kv":
             # Llama-style GQA decode step.  RoPE + per-KV-head cache +
             # per-Q-head scoring + output projection all live inside
-            # attn_gqa_kv_step_f32 against gqa_state_{gi} (alloc + weight
+            # attn_gqa_kv_step_f32 against gqa_state_{idx} (alloc + weight
             # binding emitted in gen_scratch).  Per token we just bind
             # X + out and call once.
             max_seq, d_model, n_heads, n_kv_heads, theta = args
             src = f"a{cur_a}"
             dst = f"a{cur_a + 1}"
-            s = f"gqa_state_{gi}"
-            lines.append(f"    // multi_head_attention_gqa_kv {gi}: "
+            s = f"gqa_state_{idx}"
+            lines.append(f"    // multi_head_attention_gqa_kv {idx}: "
                          f"d_model={d_model} n_heads={n_heads} "
                          f"n_kv_heads={n_kv_heads} theta={theta!r} "
                          f"max_seq={max_seq}")
@@ -1876,7 +1794,6 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(f"    arr_set({s}, 9, {dst});")
             lines.append(f"    attn_gqa_kv_step_f32({s});")
             cur_a += 1
-            gi += 1
         elif kind == "flatten":
             # Reshape only — same buffer holds the data.  No code emitted.
             pass
@@ -1900,37 +1817,36 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             vocab_size, d_model, seq = args
             if cur_a != 0:
                 raise SystemExit(
-                    f"embedding #{ei} must be the first layer; today the "
+                    f"embedding #{idx} must be the first layer; today the "
                     "packer only emits a token-input loader for the "
                     "leading position.")
             tb = _embedding_token_bytes(vocab_size)
             dst = f"a{cur_a}"
             lines.append(
-                f"    // embedding {ei}: vocab={vocab_size} d_model={d_model} "
+                f"    // embedding {idx}: vocab={vocab_size} d_model={d_model} "
                 f"seq={seq} ({tb} byte/token)")
-            lines.append(f"    let _ei{ei}: i32 = 0;")
-            lines.append(f"    while (_ei{ei} < {seq}) {{")
+            lines.append(f"    let _ei{idx}: i32 = 0;")
+            lines.append(f"    while (_ei{idx} < {seq}) {{")
             if tb == 1:
                 lines.append(
-                    f"        let _tok{ei}: i32 = byte_at(_toks_raw, _ei{ei});")
+                    f"        let _tok{idx}: i32 = byte_at(_toks_raw, _ei{idx});")
             elif tb == 2:
                 lines.append(
-                    f"        let _tok{ei}: i32 = "
-                    f"byte_at(_toks_raw, _ei{ei} * 2) + "
-                    f"byte_at(_toks_raw, _ei{ei} * 2 + 1) * 256;")
+                    f"        let _tok{idx}: i32 = "
+                    f"byte_at(_toks_raw, _ei{idx} * 2) + "
+                    f"byte_at(_toks_raw, _ei{idx} * 2 + 1) * 256;")
             else:   # tb == 4
                 lines.append(
-                    f"        let _tok{ei}: i32 = "
-                    f"byte_at(_toks_raw, _ei{ei} * 4) + "
-                    f"byte_at(_toks_raw, _ei{ei} * 4 + 1) * 256 + "
-                    f"byte_at(_toks_raw, _ei{ei} * 4 + 2) * 65536 + "
-                    f"byte_at(_toks_raw, _ei{ei} * 4 + 3) * 16777216;")
+                    f"        let _tok{idx}: i32 = "
+                    f"byte_at(_toks_raw, _ei{idx} * 4) + "
+                    f"byte_at(_toks_raw, _ei{idx} * 4 + 1) * 256 + "
+                    f"byte_at(_toks_raw, _ei{idx} * 4 + 2) * 65536 + "
+                    f"byte_at(_toks_raw, _ei{idx} * 4 + 3) * 16777216;")
             lines.append(
-                f"        arr_f32_copy_slice(Wemb{ei}, _tok{ei} * {d_model}, "
-                f"{dst}, _ei{ei} * {d_model}, {d_model});")
-            lines.append(f"        _ei{ei} = _ei{ei} + 1;")
+                f"        arr_f32_copy_slice(Wemb{idx}, _tok{idx} * {d_model}, "
+                f"{dst}, _ei{idx} * {d_model}, {d_model});")
+            lines.append(f"        _ei{idx} = _ei{idx} + 1;")
             lines.append(f"    }}")
-            ei += 1
             # cur_a stays at 0; the embedding's output IS a0.
         elif kind == "positional_embedding":
             # Add the leading seq*d_model slice of W_pos in-place to
@@ -1938,12 +1854,11 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             # arr_f32_add_scaled (whole-array) can fold it back.
             max_pos, d_model, seq = args
             lines.append(
-                f"    arr_f32_copy_slice(Wpos{pei}, 0, "
-                f"pe_window_{pei}, 0, {seq * d_model});")
+                f"    arr_f32_copy_slice(Wpos{idx}, 0, "
+                f"pe_window_{idx}, 0, {seq * d_model});")
             lines.append(
                 f"    arr_f32_add_scaled(a{cur_a}, "
-                f"pe_window_{pei}, 1.0);")
-            pei += 1
+                f"pe_window_{idx}, 1.0);")
         elif kind == "save_residual":
             slot_idx = next_resid_slot
             next_resid_slot += 1
@@ -2551,37 +2466,32 @@ def main():
             li += 1
 
     # Collect (kind, idx, W, b) tuples in arch order so the staging-file
-    # writer can name them consistently.
+    # writer can name them consistently.  `arch_walk` supplies the
+    # shared per-kind index — the same one weight_tensors / gen_scratch
+    # / gen_forward consume, so naming stays consistent across the four
+    # walkers without needing five hand-rolled `<op>i += 1` blocks.
     collected = []   # list of (kind, idx, suffix, W_array, b_array)
-    li = 0
-    ci = 0
-    ai = 0
-    ni = 0
-    mi = 0
-    gi = 0   # multi_head_attention_gqa_kv counter
-    ei = 0
-    pei = 0
-    ri = 0
-    si = 0
-    for kind, *largs in arch:
+    import numpy as _np
+    for kind, idx, largs in arch_walk(arch):
+        if idx is None:
+            continue   # pseudo-op (residual / activation / flatten) — no weights.
         if kind == "linear":
             in_f, out_f = largs
-            wkey = keys(li, "weight")
-            bkey = keys(li, "bias")
+            wkey = keys(idx, "weight")
+            bkey = keys(idx, "bias")
             if wkey not in sd or bkey not in sd:
                 raise SystemExit(
-                    f"linear #{li}: missing '{wkey}' or '{bkey}' in checkpoint. "
+                    f"linear #{idx}: missing '{wkey}' or '{bkey}' in checkpoint. "
                     f"Available keys: {sorted(sd.keys())}"
                 )
             W = sd[wkey].detach().cpu().numpy().astype("float32")
             b = sd[bkey].detach().cpu().numpy().astype("float32")
             if W.shape != (out_f, in_f) or b.shape != (out_f,):
                 raise SystemExit(
-                    f"linear #{li}: shape mismatch.  expected ({out_f},{in_f}) "
+                    f"linear #{idx}: shape mismatch.  expected ({out_f},{in_f}) "
                     f"+ ({out_f},); got {tuple(W.shape)} + {tuple(b.shape)}."
                 )
-            collected.append(("linear", li, "", W, b))
-            li += 1
+            collected.append(("linear", idx, "", W, b))
         elif kind == "conv2d_3x3_p1":
             c_in, c_out = largs
             # Conv keys default to {idx_plus_1}.weight; if the user kept
@@ -2591,32 +2501,31 @@ def main():
             # (i.e. "1.weight") doesn't clash with fc names.  Real users
             # can pass --conv-keys later; v0.4 supports the simple case.
             wkey = sd_lookup(sd, ["conv.weight",
-                                  f"conv{ci + 1}.weight",
-                                  f"layers.{ci}.weight",
-                                  keys(ci, "weight")])
+                                  f"conv{idx + 1}.weight",
+                                  f"layers.{idx}.weight",
+                                  keys(idx, "weight")])
             bkey = sd_lookup(sd, ["conv.bias",
-                                  f"conv{ci + 1}.bias",
-                                  f"layers.{ci}.bias",
-                                  keys(ci, "bias")])
+                                  f"conv{idx + 1}.bias",
+                                  f"layers.{idx}.bias",
+                                  keys(idx, "bias")])
             if wkey is None or bkey is None:
                 raise SystemExit(
-                    f"conv2d_3x3_p1 #{ci}: cannot find weight/bias in "
-                    f"checkpoint.  Tried: conv.weight / layers.{ci}.weight / "
-                    f"{keys(ci, 'weight')}.  Available: {sorted(sd.keys())}"
+                    f"conv2d_3x3_p1 #{idx}: cannot find weight/bias in "
+                    f"checkpoint.  Tried: conv.weight / layers.{idx}.weight / "
+                    f"{keys(idx, 'weight')}.  Available: {sorted(sd.keys())}"
                 )
             W = sd[wkey].detach().cpu().numpy().astype("float32")
             b = sd[bkey].detach().cpu().numpy().astype("float32")
             if W.shape != (c_out, c_in, 3, 3) or b.shape != (c_out,):
                 raise SystemExit(
-                    f"conv2d_3x3_p1 #{ci}: shape mismatch.  expected "
+                    f"conv2d_3x3_p1 #{idx}: shape mismatch.  expected "
                     f"({c_out},{c_in},3,3) + ({c_out},); got "
                     f"{tuple(W.shape)} + {tuple(b.shape)}."
                 )
             # Flatten (C_out, C_in, 3, 3) → (C_out, C_in*9) row-major to
             # match arr_f32_conv2d_3x3_p1's expected weight layout.
             W = W.reshape(c_out, c_in * 9)
-            collected.append(("conv2d_3x3_p1", ci, "", W, b))
-            ci += 1
+            collected.append(("conv2d_3x3_p1", idx, "", W, b))
         elif kind == "attention":
             # ["attention", seq, d_in, d_head, causal]
             # Three projections — Q, K, V — each loaded as a separate
@@ -2629,15 +2538,15 @@ def main():
                     f"{proj}_proj.weight",
                     f"attn.{proj}_proj.weight",
                     f"attention.{proj}_proj.weight",
-                    f"layers.{ai}.attn.{proj}_proj.weight",
-                    f"layers.{ai}.{proj}_proj.weight",
+                    f"layers.{idx}.attn.{proj}_proj.weight",
+                    f"layers.{idx}.{proj}_proj.weight",
                 ]
                 candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
                 wkey = sd_lookup(sd, candidates_w)
                 bkey = sd_lookup(sd, candidates_b)
                 if wkey is None or bkey is None:
                     raise SystemExit(
-                        f"attention #{ai}: missing {proj}_proj weight or bias.  "
+                        f"attention #{idx}: missing {proj}_proj weight or bias.  "
                         f"Tried: {candidates_w[0]} / "
                         f"{candidates_w[3]}.  "
                         f"Available: {sorted(sd.keys())}"
@@ -2646,12 +2555,11 @@ def main():
                 b = sd[bkey].detach().cpu().numpy().astype("float32")
                 if W.shape != (d_head, d_in) or b.shape != (d_head,):
                     raise SystemExit(
-                        f"attention #{ai} {proj}_proj: shape mismatch. "
+                        f"attention #{idx} {proj}_proj: shape mismatch. "
                         f"expected ({d_head},{d_in}) + ({d_head},); got "
                         f"{tuple(W.shape)} + {tuple(b.shape)}."
                     )
-                collected.append(("attention", ai, proj, W, b))
-            ai += 1
+                collected.append(("attention", idx, proj, W, b))
         elif kind == "multi_head_attention":
             seq, d_model, n_heads, causal = largs
             # Q/K/V/O projections — same key-pattern set as single-head
@@ -2671,20 +2579,20 @@ def main():
                     f"{hf_key}.weight",
                     f"attn.{hf_key}.weight",
                     f"attention.{hf_key}.weight",
-                    f"layers.{mi}.attn.{hf_key}.weight",
-                    f"layers.{mi}.{hf_key}.weight",
+                    f"layers.{idx}.attn.{hf_key}.weight",
+                    f"layers.{idx}.{hf_key}.weight",
                     # Llama prefill mode (mirrors the GQA-KV path).
-                    f"model.layers.{mi}.self_attn.{hf_key}.weight",
+                    f"model.layers.{idx}.self_attn.{hf_key}.weight",
                     # distilbert: transformer.layer.{i}.attention.q_lin.weight
-                    f"transformer.layer.{mi}.attention.{dbert_key}.weight",
-                    f"layer.{mi}.attention.{dbert_key}.weight",
+                    f"transformer.layer.{idx}.attention.{dbert_key}.weight",
+                    f"layer.{idx}.attention.{dbert_key}.weight",
                 ]
                 candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
                 wkey = sd_lookup(sd, candidates_w)
                 bkey = sd_lookup(sd, candidates_b)
                 if wkey is None or bkey is None:
                     raise SystemExit(
-                        f"multi_head_attention #{mi}: missing {proj} "
+                        f"multi_head_attention #{idx}: missing {proj} "
                         f"weight or bias.  Tried: {candidates_w[0]} / "
                         f"{candidates_w[3]}.  Available: {sorted(sd.keys())}"
                     )
@@ -2692,19 +2600,20 @@ def main():
                 b = sd[bkey].detach().cpu().numpy().astype("float32")
                 if W.shape != (d_model, d_model) or b.shape != (d_model,):
                     raise SystemExit(
-                        f"multi_head_attention #{mi} {proj}: shape "
+                        f"multi_head_attention #{idx} {proj}: shape "
                         f"mismatch.  expected ({d_model},{d_model}) + "
                         f"({d_model},); got {tuple(W.shape)} + "
                         f"{tuple(b.shape)}."
                     )
-                collected.append(("multi_head_attention", mi, proj, W, b))
-            mi += 1
+                collected.append(("multi_head_attention", idx, proj, W, b))
         elif kind == "multi_head_attention_kv":
             # Same weight layout as the one-shot MHA — Q/K/V/O each
             # (d_model, d_model) — so the same key candidate set works.
             # Tagged kv in `collected` so tensor_names yields the same
             # Wm{suffix}{i}/bm{suffix}{i} names (decoder-mode forward
-            # already references those).
+            # already references those).  `idx` is the SHARED
+            # multi_head_attention counter (see _ARCH_WALK_COUNTER_KEY)
+            # so prefill and decode forms can swap state dicts cleanly.
             max_seq, d_model, n_heads = largs
             proj_to_keys = {
                 "q": ("q_proj", "q_lin"),
@@ -2718,19 +2627,19 @@ def main():
                     f"{hf_key}.weight",
                     f"attn.{hf_key}.weight",
                     f"attention.{hf_key}.weight",
-                    f"layers.{mi}.attn.{hf_key}.weight",
-                    f"layers.{mi}.{hf_key}.weight",
+                    f"layers.{idx}.attn.{hf_key}.weight",
+                    f"layers.{idx}.{hf_key}.weight",
                     # Llama-style decoder (mirrors GQA-KV path).
-                    f"model.layers.{mi}.self_attn.{hf_key}.weight",
-                    f"transformer.layer.{mi}.attention.{dbert_key}.weight",
-                    f"layer.{mi}.attention.{dbert_key}.weight",
+                    f"model.layers.{idx}.self_attn.{hf_key}.weight",
+                    f"transformer.layer.{idx}.attention.{dbert_key}.weight",
+                    f"layer.{idx}.attention.{dbert_key}.weight",
                 ]
                 candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
                 wkey = sd_lookup(sd, candidates_w)
                 bkey = sd_lookup(sd, candidates_b)
                 if wkey is None or bkey is None:
                     raise SystemExit(
-                        f"multi_head_attention_kv #{mi}: missing {proj} "
+                        f"multi_head_attention_kv #{idx}: missing {proj} "
                         f"weight or bias.  Tried: {candidates_w[0]} / "
                         f"{candidates_w[3]}.  Available: {sorted(sd.keys())}"
                     )
@@ -2738,13 +2647,12 @@ def main():
                 b = sd[bkey].detach().cpu().numpy().astype("float32")
                 if W.shape != (d_model, d_model) or b.shape != (d_model,):
                     raise SystemExit(
-                        f"multi_head_attention_kv #{mi} {proj}: shape "
+                        f"multi_head_attention_kv #{idx} {proj}: shape "
                         f"mismatch.  expected ({d_model},{d_model}) + "
                         f"({d_model},); got {tuple(W.shape)} + "
                         f"{tuple(b.shape)}."
                     )
-                collected.append(("multi_head_attention_kv", mi, proj, W, b))
-            mi += 1
+                collected.append(("multi_head_attention_kv", idx, proj, W, b))
         elif kind == "multi_head_attention_gqa_kv":
             # Llama / TinyLlama / Mistral attention.  Q is (d_model,
             # d_model); K/V are (n_kv_heads*d_head, d_model); O is
@@ -2763,16 +2671,16 @@ def main():
             for proj in ("q", "k", "v", "o"):
                 hf = "o_proj" if proj == "o" else f"{proj}_proj"
                 candidates_w = [
-                    f"model.layers.{gi}.self_attn.{hf}.weight",
-                    f"layers.{gi}.self_attn.{hf}.weight",
-                    f"transformer.h.{gi}.self_attn.{hf}.weight",
+                    f"model.layers.{idx}.self_attn.{hf}.weight",
+                    f"layers.{idx}.self_attn.{hf}.weight",
+                    f"transformer.h.{idx}.self_attn.{hf}.weight",
                     # Plain fallback for synthetic test rigs.
-                    f"gqa{gi}.{proj}.weight",
+                    f"gqa{idx}.{proj}.weight",
                 ]
                 wkey = sd_lookup(sd, candidates_w)
                 if wkey is None:
                     raise SystemExit(
-                        f"multi_head_attention_gqa_kv #{gi}: missing "
+                        f"multi_head_attention_gqa_kv #{idx}: missing "
                         f"{hf} weight.  Tried: "
                         f"{candidates_w[0]} / {candidates_w[3]}.  "
                         f"Available: {sorted(sd.keys())}"
@@ -2780,33 +2688,31 @@ def main():
                 W = sd[wkey].detach().cpu().numpy().astype("float32")
                 if W.shape != shape_for[proj]:
                     raise SystemExit(
-                        f"multi_head_attention_gqa_kv #{gi} {proj}: "
+                        f"multi_head_attention_gqa_kv #{idx} {proj}: "
                         f"shape mismatch.  expected {shape_for[proj]}; "
                         f"got {tuple(W.shape)}."
                     )
-                import numpy as _np
                 b = _np.zeros(0, dtype=_np.float32)
-                collected.append(("multi_head_attention_gqa_kv", gi, proj, W, b))
-            gi += 1
+                collected.append(("multi_head_attention_gqa_kv", idx, proj, W, b))
         elif kind == "layernorm":
             # ["layernorm", dim] — γ ("LayerNorm.weight") and β ("LayerNorm.bias")
             # both shape (dim,).  HuggingFace naming.  The packer's per-LN
-            # counter `ni` walks LN entries in arch order, so for typical
-            # encoder stacks the embedding-LN is ni=0, then per-block
+            # counter walks LN entries in arch order, so for typical
+            # encoder stacks the embedding-LN is idx=0, then per-block
             # sa_layer_norm and output_layer_norm interleave.  Distilbert
             # / BERT layouts:
-            #   ni=0   embeddings.LayerNorm
-            #   ni=1   transformer.layer.0.sa_layer_norm
-            #   ni=2   transformer.layer.0.output_layer_norm
-            #   ni=3   transformer.layer.1.sa_layer_norm
+            #   idx=0   embeddings.LayerNorm
+            #   idx=1   transformer.layer.0.sa_layer_norm
+            #   idx=2   transformer.layer.0.output_layer_norm
+            #   idx=3   transformer.layer.1.sa_layer_norm
             #   ...
             # We try all of these patterns; first hit wins.
             dim = largs[0]
-            if ni == 0:
+            if idx == 0:
                 # Initial / embedding-level LN.  Prefer HF embedding LN
                 # over plain `LayerNorm.weight` so a checkpoint that
                 # has both an embedding LN and per-block LNs disambiguates
-                # correctly (an arch with ni=0 ALWAYS expects the
+                # correctly (an arch with idx=0 ALWAYS expects the
                 # embedding-level LN to match first).
                 candidates_w = [
                     "embeddings.LayerNorm.weight",
@@ -2816,14 +2722,14 @@ def main():
                     "ln_0.weight",
                 ]
             else:
-                # Per-block LN.  Decode (block_idx, sa|output) from ni:
+                # Per-block LN.  Decode (block_idx, sa|output) from idx:
                 # blocks contribute 2 LNs each after the embedding LN
-                # at ni=0, so block_idx = (ni - 1) // 2 and the SA flag
-                # is is_sa = ni is odd.  Tries distilbert and BERT
+                # at idx=0, so block_idx = (idx - 1) // 2 and the SA flag
+                # is is_sa = idx is odd.  Tries distilbert and BERT
                 # naming patterns FIRST so embedding-level keys can't
-                # accidentally match a per-block ni>0 slot.
-                block_idx = (ni - 1) // 2
-                is_sa = (ni % 2 == 1)
+                # accidentally match a per-block idx>0 slot.
+                block_idx = (idx - 1) // 2
+                is_sa = (idx % 2 == 1)
                 sa_or_out = "sa_layer_norm" if is_sa else "output_layer_norm"
                 candidates_w = [
                     # distilbert: transformer.layer.{i}.{sa|output}_layer_norm
@@ -2835,16 +2741,16 @@ def main():
                         if is_sa else
                         f"encoder.layer.{block_idx}.output.LayerNorm.weight",
                     # Plain layered fallbacks (the existing convention)
-                    f"layers.{ni}.LayerNorm.weight",
-                    f"layer_norm{ni}.weight",
-                    f"ln_{ni}.weight",
+                    f"layers.{idx}.LayerNorm.weight",
+                    f"layer_norm{idx}.weight",
+                    f"ln_{idx}.weight",
                 ]
             candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
             wkey = sd_lookup(sd, candidates_w)
             bkey = sd_lookup(sd, candidates_b)
             if wkey is None or bkey is None:
                 raise SystemExit(
-                    f"layernorm #{ni}: missing γ / β.  Tried: "
+                    f"layernorm #{idx}: missing γ / β.  Tried: "
                     f"{candidates_w[0]} / {candidates_w[1]}.  "
                     f"Available: {sorted(sd.keys())}"
                 )
@@ -2852,53 +2758,50 @@ def main():
             b = sd[bkey].detach().cpu().numpy().astype("float32")
             if W.shape != (dim,) or b.shape != (dim,):
                 raise SystemExit(
-                    f"layernorm #{ni}: shape mismatch.  expected "
+                    f"layernorm #{idx}: shape mismatch.  expected "
                     f"({dim},) + ({dim},); got {tuple(W.shape)} + "
                     f"{tuple(b.shape)}."
                 )
-            collected.append(("layernorm", ni, "", W, b))
-            ni += 1
+            collected.append(("layernorm", idx, "", W, b))
         elif kind == "rmsnorm":
             # ["rmsnorm", dim] — γ only, no β.  Llama state_dict layout:
             #   model.layers.{i}.input_layernorm.weight        (pre-attn)
             #   model.layers.{i}.post_attention_layernorm.weight (pre-FFN)
             #   model.norm.weight                              (final)
-            # Counter `ri` walks RMSNorm entries in arch order.  For a
-            # decoder with K blocks the layout is:
-            #   ri=0      block 0 input_layernorm
-            #   ri=1      block 0 post_attention_layernorm
-            #   ri=2      block 1 input_layernorm
+            # `idx` walks RMSNorm entries in arch order.  For a decoder
+            # with K blocks the layout is:
+            #   idx=0      block 0 input_layernorm
+            #   idx=1      block 0 post_attention_layernorm
+            #   idx=2      block 1 input_layernorm
             #   ...
-            #   ri=2K     final model.norm
+            #   idx=2K     final model.norm
             dim = largs[0]
-            block_idx = ri // 2
-            is_input = (ri % 2 == 0)
+            block_idx = idx // 2
+            is_input = (idx % 2 == 0)
             sa_or_post = "input_layernorm" if is_input else "post_attention_layernorm"
             candidates_w = [
                 f"model.layers.{block_idx}.{sa_or_post}.weight",
                 f"layers.{block_idx}.{sa_or_post}.weight",
-                "model.norm.weight",   # final RMSNorm; matches when ri == 2*K
+                "model.norm.weight",   # final RMSNorm; matches when idx == 2*K
                 "norm.weight",
-                f"rmsnorm{ri}.weight",
-                f"rn_{ri}.weight",
+                f"rmsnorm{idx}.weight",
+                f"rn_{idx}.weight",
             ]
             wkey = sd_lookup(sd, candidates_w)
             if wkey is None:
                 raise SystemExit(
-                    f"rmsnorm #{ri}: missing γ.  Tried: "
+                    f"rmsnorm #{idx}: missing γ.  Tried: "
                     f"{candidates_w[0]} / {candidates_w[1]} / "
                     f"{candidates_w[2]}.  Available: {sorted(sd.keys())}"
                 )
             W = sd[wkey].detach().cpu().numpy().astype("float32")
             if W.shape != (dim,):
                 raise SystemExit(
-                    f"rmsnorm #{ri}: shape mismatch.  expected ({dim},); "
+                    f"rmsnorm #{idx}: shape mismatch.  expected ({dim},); "
                     f"got {tuple(W.shape)}."
                 )
-            import numpy as _np
             b = _np.zeros(0, dtype=_np.float32)
-            collected.append(("rmsnorm", ri, "", W, b))
-            ri += 1
+            collected.append(("rmsnorm", idx, "", W, b))
         elif kind == "swiglu_ffn":
             # ["swiglu_ffn", d_model, d_ffn] — three weight tensors,
             # NO biases (Llama convention).  HF state_dict layout:
@@ -2914,16 +2817,16 @@ def main():
             for proj in ("gate", "up", "down"):
                 hf = f"{proj}_proj"
                 candidates_w = [
-                    f"model.layers.{si}.mlp.{hf}.weight",
-                    f"layers.{si}.mlp.{hf}.weight",
+                    f"model.layers.{idx}.mlp.{hf}.weight",
+                    f"layers.{idx}.mlp.{hf}.weight",
                     # Plain fallback — useful for synthetic test rigs
                     # that don't follow the HF block-tree naming.
-                    f"swiglu{si}.{proj}.weight",
+                    f"swiglu{idx}.{proj}.weight",
                 ]
                 wkey = sd_lookup(sd, candidates_w)
                 if wkey is None:
                     raise SystemExit(
-                        f"swiglu_ffn #{si}: missing {proj}_proj weight.  "
+                        f"swiglu_ffn #{idx}: missing {proj}_proj weight.  "
                         f"Tried: {candidates_w[0]} / {candidates_w[1]} / "
                         f"{candidates_w[2]}.  "
                         f"Available: {sorted(sd.keys())}"
@@ -2931,13 +2834,11 @@ def main():
                 W = sd[wkey].detach().cpu().numpy().astype("float32")
                 if W.shape != shape_for[proj]:
                     raise SystemExit(
-                        f"swiglu_ffn #{si} {proj}: shape mismatch.  "
+                        f"swiglu_ffn #{idx} {proj}: shape mismatch.  "
                         f"expected {shape_for[proj]}; got {tuple(W.shape)}."
                     )
-                import numpy as _np
                 b = _np.zeros(0, dtype=_np.float32)
-                collected.append(("swiglu_ffn", si, proj, W, b))
-            si += 1
+                collected.append(("swiglu_ffn", idx, proj, W, b))
         elif kind == "embedding":
             # ["embedding", vocab_size, d_model, seq] — only a weight
             # tensor (no bias).  HuggingFace canonical names cover BERT/
@@ -2951,28 +2852,26 @@ def main():
                 "embed.weight",
                 "tok_embeddings.weight",
                 "embeddings.weight",
-                f"layers.{ei}.embed.weight",
+                f"layers.{idx}.embed.weight",
             ]
             wkey = sd_lookup(sd, candidates)
             if wkey is None:
                 raise SystemExit(
-                    f"embedding #{ei}: cannot find weight in checkpoint.  "
+                    f"embedding #{idx}: cannot find weight in checkpoint.  "
                     f"Tried: {candidates[0]} / {candidates[1]} / ...  "
                     f"Available: {sorted(sd.keys())}"
                 )
             W = sd[wkey].detach().cpu().numpy().astype("float32")
             if W.shape != (vocab_size, d_model):
                 raise SystemExit(
-                    f"embedding #{ei}: shape mismatch.  expected "
+                    f"embedding #{idx}: shape mismatch.  expected "
                     f"({vocab_size},{d_model}); got {tuple(W.shape)}."
                 )
             # Synthesise a zero-byte placeholder for `b` so the shared
             # 5-tuple shape stays consistent.  Downstream consumers
             # already gate on size==0 to skip bias staging.
-            import numpy as _np
             b = _np.zeros(0, dtype=_np.float32)
-            collected.append(("embedding", ei, "", W, b))
-            ei += 1
+            collected.append(("embedding", idx, "", W, b))
         elif kind == "positional_embedding":
             # ["positional_embedding", max_pos, d_model, seq] — only a
             # weight tensor (no bias).  HuggingFace canonical names cover
@@ -2984,25 +2883,23 @@ def main():
                 "position_embeddings.weight",
                 "wpe.weight",
                 "pos_embed.weight",
-                f"layers.{pei}.pos_embed.weight",
+                f"layers.{idx}.pos_embed.weight",
             ]
             wkey = sd_lookup(sd, candidates)
             if wkey is None:
                 raise SystemExit(
-                    f"positional_embedding #{pei}: cannot find weight "
+                    f"positional_embedding #{idx}: cannot find weight "
                     f"in checkpoint.  Tried: {candidates[0]} / "
                     f"{candidates[1]} / ...  Available: {sorted(sd.keys())}"
                 )
             W = sd[wkey].detach().cpu().numpy().astype("float32")
             if W.shape != (max_pos, d_model):
                 raise SystemExit(
-                    f"positional_embedding #{pei}: shape mismatch.  "
+                    f"positional_embedding #{idx}: shape mismatch.  "
                     f"expected ({max_pos},{d_model}); got {tuple(W.shape)}."
                 )
-            import numpy as _np
             b = _np.zeros(0, dtype=_np.float32)
-            collected.append(("positional_embedding", pei, "", W, b))
-            pei += 1
+            collected.append(("positional_embedding", idx, "", W, b))
     # Skip zero-size tensors when accumulating the f32 blob (no bias for
     # nn.Embedding); same condition gate the staging-file writer uses.
     weights_blob = [a for (_, _, _, W, b) in collected
