@@ -1,0 +1,145 @@
+// aricode-ml: tests/test_attention_mh_kv.ari
+//
+// Validates attention_mh_kv_f32 (incremental, per-head KV-cached
+// multi-head attention) against a manually-constructed multi-head
+// SDPA reference using attention_f32 (one-shot, causal=1) per head.
+//
+// Setup: seq=4, d_model=8, n_heads=2 → d_head=4.  Random weights.
+//
+// Pass: max abs diff < 1e-4.
+
+import "../attention_f32.ari" as attn;
+import "../attention_mh_kv_f32.ari" as mhkv;
+
+fn fill_random(W: i32, n: i32, seed: i32) -> i32 {
+    let s: i32 = seed;
+    let i: i32 = 0;
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        let bits: i32 = s & 65535;
+        let f: f64 = int_to_float(bits) / 32768.0 - 1.0;
+        arr_f32_set(W, i, f);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    let seq: i32 = 4;
+    let d_model: i32 = 8;
+    let n_heads: i32 = 2;
+    let d_head: i32 = d_model / n_heads;
+
+    let X: i32 = arr_f32_new(seq * d_model);
+    fill_random(X, seq * d_model, 73);
+
+    let W_Q: i32 = arr_f32_new(d_model * d_model); fill_random(W_Q, d_model * d_model, 11);
+    let W_K: i32 = arr_f32_new(d_model * d_model); fill_random(W_K, d_model * d_model, 17);
+    let W_V: i32 = arr_f32_new(d_model * d_model); fill_random(W_V, d_model * d_model, 23);
+    let W_O: i32 = arr_f32_new(d_model * d_model); fill_random(W_O, d_model * d_model, 29);
+
+    let b_Q: i32 = arr_f32_new(d_model); fill_random(b_Q, d_model, 31);
+    let b_K: i32 = arr_f32_new(d_model); fill_random(b_K, d_model, 37);
+    let b_V: i32 = arr_f32_new(d_model); fill_random(b_V, d_model, 41);
+    let b_O: i32 = arr_f32_new(d_model); fill_random(b_O, d_model, 43);
+
+    // ---- Reference: full causal MHA, inlined ----
+    let out_ref: i32 = arr_f32_new(seq * d_model);
+    let Wq_s: i32 = arr_f32_new(d_head * d_model);
+    let bq_s: i32 = arr_f32_new(d_head);
+    let Wk_s: i32 = arr_f32_new(d_head * d_model);
+    let bk_s: i32 = arr_f32_new(d_head);
+    let Wv_s: i32 = arr_f32_new(d_head * d_model);
+    let bv_s: i32 = arr_f32_new(d_head);
+    let head_out: i32 = arr_f32_new(seq * d_head);
+    let concat: i32 = arr_f32_new(seq * d_model);
+    let row_in: i32 = arr_f32_new(d_model);
+    let row_out: i32 = arr_f32_new(d_model);
+
+    let desc: i32 = attn.attn_alloc_desc_f32(seq, d_model, d_head, 1);
+    arr_set(desc, 0, X);
+    arr_set(desc, 11, head_out);
+
+    let h: i32 = 0;
+    while (h < n_heads) {
+        arr_f32_copy_slice(W_Q, h * d_head * d_model, Wq_s, 0, d_head * d_model);
+        arr_f32_copy_slice(b_Q, h * d_head, bq_s, 0, d_head);
+        arr_f32_copy_slice(W_K, h * d_head * d_model, Wk_s, 0, d_head * d_model);
+        arr_f32_copy_slice(b_K, h * d_head, bk_s, 0, d_head);
+        arr_f32_copy_slice(W_V, h * d_head * d_model, Wv_s, 0, d_head * d_model);
+        arr_f32_copy_slice(b_V, h * d_head, bv_s, 0, d_head);
+        arr_set(desc, 1, Wq_s); arr_set(desc, 2, bq_s);
+        arr_set(desc, 3, Wk_s); arr_set(desc, 4, bk_s);
+        arr_set(desc, 5, Wv_s); arr_set(desc, 6, bv_s);
+        attn.attention_forward_f32(desc);
+
+        let r: i32 = 0;
+        while (r < seq) {
+            arr_f32_copy_slice(head_out, r * d_head, concat, r * d_model + h * d_head, d_head);
+            r = r + 1;
+        }
+        h = h + 1;
+    }
+
+    let r2: i32 = 0;
+    while (r2 < seq) {
+        arr_f32_copy_slice(concat, r2 * d_model, row_in, 0, d_model);
+        arr_f32_matvec(W_O, row_in, b_O, row_out, d_model, d_model);
+        arr_f32_copy_slice(row_out, 0, out_ref, r2 * d_model, d_model);
+        r2 = r2 + 1;
+    }
+
+    // ---- KV-cache multi-head decode loop ----
+    let out_kv: i32 = arr_f32_new(seq * d_model);
+    let row_in_kv: i32 = arr_f32_new(d_model);
+    let row_out_kv: i32 = arr_f32_new(d_model);
+
+    let mh: i32 = mhkv.attn_mh_kv_alloc_f32(seq, d_model, n_heads);
+    arr_set(mh, 1, W_Q); arr_set(mh, 2, b_Q);
+    arr_set(mh, 3, W_K); arr_set(mh, 4, b_K);
+    arr_set(mh, 5, W_V); arr_set(mh, 6, b_V);
+    arr_set(mh, 7, W_O); arr_set(mh, 8, b_O);
+    arr_set(mh, 0, row_in_kv);
+    arr_set(mh, 9, row_out_kv);
+
+    let t: i32 = 0;
+    while (t < seq) {
+        arr_f32_copy_slice(X, t * d_model, row_in_kv, 0, d_model);
+        mhkv.attn_mh_kv_step_f32(mh);
+        arr_f32_copy_slice(row_out_kv, 0, out_kv, t * d_model, d_model);
+        t = t + 1;
+    }
+
+    // ---- Compare ----
+    let max_diff: f64 = 0.0;
+    let tol: f64 = 0.0001;
+    let ok: i32 = 1;
+    let i: i32 = 0;
+    while (i < seq * d_model) {
+        let a: f64 = arr_f32_get(out_ref, i);
+        let b: f64 = arr_f32_get(out_kv, i);
+        let dd: f64 = a - b;
+        if (dd < 0.0) { dd = 0.0 - dd; }
+        if (dd > max_diff) { max_diff = dd; }
+        if (dd > tol) { ok = 0; }
+        i = i + 1;
+    }
+
+    if (ok == 1) {
+        print_str("ATTN_MH_KV_OK");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+    } else {
+        print_str("FAIL");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+        i = 0;
+        while (i < seq * d_model) {
+            print_str("idx:"); print_int(i);
+            print_str("  ref:"); print_f64(arr_f32_get(out_ref, i), 6);
+            print_str("  kv :"); print_f64(arr_f32_get(out_kv, i), 6);
+            i = i + 1;
+        }
+    }
+    return 0;
+}

@@ -1,0 +1,142 @@
+// aricode-ml: attention_mh_kv_f32.ari
+//
+// Multi-head decoder attention with persistent per-head KV cache.
+// Wraps attention_kv_f32 — one independent KV state per head, plus
+// the output projection (W_O · concat).
+//
+// Layout:
+//   X      : [d_model]              current-token input (single row)
+//   W_Q W_K W_V W_O : [d_model, d_model]   full projection weights
+//   b_*    : [d_model]              biases
+//   K cache: per head, [max_seq, d_head]
+//   V cache: per head, [max_seq, d_head]
+//   out    : [d_model]              output row for this token
+//
+// Per head: slice (d_head, d_model) view out of the full (d_model, d_model)
+// W_Q/W_K/W_V matrix at rows [h*d_head .. (h+1)*d_head], copy into a
+// per-head scratch, run attn_kv_step_f32 against that head's cache,
+// concat the d_head-wide head output into the [d_model] concat scratch.
+// Then W_O · concat + b_O = out.
+//
+// State struct (i32 array, slot indices):
+//   [ 0]  X (per-step)
+//   [ 1]  W_Q       [ 2] b_Q
+//   [ 3]  W_K       [ 4] b_K
+//   [ 5]  W_V       [ 6] b_V
+//   [ 7]  W_O       [ 8] b_O
+//   [ 9]  out (per-step or once)
+//   [10]  states    — array of n_heads kv states
+//   [11]  W_q_slice [12] b_q_slice  (d_head-row chunk scratch)
+//   [13]  W_k_slice [14] b_k_slice
+//   [15]  W_v_slice [16] b_v_slice
+//   [17]  head_out  — [d_head] per-head output scratch
+//   [18]  concat    — [d_model] concat of head outputs
+//   [19]  max_seq
+//   [20]  d_model
+//   [21]  n_heads
+//   [22]  d_head
+
+import "attention_kv_f32.ari" as kv;
+
+fn attn_mh_kv_alloc_f32(max_seq: i32, d_model: i32, n_heads: i32) -> i32 {
+    let s: i32 = arr_new(24);
+    let d_head: i32 = d_model / n_heads;
+
+    arr_set(s,  0, 0);
+    arr_set(s,  1, 0); arr_set(s,  2, 0);
+    arr_set(s,  3, 0); arr_set(s,  4, 0);
+    arr_set(s,  5, 0); arr_set(s,  6, 0);
+    arr_set(s,  7, 0); arr_set(s,  8, 0);
+    arr_set(s,  9, 0);
+
+    let states: i32 = arr_new(n_heads);
+    let h: i32 = 0;
+    while (h < n_heads) {
+        let st: i32 = kv.attn_kv_alloc_f32(max_seq, d_model, d_head);
+        arr_set(states, h, st);
+        h = h + 1;
+    }
+    arr_set(s, 10, states);
+
+    arr_set(s, 11, arr_f32_new(d_head * d_model));
+    arr_set(s, 12, arr_f32_new(d_head));
+    arr_set(s, 13, arr_f32_new(d_head * d_model));
+    arr_set(s, 14, arr_f32_new(d_head));
+    arr_set(s, 15, arr_f32_new(d_head * d_model));
+    arr_set(s, 16, arr_f32_new(d_head));
+    arr_set(s, 17, arr_f32_new(d_head));
+    arr_set(s, 18, arr_f32_new(d_model));
+
+    arr_set(s, 19, max_seq);
+    arr_set(s, 20, d_model);
+    arr_set(s, 21, n_heads);
+    arr_set(s, 22, d_head);
+    return s;
+}
+
+// Reset all per-head caches (count=0, K/V zero) for a fresh sequence.
+fn attn_mh_kv_reset(s: i32) -> i32 {
+    let states: i32 = arr_get(s, 10);
+    let n_heads: i32 = arr_get(s, 21);
+    let h: i32 = 0;
+    while (h < n_heads) {
+        kv.attn_kv_reset(arr_get(states, h));
+        h = h + 1;
+    }
+    return 0;
+}
+
+// One incremental MHA decode step.  Caller must have set:
+//   slot 0  X (length d_model)
+//   slot 9  out (length d_model)
+//   slots 1..8 weights + biases (set once)
+//
+// Algorithm:
+//   for h in 0..n_heads:
+//       slice W_Q rows [h*d_head .. (h+1)*d_head] into per-head scratch
+//       same for W_K, W_V, b_Q, b_K, b_V
+//       run attn_kv_step_f32 on head's state — outputs head_out [d_head]
+//       copy head_out into concat[h*d_head .. (h+1)*d_head]
+//   out = W_O · concat + b_O
+fn attn_mh_kv_step_f32(s: i32) -> i32 {
+    let X: i32       = arr_get(s,  0);
+    let W_Q: i32     = arr_get(s,  1);  let b_Q: i32 = arr_get(s,  2);
+    let W_K: i32     = arr_get(s,  3);  let b_K: i32 = arr_get(s,  4);
+    let W_V: i32     = arr_get(s,  5);  let b_V: i32 = arr_get(s,  6);
+    let W_O: i32     = arr_get(s,  7);  let b_O: i32 = arr_get(s,  8);
+    let out: i32     = arr_get(s,  9);
+    let states: i32  = arr_get(s, 10);
+    let Wq_s: i32    = arr_get(s, 11); let bq_s: i32 = arr_get(s, 12);
+    let Wk_s: i32    = arr_get(s, 13); let bk_s: i32 = arr_get(s, 14);
+    let Wv_s: i32    = arr_get(s, 15); let bv_s: i32 = arr_get(s, 16);
+    let head_out: i32 = arr_get(s, 17);
+    let concat: i32  = arr_get(s, 18);
+    let d_model: i32 = arr_get(s, 20);
+    let n_heads: i32 = arr_get(s, 21);
+    let d_head: i32  = arr_get(s, 22);
+
+    let h: i32 = 0;
+    while (h < n_heads) {
+        arr_f32_copy_slice(W_Q, h * d_head * d_model, Wq_s, 0, d_head * d_model);
+        arr_f32_copy_slice(b_Q, h * d_head, bq_s, 0, d_head);
+        arr_f32_copy_slice(W_K, h * d_head * d_model, Wk_s, 0, d_head * d_model);
+        arr_f32_copy_slice(b_K, h * d_head, bk_s, 0, d_head);
+        arr_f32_copy_slice(W_V, h * d_head * d_model, Wv_s, 0, d_head * d_model);
+        arr_f32_copy_slice(b_V, h * d_head, bv_s, 0, d_head);
+
+        let st: i32 = arr_get(states, h);
+        arr_set(st, 0, X);
+        arr_set(st, 1, Wq_s); arr_set(st, 2, bq_s);
+        arr_set(st, 3, Wk_s); arr_set(st, 4, bk_s);
+        arr_set(st, 5, Wv_s); arr_set(st, 6, bv_s);
+        arr_set(st, 12, head_out);
+
+        kv.attn_kv_step_f32(st);
+
+        arr_f32_copy_slice(head_out, 0, concat, h * d_head, d_head);
+        h = h + 1;
+    }
+
+    arr_f32_matvec(W_O, concat, b_O, out, d_model, d_model);
+    return 0;
+}

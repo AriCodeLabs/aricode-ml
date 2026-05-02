@@ -1,0 +1,271 @@
+// aricode-ml: attention_gqa_kv_f32.ari
+//
+// Grouped-query multi-head decoder attention with persistent KV cache
+// + RoPE applied to Q/K before scoring.  Generalises attention_mh_kv_f32
+// to n_kv_heads ≤ n_heads (Llama-2 / TinyLlama / Mistral / Llama-3).
+//
+// Layout:
+//   X      : [d_model]                             current-token input row
+//   W_Q    : [d_model, d_model]                    full Q projection
+//   W_K    : [n_kv_heads * d_head, d_model]        K projection (n_kv_heads-wide)
+//   W_V    : [n_kv_heads * d_head, d_model]        V projection (n_kv_heads-wide)
+//   W_O    : [d_model, d_model]                    output projection
+//   biases : zero-length / NULL — Llama drops them; we still pass empty
+//            buffers down to attn_kv_step_f32 since matvec demands a bias arg
+//   K cache: per kv-head, [max_seq, d_head]        rotated K rows
+//   V cache: per kv-head, [max_seq, d_head]
+//   out    : [d_model]                             output row for this token
+//
+// Per Q-head h in 0..n_heads:
+//   kv_h = h / (n_heads / n_kv_heads)              groups of n_heads/n_kv_heads heads share one KV
+//   slice W_Q rows [h*d_head:(h+1)*d_head, :]      → Wq_s
+//   slice W_K rows [kv_h*d_head:(kv_h+1)*d_head, :] → Wk_s
+//   slice W_V rows [kv_h*d_head:(kv_h+1)*d_head, :] → Wv_s
+//   project Q via attn_kv_step_f32 — but we replace the cached K's rotation
+//   step by pre-rotating Q (after projection) and the new K row (before
+//   it lands in the cache).  RoPE position is the per-step `count` slot.
+//
+// Because attn_kv_step_f32 fuses Q-projection + K-row-projection + cache
+// append + score-matvec + softmax + V-combine in one call, we re-implement
+// that body here so we can intercept the Q and K_new rows post-projection
+// and apply RoPE before the score matvec / cache write.
+//
+// State struct (i32 array, 30 slots):
+//   [ 0]  X (per-step)
+//   [ 1]  W_Q       [ 2] b_Q      (Q is full d_model — bias optional, may
+//                                  be empty/NULL for Llama)
+//   [ 3]  W_K       [ 4] b_K      (K is n_kv_heads * d_head wide)
+//   [ 5]  W_V       [ 6] b_V      (V is n_kv_heads * d_head wide)
+//   [ 7]  W_O       [ 8] b_O
+//   [ 9]  out (per-step)
+//   [10]  rope_table   — rope_alloc_f32(max_seq, d_head, theta)
+//   [11]  states_kv    — array of n_kv_heads kv states (one per KV head)
+//   [12]  Wq_s         [13] bq_s     per-Q-head Q slice scratch (zero-fill)
+//   [14]  Wk_s         [15] bk_s     per-KV-head K slice scratch (zero-fill)
+//   [16]  Wv_s         [17] bv_s     per-KV-head V slice scratch (zero-fill)
+//   [18]  head_out     (d_head)
+//   [19]  concat       (d_model)
+//   [20]  max_seq
+//   [21]  d_model
+//   [22]  n_heads
+//   [23]  n_kv_heads
+//   [24]  d_head
+//   [25]  count        (current step / position)
+//   [26]  bO_zero      — d_model zero-fill scratch used when b_O is empty
+//
+// Llama drops biases on Q/K/V/O.  Caller may bind slots 2/4/6/8 to either
+// real bias tensors (slice + add per matvec call) or to empty/NULL
+// sentinels — we test arr_len() at step time and route through the
+// per-head zero-fill scratch when the bias is missing.
+
+import "attention_kv_f32.ari" as kv;
+import "rope_f32.ari" as rope;
+
+// ----------------------------------------------------------------------
+// Allocator: builds n_kv_heads kv states + the RoPE table + per-head
+// scratches.  Caller binds slots 1..8 (weights) once after alloc.
+// ----------------------------------------------------------------------
+fn attn_gqa_kv_alloc_f32(max_seq: i32, d_model: i32, n_heads: i32,
+                        n_kv_heads: i32, theta: f64) -> i32 {
+    let s: i32 = arr_new(30);
+    let d_head: i32 = d_model / n_heads;
+
+    arr_set(s,  0, 0);
+    arr_set(s,  1, 0); arr_set(s,  2, 0);
+    arr_set(s,  3, 0); arr_set(s,  4, 0);
+    arr_set(s,  5, 0); arr_set(s,  6, 0);
+    arr_set(s,  7, 0); arr_set(s,  8, 0);
+    arr_set(s,  9, 0);
+
+    // RoPE table — built once, shared across all heads.
+    let table: i32 = rope.rope_alloc_f32(max_seq, d_head, theta);
+    arr_set(s, 10, table);
+
+    // n_kv_heads kv states.  Each kv state holds K/V cache + Q/K/V scratch.
+    // We won't actually call attn_kv_step_f32 directly (we re-implement the
+    // body to inject RoPE), but we reuse the kv state's allocated buffers
+    // so the cache management code stays uniform.
+    let states_kv: i32 = arr_new(n_kv_heads);
+    let kh: i32 = 0;
+    while (kh < n_kv_heads) {
+        let st: i32 = kv.attn_kv_alloc_f32(max_seq, d_model, d_head);
+        arr_set(states_kv, kh, st);
+        kh = kh + 1;
+    }
+    arr_set(s, 11, states_kv);
+
+    // Per-head slice scratches.  Q slice is per-Q-head; K/V slice is per
+    // KV-head but reused across the n_heads/n_kv_heads Q heads in the same
+    // group, so we only need ONE K/V slice scratch (rebound when kv_h changes).
+    arr_set(s, 12, arr_f32_new(d_head * d_model));   // Wq_s
+    arr_set(s, 13, arr_f32_new(d_head));              // bq_s (zero-filled)
+    arr_set(s, 14, arr_f32_new(d_head * d_model));   // Wk_s
+    arr_set(s, 15, arr_f32_new(d_head));              // bk_s (zero-filled)
+    arr_set(s, 16, arr_f32_new(d_head * d_model));   // Wv_s
+    arr_set(s, 17, arr_f32_new(d_head));              // bv_s (zero-filled)
+
+    arr_f32_fill(arr_get(s, 13), 0.0);
+    arr_f32_fill(arr_get(s, 15), 0.0);
+    arr_f32_fill(arr_get(s, 17), 0.0);
+
+    arr_set(s, 18, arr_f32_new(d_head));              // head_out
+    arr_set(s, 19, arr_f32_new(d_model));              // concat
+
+    arr_set(s, 20, max_seq);
+    arr_set(s, 21, d_model);
+    arr_set(s, 22, n_heads);
+    arr_set(s, 23, n_kv_heads);
+    arr_set(s, 24, d_head);
+    arr_set(s, 25, 0);                                  // count
+
+    let bO_zero: i32 = arr_f32_new(d_model);
+    arr_f32_fill(bO_zero, 0.0);
+    arr_set(s, 26, bO_zero);
+    return s;
+}
+
+// Reset all per-KV-head caches and the global step counter.
+fn attn_gqa_kv_reset(s: i32) -> i32 {
+    let states_kv: i32 = arr_get(s, 11);
+    let n_kv_heads: i32 = arr_get(s, 23);
+    let kh: i32 = 0;
+    while (kh < n_kv_heads) {
+        kv.attn_kv_reset(arr_get(states_kv, kh));
+        kh = kh + 1;
+    }
+    arr_set(s, 25, 0);
+    return 0;
+}
+
+// Score one Q-head against the KV cache of its group's kv head.
+// Mirrors the scoring half of attn_kv_step_f32 (Q is already projected,
+// scaled, and rope-rotated; K cache row at `count` is already written
+// and rope-rotated).  Writes head output [d_head] into `head_out`.
+fn _gqa_score_head(kv_st: i32, Q: i32, head_out: i32,
+                   count: i32, max_seq: i32, d_head: i32) -> i32 {
+    let Kc: i32 = arr_get(kv_st, 7);
+    let Vc: i32 = arr_get(kv_st, 8);
+    let scores: i32 = arr_get(kv_st, 11);
+    let zero_bias: i32 = arr_get(kv_st, 17);
+
+    let n: i32 = count + 1;
+    arr_f32_matvec(Kc, Q, zero_bias, scores, n, d_head);
+
+    // Poison inactive tail with -60 so softmax assigns ~0 mass.
+    let j: i32 = n;
+    while (j < max_seq) {
+        arr_f32_set(scores, j, 0.0 - 60.0);
+        j = j + 1;
+    }
+    arr_f32_softmax(scores);
+
+    arr_f32_matvec_T(Vc, scores, head_out, n, d_head);
+    return 0;
+}
+
+// One incremental GQA decode step.  See header for slot layout.
+fn attn_gqa_kv_step_f32(s: i32) -> i32 {
+    let X: i32       = arr_get(s,  0);
+    let W_Q: i32     = arr_get(s,  1);  let b_Q: i32 = arr_get(s,  2);
+    let W_K: i32     = arr_get(s,  3);  let b_K: i32 = arr_get(s,  4);
+    let W_V: i32     = arr_get(s,  5);  let b_V: i32 = arr_get(s,  6);
+    let W_O: i32     = arr_get(s,  7);  let b_O: i32 = arr_get(s,  8);
+    let out: i32     = arr_get(s,  9);
+    let rope_tbl: i32 = arr_get(s, 10);
+    let states_kv: i32 = arr_get(s, 11);
+    let Wq_s: i32    = arr_get(s, 12); let bq_s: i32 = arr_get(s, 13);
+    let Wk_s: i32    = arr_get(s, 14); let bk_s: i32 = arr_get(s, 15);
+    let Wv_s: i32    = arr_get(s, 16); let bv_s: i32 = arr_get(s, 17);
+    let head_out: i32 = arr_get(s, 18);
+    let concat: i32  = arr_get(s, 19);
+    let max_seq: i32 = arr_get(s, 20);
+    let d_model: i32 = arr_get(s, 21);
+    let n_heads: i32 = arr_get(s, 22);
+    let n_kv_heads: i32 = arr_get(s, 23);
+    let d_head: i32  = arr_get(s, 24);
+    let count: i32   = arr_get(s, 25);
+
+    if (count >= max_seq) {
+        return 0 - 1;
+    }
+
+    let group_size: i32 = n_heads / n_kv_heads;
+    let inv_sqrt_dh: f64 = 1.0 / math_sqrt(int_to_float(d_head));
+
+    // ---- Stage 1: project + rope + write K/V for each KV head ----
+    // K and V projections are per-KV-head (n_kv_heads of them).  We project
+    // each KV head's K and V row, rope-rotate the K row, and write both
+    // into that head's KV cache at row `count`.
+    //
+    // Bias handling: when caller binds slot 4/6 to a real f32 buffer of
+    // length n_kv_heads*d_head we slice it per KV head; when it's the
+    // null sentinel (== 0), we leave bk_s / bv_s at their alloc-time
+    // zero fill (Llama convention).
+    let kh: i32 = 0;
+    while (kh < n_kv_heads) {
+        // Slice W_K rows [kh*d_head:(kh+1)*d_head, :] from the
+        // (n_kv_heads*d_head, d_model) matrix.
+        arr_f32_copy_slice(W_K, kh * d_head * d_model, Wk_s, 0, d_head * d_model);
+        if (b_K != 0) {
+            arr_f32_copy_slice(b_K, kh * d_head, bk_s, 0, d_head);
+        }
+        arr_f32_copy_slice(W_V, kh * d_head * d_model, Wv_s, 0, d_head * d_model);
+        if (b_V != 0) {
+            arr_f32_copy_slice(b_V, kh * d_head, bv_s, 0, d_head);
+        }
+
+        let kv_st: i32 = arr_get(states_kv, kh);
+        let Kc: i32 = arr_get(kv_st, 7);
+        let Vc: i32 = arr_get(kv_st, 8);
+        let row_scratch: i32 = arr_get(kv_st, 10);
+
+        // K_new = W_K_slice · X + b_K_slice  → apply RoPE → write to cache.
+        arr_f32_matvec(Wk_s, X, bk_s, row_scratch, d_head, d_model);
+        rope.rope_apply_f32(rope_tbl, row_scratch, count, d_head);
+        arr_f32_copy_slice(row_scratch, 0, Kc, count * d_head, d_head);
+
+        // V_new = W_V_slice · X + b_V_slice → write directly (no RoPE on V).
+        arr_f32_matvec(Wv_s, X, bv_s, row_scratch, d_head, d_model);
+        arr_f32_copy_slice(row_scratch, 0, Vc, count * d_head, d_head);
+
+        kh = kh + 1;
+    }
+
+    // ---- Stage 2: project Q, rope, score against cache, concat ----
+    let h: i32 = 0;
+    while (h < n_heads) {
+        let kv_h: i32 = h / group_size;
+        let kv_st: i32 = arr_get(states_kv, kv_h);
+        let Q: i32 = arr_get(kv_st, 9);
+
+        // Slice W_Q rows [h*d_head:(h+1)*d_head, :].
+        arr_f32_copy_slice(W_Q, h * d_head * d_model, Wq_s, 0, d_head * d_model);
+        if (b_Q != 0) {
+            arr_f32_copy_slice(b_Q, h * d_head, bq_s, 0, d_head);
+        }
+
+        // Q = W_Q_slice · X + b_Q_slice
+        arr_f32_matvec(Wq_s, X, bq_s, Q, d_head, d_model);
+        // Apply RoPE BEFORE scaling — both compose linearly so order against
+        // a constant scalar doesn't matter, but keep it conventional.
+        rope.rope_apply_f32(rope_tbl, Q, count, d_head);
+        // Pre-scale by 1/sqrt(d_head) so the matvec against Kc is the
+        // scaled dot-product (mirrors attention_kv_f32.ari).
+        arr_f32_scale(Q, inv_sqrt_dh);
+
+        _gqa_score_head(kv_st, Q, head_out, count, max_seq, d_head);
+
+        arr_f32_copy_slice(head_out, 0, concat, h * d_head, d_head);
+        h = h + 1;
+    }
+
+    // ---- Stage 3: output projection ----
+    let bO_used: i32 = b_O;
+    if (b_O == 0) {
+        bO_used = arr_get(s, 26);
+    }
+    arr_f32_matvec(W_O, concat, bO_used, out, d_model, d_model);
+
+    arr_set(s, 25, count + 1);
+    return 0;
+}

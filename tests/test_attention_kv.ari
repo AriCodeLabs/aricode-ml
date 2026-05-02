@@ -1,0 +1,125 @@
+// aricode-ml: tests/test_attention_kv.ari
+//
+// Validates attention_kv_f32 (incremental, KV-cached) against
+// attention_f32 (one-shot, causal=1).  Same X / weights run through
+// both paths must produce the same output to f32 noise level.
+//
+// Setup:
+//   seq=4, d_in=d_head=8.  Identity-ish weights with biases zero.
+//   The one-shot path runs causal=1 attention over [seq, d_in] and
+//   produces out_full [seq, d_head].  The incremental path feeds X
+//   one row at a time through attn_kv_step_f32 and concatenates the
+//   per-step outputs into out_kv [seq, d_head].
+//
+// Pass condition:
+//   max |out_full[i] - out_kv[i]| < 1e-4 over all 32 elements.
+
+import "../attention_f32.ari" as attn;
+import "../attention_kv_f32.ari" as kv;
+
+fn fill_random(W: i32, n: i32, seed: i32) -> i32 {
+    // Reproducible LCG so we don't depend on rand() init order.
+    let s: i32 = seed;
+    let i: i32 = 0;
+    while (i < n) {
+        s = s * 1103515245 + 12345;
+        // Convert to [-1, 1] roughly: take low 16 bits, divide by 32768.
+        let bits: i32 = s & 65535;
+        let f: f64 = int_to_float(bits) / 32768.0 - 1.0;
+        arr_f32_set(W, i, f);
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn close_within(got: f64, expect: f64, tol: f64) -> i32 {
+    let diff: f64 = got - expect;
+    if (diff < 0.0) { diff = 0.0 - diff; }
+    if (diff > tol) { return 0; }
+    return 1;
+}
+
+fn main() -> i32 {
+    let seq: i32 = 4;
+    let d:   i32 = 8;
+    let causal: i32 = 1;
+
+    let X: i32 = arr_f32_new(seq * d);
+    fill_random(X, seq * d, 11);
+
+    let W_Q: i32 = arr_f32_new(d * d); fill_random(W_Q, d * d, 23);
+    let W_K: i32 = arr_f32_new(d * d); fill_random(W_K, d * d, 31);
+    let W_V: i32 = arr_f32_new(d * d); fill_random(W_V, d * d, 47);
+
+    let b_Q: i32 = arr_f32_new(d); fill_random(b_Q, d, 53);
+    let b_K: i32 = arr_f32_new(d); fill_random(b_K, d, 59);
+    let b_V: i32 = arr_f32_new(d); fill_random(b_V, d, 67);
+
+    // ---- One-shot causal attention reference ----
+    let out_full: i32 = arr_f32_new(seq * d);
+    let desc: i32 = attn.attn_alloc_desc_f32(seq, d, d, causal);
+    arr_set(desc,  0, X);
+    arr_set(desc,  1, W_Q); arr_set(desc,  2, b_Q);
+    arr_set(desc,  3, W_K); arr_set(desc,  4, b_K);
+    arr_set(desc,  5, W_V); arr_set(desc,  6, b_V);
+    arr_set(desc, 11, out_full);
+    attn.attention_forward_f32(desc);
+
+    // ---- Incremental KV-cache attention ----
+    let out_kv: i32 = arr_f32_new(seq * d);
+    let row_in: i32 = arr_f32_new(d);
+    let row_out: i32 = arr_f32_new(d);
+
+    let st: i32 = kv.attn_kv_alloc_f32(seq, d, d);
+    arr_set(st,  1, W_Q); arr_set(st,  2, b_Q);
+    arr_set(st,  3, W_K); arr_set(st,  4, b_K);
+    arr_set(st,  5, W_V); arr_set(st,  6, b_V);
+    arr_set(st,  0, row_in);
+    arr_set(st, 12, row_out);
+
+    let t: i32 = 0;
+    while (t < seq) {
+        arr_f32_copy_slice(X, t * d, row_in, 0, d);
+        kv.attn_kv_step_f32(st);
+        arr_f32_copy_slice(row_out, 0, out_kv, t * d, d);
+        t = t + 1;
+    }
+
+    // ---- Compare ----
+    let ok: i32 = 1;
+    let max_diff: f64 = 0.0;
+    let tol: f64 = 0.0001;
+    let i: i32 = 0;
+    while (i < seq * d) {
+        let a: f64 = arr_f32_get(out_full, i);
+        let b: f64 = arr_f32_get(out_kv, i);
+        let dd: f64 = a - b;
+        if (dd < 0.0) { dd = 0.0 - dd; }
+        if (dd > max_diff) { max_diff = dd; }
+        if (dd > tol) {
+            ok = 0;
+        }
+        i = i + 1;
+    }
+
+    if (ok == 1) {
+        print_str("ATTN_KV_OK");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+    } else {
+        print_str("FAIL");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+        i = 0;
+        while (i < seq * d) {
+            print_str("idx:");
+            print_int(i);
+            print_str("  full:");
+            print_f64(arr_f32_get(out_full, i), 6);
+            print_str("  kv  :");
+            print_f64(arr_f32_get(out_kv, i), 6);
+            i = i + 1;
+        }
+    }
+    return 0;
+}

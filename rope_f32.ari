@@ -1,0 +1,77 @@
+// aricode-ml: rope_f32.ari
+//
+// Rotary Position Embedding (RoPE) — pre-computed (cos, sin) table
+// + in-place rotation of a d_head-wide vector.
+//
+// This is the original RoPE paper convention (INTERLEAVED pairs),
+// not HuggingFace's split-half layout.  For each head we treat the
+// d_head dim as d_head/2 contiguous pairs (vec[2i], vec[2i+1]) and
+// rotate each pair by an angle θ_pos_i = pos * theta^(-2i/d_head).
+//
+//   (x0, x1) → (x0*cos(θ) - x1*sin(θ), x0*sin(θ) + x1*cos(θ))
+//
+// HF's split-half layout (vec[i], vec[i+d_head/2]) is mathematically
+// equivalent up to a permutation of d_head; pure-forward correctness
+// holds with either convention as long as Q and K rotate consistently
+// AND the prepare-script matches.  Pick INTERLEAVED here for
+// simplicity — the prepare.py side has to mirror this.
+//
+// Table layout: shape [max_seq, d_head], flat row-major.  Row `pos`
+// holds the interleaved cos/sin for each pair:
+//   table[pos * d_head + 2*i    ] = cos(pos * theta^(-2i/d_head))
+//   table[pos * d_head + 2*i + 1] = sin(pos * theta^(-2i/d_head))
+//
+// theta is typically 10000.0 (Llama-2, Mistral, TinyLlama).  Llama-3
+// uses 500000.0; the alloc API takes it as a runtime f64 so both work.
+
+// ----------------------------------------------------------------------
+// rope_alloc_f32(max_seq, d_head, theta) — pre-compute the table.
+//
+// d_head must be even.  Computes theta^(-2i/d_head) via
+// math_exp(-2*i/d_head * math_log(theta)) since math_pow isn't
+// available as a builtin.
+// ----------------------------------------------------------------------
+fn rope_alloc_f32(max_seq: i32, d_head: i32, theta: f64) -> i32 {
+    let table: i32 = arr_f32_new(max_seq * d_head);
+    let log_theta: f64 = math_log(theta);
+    let half: i32 = d_head / 2;
+    let pos: i32 = 0;
+    while (pos < max_seq) {
+        let i: i32 = 0;
+        while (i < half) {
+            // freq = theta^(-2i/d_head) = exp(-2i/d_head * log(theta))
+            let exponent: f64 = 0.0 - 2.0 * int_to_float(i) / int_to_float(d_head);
+            let freq: f64 = math_exp(exponent * log_theta);
+            let angle: f64 = int_to_float(pos) * freq;
+            let c: f64 = math_cos(angle);
+            let s: f64 = math_sin(angle);
+            arr_f32_set(table, pos * d_head + 2 * i,     c);
+            arr_f32_set(table, pos * d_head + 2 * i + 1, s);
+            i = i + 1;
+        }
+        pos = pos + 1;
+    }
+    return table;
+}
+
+// ----------------------------------------------------------------------
+// rope_apply_f32(table, vec, pos, d_head)
+//
+// Rotates the d_head-wide `vec` in place using the pre-computed `table`
+// row at `pos`.  Pair convention: (vec[2i], vec[2i+1]).
+// ----------------------------------------------------------------------
+fn rope_apply_f32(table: i32, vec: i32, pos: i32, d_head: i32) -> i32 {
+    let half: i32 = d_head / 2;
+    let row_off: i32 = pos * d_head;
+    let i: i32 = 0;
+    while (i < half) {
+        let c: f64 = arr_f32_get(table, row_off + 2 * i);
+        let s: f64 = arr_f32_get(table, row_off + 2 * i + 1);
+        let x0: f64 = arr_f32_get(vec, 2 * i);
+        let x1: f64 = arr_f32_get(vec, 2 * i + 1);
+        arr_f32_set(vec, 2 * i,     x0 * c - x1 * s);
+        arr_f32_set(vec, 2 * i + 1, x0 * s + x1 * c);
+        i = i + 1;
+    }
+    return 0;
+}

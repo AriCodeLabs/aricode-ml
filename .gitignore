@@ -8,3 +8,17 @@ examples/mnist/*.gz
 # Compiled demos
 examples/mnist/mnist
 examples/xor
+
+# Compiled test binaries (the .ari sources stay tracked)
+tests/test_attention
+tests/test_attention_kv
+tests/test_attention_mh_kv
+tests/test_sampling
+tests/test_optimizer
+tests/test_dense
+
+# Stray scratch files from earlier exploration
+arch_just_mha.json
+jm.pt
+jm_e.f32
+jm_t.bin

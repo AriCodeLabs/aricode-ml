@@ -1,0 +1,164 @@
+// aricode-ml: attention_kv_f32.ari
+//
+// Single-token incremental attention with persistent KV cache.
+// This is the decode-time companion to attention_f32.ari: instead of
+// processing a full [seq, d_in] block at once, it accepts ONE input
+// row, projects it to Q/K/V, appends the new K/V row to the cache,
+// and computes attention against all cached keys.
+//
+// Layout convention (row-major, last dim contiguous):
+//   X      : [d_in]                  current-token input (single row)
+//   W_*    : [d_head, d_in]          projection weights
+//   b_*    : [d_head]                bias
+//   K cache: [max_seq, d_head]       row j is the K vector for token j
+//   V cache: [max_seq, d_head]       row j is the V vector for token j
+//   out    : [d_head]                attention output for current token
+//
+// The state struct is a flat i32 array; slot indices are documented
+// at attn_kv_alloc_f32.  Caller is responsible for filling slot 0 (X)
+// and slot 12 (out) before each step, and slots 1..6 (weights) once
+// up front.
+//
+// The decode loop pattern is:
+//
+//   let st = attn_kv_alloc_f32(max_seq, d_in, d_head);
+//   arr_set(st, 1, W_Q); arr_set(st, 2, b_Q);  // ... (6 weight slots)
+//   arr_set(st, 12, out_buf);
+//   for each prompt token + each generated token:
+//       arr_set(st, 0, X_row);
+//       attn_kv_step_f32(st);
+//
+// Causal masking is implicit: each step attends to count+1 keys (all
+// keys written so far including this step's), which is exactly the
+// causal triangular pattern.
+
+// ----------------------------------------------------------------------
+// State allocator.  Caller sets slot 0 (X) per step and slot 12 (out)
+// per step (or once if same buffer reused).  Weights set once up front.
+// ----------------------------------------------------------------------
+fn attn_kv_alloc_f32(max_seq: i32, d_in: i32, d_head: i32) -> i32 {
+    let s: i32 = arr_new(20);
+    arr_set(s,  0, 0);                              // X (per-step)
+    arr_set(s,  1, 0); arr_set(s,  2, 0);           // W_Q, b_Q
+    arr_set(s,  3, 0); arr_set(s,  4, 0);           // W_K, b_K
+    arr_set(s,  5, 0); arr_set(s,  6, 0);           // W_V, b_V
+
+    let kc: i32 = arr_f32_new(max_seq * d_head);
+    arr_f32_fill(kc, 0.0);
+    arr_set(s,  7, kc);                             // K cache
+
+    let vc: i32 = arr_f32_new(max_seq * d_head);
+    arr_f32_fill(vc, 0.0);
+    arr_set(s,  8, vc);                             // V cache
+
+    arr_set(s,  9, arr_f32_new(d_head));            // Q scratch
+    arr_set(s, 10, arr_f32_new(d_head));            // row_qkv scratch (K_new / V_new)
+    arr_set(s, 11, arr_f32_new(max_seq));           // scores scratch
+    arr_set(s, 12, 0);                              // out (per-step)
+    arr_set(s, 13, max_seq);
+    arr_set(s, 14, d_in);
+    arr_set(s, 15, d_head);
+    arr_set(s, 16, 0);                              // count
+
+    // Slot 17: zero-bias scratch of length max_seq for arr_f32_matvec's
+    // bias parameter on the score matvec (we never want a real bias on
+    // attention scores).  Filled once at alloc time and never written.
+    let zb: i32 = arr_f32_new(max_seq);
+    arr_f32_fill(zb, 0.0);
+    arr_set(s, 17, zb);
+    return s;
+}
+
+// ----------------------------------------------------------------------
+// Reset cache state (zero count, zero K/V cache).  Used between
+// independent generations sharing the same allocated state.
+// ----------------------------------------------------------------------
+fn attn_kv_reset(s: i32) -> i32 {
+    arr_f32_fill(arr_get(s, 7), 0.0);
+    arr_f32_fill(arr_get(s, 8), 0.0);
+    arr_set(s, 16, 0);
+    return 0;
+}
+
+// ----------------------------------------------------------------------
+// One incremental step:
+//   1. Project Q = W_Q · X + b_Q                 (one row)
+//   2. K_new    = W_K · X + b_K → write into Kc[count, :]
+//   3. V_new    = W_V · X + b_V → write into Vc[count, :]
+//   4. n        = count + 1
+//   5. scores[j] = Q · Kc[j, :] / sqrt(d_head)   for j in 0..n
+//   6. soft     = stable softmax(scores[0..n])
+//   7. out[d]   = sum_j soft[j] · Vc[j, d]       for d in 0..d_head
+//   8. count   ++
+//
+// Returns 0 on success, -1 if cache would overflow.
+// ----------------------------------------------------------------------
+fn attn_kv_step_f32(s: i32) -> i32 {
+    let X: i32       = arr_get(s,  0);
+    let W_Q: i32     = arr_get(s,  1);  let b_Q: i32 = arr_get(s,  2);
+    let W_K: i32     = arr_get(s,  3);  let b_K: i32 = arr_get(s,  4);
+    let W_V: i32     = arr_get(s,  5);  let b_V: i32 = arr_get(s,  6);
+    let Kc: i32      = arr_get(s,  7);
+    let Vc: i32      = arr_get(s,  8);
+    let Q: i32       = arr_get(s,  9);
+    let row: i32     = arr_get(s, 10);
+    let scores: i32  = arr_get(s, 11);
+    let out: i32     = arr_get(s, 12);
+    let max_seq: i32 = arr_get(s, 13);
+    let d_in: i32    = arr_get(s, 14);
+    let d_head: i32  = arr_get(s, 15);
+    let count: i32   = arr_get(s, 16);
+    let zero_bias: i32 = arr_get(s, 17);
+
+    if (count >= max_seq) {
+        return 0 - 1;
+    }
+
+    // ---- Step 1: project Q, then pre-scale by 1/sqrt(d_head) ----
+    // Pre-scaling Q once is mathematically equivalent to scaling each
+    // score after the matvec but cheaper (one d_head-length scale vs.
+    // an n-length scale every step) and lets the matvec output land
+    // pre-scaled with no follow-up pass.
+    arr_f32_matvec(W_Q, X, b_Q, Q, d_head, d_in);
+    let inv_sqrt_dh: f64 = 1.0 / math_sqrt(int_to_float(d_head));
+    arr_f32_scale(Q, inv_sqrt_dh);
+
+    // ---- Step 2: project K_new and append to K cache ----
+    arr_f32_matvec(W_K, X, b_K, row, d_head, d_in);
+    arr_f32_copy_slice(row, 0, Kc, count * d_head, d_head);
+
+    // ---- Step 3: project V_new and append to V cache ----
+    arr_f32_matvec(W_V, X, b_V, row, d_head, d_in);
+    arr_f32_copy_slice(row, 0, Vc, count * d_head, d_head);
+
+    // ---- Step 4: scores[j] = (Q/sqrt(dh)) · Kc[j, :], j in 0..n ----
+    // SIMD matvec: scores = Kc[0..n, :] · Q + 0.  Treats Kc as an
+    // [n, d_head] flat matrix; arr_f32_matvec only reads n*d_head
+    // floats from Kc and never inspects its length header, so the
+    // larger [max_seq, d_head] backing buffer is fine.
+    let n: i32 = count + 1;
+    arr_f32_matvec(Kc, Q, zero_bias, scores, n, d_head);
+
+    // ---- Step 5: stable softmax over the WHOLE scores buffer ----
+    // arr_f32_softmax always softmaxes every element of its argument.
+    // We poison the inactive tail with -60 so exp(-60 - max) ≈ 1e-26
+    // contributes negligible mass; the tail probabilities then come
+    // out near-zero and never leak into the V combine, which only
+    // touches the first n entries via arr_f32_matvec_T.
+    let j: i32 = n;
+    while (j < max_seq) {
+        arr_f32_set(scores, j, 0.0 - 60.0);
+        j = j + 1;
+    }
+    arr_f32_softmax(scores);
+
+    // ---- Step 6: out = Vc[0..n, :].T · scores[0..n] ----
+    // matvec_T zeros out[0..d_head] then accumulates n FMA chunks,
+    // reading exactly the first n rows of Vc and the first n score
+    // entries — the poisoned tail is structurally ignored.
+    arr_f32_matvec_T(Vc, scores, out, n, d_head);
+
+    // ---- Step 7: advance count ----
+    arr_set(s, 16, count + 1);
+    return 0;
+}
