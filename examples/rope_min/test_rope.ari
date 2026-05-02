@@ -1,0 +1,57 @@
+// Standalone RoPE smoke test: rope_alloc_f32 + rope_apply_f32
+// against hand-computed expected values.  Lives in examples/ so the
+// run_test.sh wrapper can be invoked uniformly with the rest of the
+// regression suite.
+
+import "../../rope_f32.ari" as rope;
+
+fn main() -> i32 {
+    let max_seq: i32 = 4;
+    let d_head: i32 = 4;
+    let theta: f64 = 10000.0;
+    let table: i32 = rope.rope_alloc_f32(max_seq, d_head, theta);
+
+    let vec: i32 = arr_f32_new(d_head);
+    arr_f32_set(vec, 0, 1.0);
+    arr_f32_set(vec, 1, 2.0);
+    arr_f32_set(vec, 2, 3.0);
+    arr_f32_set(vec, 3, 4.0);
+
+    rope.rope_apply_f32(table, vec, 1, d_head);
+
+    let exp0: f64 = 0.0 - 1.1426396637476532;
+    let exp1: f64 =       1.9220755965441760;
+    let exp2: f64 =       2.9598506679133294;
+    let exp3: f64 =       4.0297995016691610;
+
+    let v0: f64 = arr_f32_get(vec, 0);
+    let v1: f64 = arr_f32_get(vec, 1);
+    let v2: f64 = arr_f32_get(vec, 2);
+    let v3: f64 = arr_f32_get(vec, 3);
+
+    let d0: f64 = v0 - exp0; if (d0 < 0.0) { d0 = 0.0 - d0; }
+    let d1: f64 = v1 - exp1; if (d1 < 0.0) { d1 = 0.0 - d1; }
+    let d2: f64 = v2 - exp2; if (d2 < 0.0) { d2 = 0.0 - d2; }
+    let d3: f64 = v3 - exp3; if (d3 < 0.0) { d3 = 0.0 - d3; }
+
+    let max_diff: f64 = d0;
+    if (d1 > max_diff) { max_diff = d1; }
+    if (d2 > max_diff) { max_diff = d2; }
+    if (d3 > max_diff) { max_diff = d3; }
+
+    let tol: f64 = 0.00001;
+    if (max_diff < tol) {
+        print_str("ROPE_OK");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+    } else {
+        print_str("FAIL");
+        print_str("max abs diff:");
+        print_f64(max_diff, 9);
+        print_str("v0:"); print_f64(v0, 9); print_str("exp0:"); print_f64(exp0, 9);
+        print_str("v1:"); print_f64(v1, 9); print_str("exp1:"); print_f64(exp1, 9);
+        print_str("v2:"); print_f64(v2, 9); print_str("exp2:"); print_f64(exp2, 9);
+        print_str("v3:"); print_f64(v3, 9); print_str("exp3:"); print_f64(exp3, 9);
+    }
+    return 0;
+}

@@ -1,0 +1,13 @@
+synth.pt
+prompt.bin
+expected_tokens.bin
+*.f32
+*.i8
+*.ari
+__pycache__/
+tiny_decoder_packed
+tiny_decoder_packed_int8
+# ad-hoc sampling test artifacts (greedy / temperature / topk / EOS variants)
+tiny_decoder_temp
+tiny_decoder_eos
+tiny_decoder_topk

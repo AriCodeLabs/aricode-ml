@@ -1,0 +1,16 @@
+[
+    ["embedding", 16, 8, 1],
+
+    ["save_residual"],
+    ["rmsnorm", 8],
+    ["multi_head_attention_kv", 8, 8, 2],
+    ["add_residual"],
+
+    ["save_residual"],
+    ["rmsnorm", 8],
+    ["swiglu_ffn", 8, 16],
+    ["add_residual"],
+
+    ["rmsnorm", 8],
+    ["linear", 8, 16]
+]

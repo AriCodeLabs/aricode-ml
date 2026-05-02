@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -360,8 +361,76 @@ fn attention_forward_f32(desc: i32) -> i32 {
 def needs_attention_lib(arch):
     # Multi-head attention also dispatches into single-head's
     # attention_forward_f32, so the library is needed for either kind.
+    # The KV variant has its own (separate) kernel; only emit the
+    # one-shot lib if a one-shot attention layer is present.
     return any(layer[0] in ("attention", "multi_head_attention")
                for layer in arch)
+
+
+# KV-cache + multi-head + sampling library — loaded at pack time from
+# the canonical .ari sources in aricode-stdlib/aricode-ml/.  Single
+# source of truth: the KV stdlib lives in aricode-ml/*.ari.  We inline
+# it at pack time so generated binaries are self-contained without
+# external import paths.  The .ari originals use `import "..." as kv;`
+# plus namespaced calls (kv.attn_kv_step_f32, samp.sample_greedy_f32);
+# we strip the imports and the `kv.` / `mhkv.` / `samp.` prefixes so
+# the resulting blob is one flat module.
+_NAMESPACE_PREFIX_RE = re.compile(r"\b(?:kv|mhkv|samp|rope|gqa)\.")
+_IMPORT_LINE_RE = re.compile(r"^\s*import\s+\"[^\"]+\"\s+as\s+\w+\s*;\s*$")
+
+
+def _strip_kv_lib_source(src: str) -> str:
+    """Remove import statements and namespace prefixes from one .ari
+    file, so its functions can be inlined alongside their callees."""
+    out_lines = []
+    for line in src.splitlines():
+        if _IMPORT_LINE_RE.match(line):
+            continue
+        out_lines.append(_NAMESPACE_PREFIX_RE.sub("", line))
+    return "\n".join(out_lines)
+
+
+def _load_kv_attention_lib() -> str:
+    """Read attention_kv_f32.ari, attention_mh_kv_f32.ari, rope_f32.ari,
+    attention_gqa_kv_f32.ari, and sampling_f32.ari from the stdlib and
+    return their concatenation with imports + namespace prefixes
+    stripped.  Order matters:
+      - attention_kv must precede attention_mh_kv (mhkv calls kv).
+      - rope must precede attention_gqa_kv (gqa calls into rope).
+      - attention_kv must precede attention_gqa_kv (gqa reuses attn_kv
+        state buffers via kv.attn_kv_alloc_f32 / kv.attn_kv_reset)."""
+    ml_dir = Path(__file__).resolve().parent.parent
+    files = [
+        "attention_kv_f32.ari",
+        "attention_mh_kv_f32.ari",
+        "rope_f32.ari",
+        "attention_gqa_kv_f32.ari",
+        "sampling_f32.ari",
+    ]
+    parts = []
+    for name in files:
+        src = (ml_dir / name).read_text()
+        parts.append(_strip_kv_lib_source(src))
+    return "\n".join(parts)
+
+
+def needs_kv_attention_lib(arch):
+    """True iff any layer is the incremental KV-cached variant.  When
+    set, we import attention_mh_kv_f32 (which transitively imports
+    attention_kv_f32) and the sampling primitives in the prologue.
+    Also fires for the GQA variant since it shares the KV state machinery
+    and uses RoPE (both bundled into the same prologue blob)."""
+    return any(layer[0] in ("multi_head_attention_kv",
+                            "multi_head_attention_gqa_kv")
+               for layer in arch)
+
+
+def is_decoder_arch(arch):
+    """A decoder arch is one that contains at least one MHA-KV layer.
+    These archs run in single-token mode end-to-end, so every layer
+    sees a [d_model] activation rather than [seq, d_model], and main()
+    wraps the forward in an autoregressive token loop."""
+    return needs_kv_attention_lib(arch)
 
 
 def _embedding_token_bytes(vocab_size):
@@ -456,6 +525,76 @@ fn gelu_f32(buf: i32) -> i32 {
 """
 
 
+# RMSNorm with affine γ, no bias.  Used by Llama / TinyLlama / Mistral.
+# Skips the mean-subtract pass that LayerNorm does — divides by RMS
+# (root-mean-square) directly.  eps default 1e-5 matches HF Llama.
+RMSNORM_HELPER = """
+fn rmsnorm_affine_f32(buf: i32, dim: i32, gamma: i32) -> i32 {
+    let n: i32 = arr_len(buf);
+    let K: i32 = n / dim;
+    let eps: f64 = 0.00001;
+    let k: i32 = 0;
+    while (k < K) {
+        let off: i32 = k * dim;
+        let sq: f64 = 0.0;
+        let i: i32 = 0;
+        while (i < dim) {
+            let v: f64 = arr_f32_get(buf, off + i);
+            sq = sq + v * v;
+            i = i + 1;
+        }
+        let inv_rms: f64 = 1.0 / math_sqrt(sq / int_to_float(dim) + eps);
+        i = 0;
+        while (i < dim) {
+            arr_f32_set(buf, off + i,
+                arr_f32_get(buf, off + i) * arr_f32_get(gamma, i) * inv_rms);
+            i = i + 1;
+        }
+        k = k + 1;
+    }
+    return 0;
+}
+"""
+
+
+def needs_rmsnorm_helper(arch):
+    return any(layer[0] == "rmsnorm" for layer in arch)
+
+
+# SwiGLU element-wise step: out[i] = silu(gate[i]) * up[i].  Used by
+# Llama / Mistral / Falcon FFNs after the two parallel projections.
+# silu(x) = x * sigmoid(x); we use the identity silu(x) = x / (1 + e^-x)
+# with branched saturation to keep math_exp inside its safe range
+# (mirrors the GELU helper's clamp at |2*inner| > 20).
+SWIGLU_HELPER = """
+fn silu_mul_f32(gate: i32, up_then_dst: i32, d: i32) -> i32 {
+    let i: i32 = 0;
+    while (i < d) {
+        let g: f64 = arr_f32_get(gate, i);
+        let sg: f64 = 0.0;
+        if (g > 20.0) {
+            sg = g;
+        } else {
+            if (g < 0.0 - 20.0) {
+                sg = 0.0;
+            } else {
+                let e_neg: f64 = math_exp(0.0 - g);
+                sg = g / (1.0 + e_neg);
+            }
+        }
+        let u: f64 = arr_f32_get(up_then_dst, i);
+        arr_f32_set(up_then_dst, i, sg * u);
+        i = i + 1;
+    }
+    return 0;
+}
+"""
+
+
+def needs_swiglu_helper(arch):
+    return any(layer[0] == "swiglu_ffn" for layer in arch)
+
+
 def needs_gelu_helper(arch):
     return any(layer[0] == "gelu" for layer in arch)
 
@@ -477,7 +616,7 @@ def residual_slots(arch):
     # Pre-LN transformer pattern) sizes correctly.
     pseudo = ("save_residual", "add_residual", "flatten",
               "relu", "sigmoid", "tanh", "softmax", "gelu",
-              "layernorm", "positional_embedding")
+              "layernorm", "rmsnorm", "positional_embedding")
     first = next((l for l in arch if l[0] not in pseudo), None)
     if first is None:
         first = arch[0]
@@ -648,12 +787,68 @@ def tensor_specs(kind, *args):
                 f"multiple of n_heads ({n_heads})")
         for proj in ("q", "k", "v", "o"):
             yield (proj, d_model * d_model, d_model)
+    elif kind == "multi_head_attention_kv":
+        # ["multi_head_attention_kv", max_seq, d_model, n_heads]
+        # Same weight tensors as multi_head_attention (Q/K/V/O), but
+        # consumed by attn_mh_kv_step_f32 (incremental, single-token,
+        # causal-by-construction).  Causal flag is implicit — KV cache
+        # only ever holds past tokens, so each step attends to the
+        # exact upper-triangular set the one-shot causal mask defines.
+        max_seq, d_model, n_heads = args
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"multi_head_attention_kv: d_model ({d_model}) must be a "
+                f"multiple of n_heads ({n_heads})")
+        for proj in ("q", "k", "v", "o"):
+            yield (proj, d_model * d_model, d_model)
+    elif kind == "multi_head_attention_gqa_kv":
+        # ["multi_head_attention_gqa_kv", max_seq, d_model, n_heads,
+        #                                  n_kv_heads, theta]
+        # Llama / TinyLlama / Mistral attention with GQA + RoPE.
+        #   q : (d_model, d_model)
+        #   k : (n_kv_heads * d_head, d_model)   ← narrower than Q
+        #   v : (n_kv_heads * d_head, d_model)
+        #   o : (d_model, d_model)
+        # No biases (Llama convention).  d_head = d_model // n_heads.
+        # n_heads must be a multiple of n_kv_heads (group_size = ratio).
+        max_seq, d_model, n_heads, n_kv_heads, theta = args
+        if d_model % n_heads != 0:
+            raise ValueError(
+                f"multi_head_attention_gqa_kv: d_model ({d_model}) must "
+                f"be a multiple of n_heads ({n_heads})")
+        if n_heads % n_kv_heads != 0:
+            raise ValueError(
+                f"multi_head_attention_gqa_kv: n_heads ({n_heads}) must "
+                f"be a multiple of n_kv_heads ({n_kv_heads})")
+        d_head = d_model // n_heads
+        kv_dim = n_kv_heads * d_head
+        yield ("q", d_model * d_model, 0)
+        yield ("k", kv_dim * d_model,  0)
+        yield ("v", kv_dim * d_model,  0)
+        yield ("o", d_model * d_model, 0)
     elif kind == "layernorm":
         # ["layernorm", dim] (eps defaults to 1e-5; or ["layernorm", dim, eps])
         # Single (γ, β) pair, both shape (dim,) — matches HuggingFace's
         # LayerNorm.weight (γ) / LayerNorm.bias (β) convention.
         dim = args[0]
         yield ("", dim, dim)
+    elif kind == "rmsnorm":
+        # ["rmsnorm", dim] — Llama/Mistral RMSNorm.  Single γ tensor, NO
+        # β (HF stores `model.layers.{i}.input_layernorm.weight` only).
+        # Yield n_bias = 0 so gen_weight_decls / gen_load skip the bias.
+        dim = args[0]
+        yield ("", dim, 0)
+    elif kind == "swiglu_ffn":
+        # ["swiglu_ffn", d_model, d_ffn] — Llama/Mistral FFN block.
+        # Three weight tensors, NO biases (HF Llama drops them).  Output
+        # = down(silu(gate(x)) * up(x)).
+        #   gate (d_ffn, d_model)   — gate_proj
+        #   up   (d_ffn, d_model)   — up_proj
+        #   down (d_model, d_ffn)   — down_proj
+        d_model, d_ffn = args
+        yield ("gate", d_ffn * d_model, 0)
+        yield ("up",   d_ffn * d_model, 0)
+        yield ("down", d_model * d_ffn, 0)
     elif kind == "embedding":
         # ["embedding", vocab_size, d_model, seq]
         # nn.Embedding has only a weight tensor (no bias).  We yield
@@ -690,8 +885,32 @@ def tensor_names(kind, idx, suffix=""):
         # both kinds without name collisions.  e.g. Wmq0/bmq0 for the
         # 0th MHA layer's Q projection.
         return f"Wm{suffix}{idx}", f"bm{suffix}{idx}"
+    if kind == "multi_head_attention_kv":
+        # Same weight tensor names as multi_head_attention so a static
+        # checkpoint can be repurposed between prefill and decode forms
+        # with no re-keying.  The kv index counter is shared with the
+        # one-shot MHA counter only when both kinds appear in the same
+        # arch — a runtime requirement we don't currently exercise.
+        return f"Wm{suffix}{idx}", f"bm{suffix}{idx}"
+    if kind == "multi_head_attention_gqa_kv":
+        # Distinct prefix from MHA-KV's Wm so a single arch can host
+        # both kinds (Llama-2 + GPT-2 hybrid for tests) without weight
+        # tensor name collisions.  No biases (Llama drops them); the b*
+        # name is reserved only for API symmetry — consumers gate on
+        # n_bias==0 from tensor_specs and skip the alloc.
+        return f"Wgqa{suffix}{idx}", f"bgqa{suffix}{idx}"
     if kind == "layernorm":
         return f"Wn{idx}", f"bn{idx}"   # γ=Wn (the "weight" in HF naming), β=bn
+    if kind == "rmsnorm":
+        # Distinct prefix from layernorm so the same arch can host both
+        # without name collisions.  No bias — `br{idx}` is reserved
+        # only for API symmetry; consumers gate on n_bias == 0.
+        return f"Wr{idx}", f"br{idx}"
+    if kind == "swiglu_ffn":
+        # Three weight tensors per layer (gate / up / down) and no
+        # biases.  Suffix carries the projection name; consumers gate
+        # on n_bias == 0 and skip allocation of `b{suffix}{idx}`.
+        return f"Wsw{suffix}{idx}", f"bsw{suffix}{idx}"
     if kind == "embedding":
         # No bias for nn.Embedding; bemb{idx} is reserved but never
         # allocated.  Returned only for API symmetry; consumers gate
@@ -714,8 +933,12 @@ def weight_tensors(arch):
     ai = 0
     ni = 0
     mi = 0
+    gi = 0   # multi_head_attention_gqa_kv counter (separate from mi so
+             # mixed Llama+GPT-2 archs don't reuse Wm/Wgqa naming slots)
     ei = 0
     pei = 0
+    ri = 0
+    si = 0
     for kind, *args in arch:
         if kind == "linear":
             for suffix, nw, nb in tensor_specs(kind, *args):
@@ -737,11 +960,37 @@ def weight_tensors(arch):
                 wname, bname = tensor_names(kind, mi, suffix)
                 yield (kind, mi, suffix, nw, nb, wname, bname)
             mi += 1
+        elif kind == "multi_head_attention_kv":
+            # Shares the `mi` counter with the one-shot variant: weight
+            # tensor names (Wmq{i}/bmq{i}/...) are identical so a state
+            # dict keyed for one form loads cleanly into the other.
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, mi, suffix)
+                yield (kind, mi, suffix, nw, nb, wname, bname)
+            mi += 1
+        elif kind == "multi_head_attention_gqa_kv":
+            # Distinct counter (`gi`) from the MHA-KV variant — Llama
+            # decoders use Wgqa{*}/bgqa{*} naming and never collide with
+            # GPT-2-style Wm{*}/bm{*}.
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, gi, suffix)
+                yield (kind, gi, suffix, nw, nb, wname, bname)
+            gi += 1
         elif kind == "layernorm":
             for suffix, nw, nb in tensor_specs(kind, *args):
                 wname, bname = tensor_names(kind, ni, suffix)
                 yield (kind, ni, suffix, nw, nb, wname, bname)
             ni += 1
+        elif kind == "rmsnorm":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, ri, suffix)
+                yield (kind, ri, suffix, nw, nb, wname, bname)
+            ri += 1
+        elif kind == "swiglu_ffn":
+            for suffix, nw, nb in tensor_specs(kind, *args):
+                wname, bname = tensor_names(kind, si, suffix)
+                yield (kind, si, suffix, nw, nb, wname, bname)
+            si += 1
         elif kind == "embedding":
             for suffix, nw, nb in tensor_specs(kind, *args):
                 wname, bname = tensor_names(kind, ei, suffix)
@@ -794,7 +1043,7 @@ def gen_act_decls(arch):
     # would either crash or pick the wrong size.
     pseudo = ("save_residual", "add_residual", "flatten",
               "relu", "sigmoid", "tanh", "softmax", "gelu",
-              "layernorm", "positional_embedding")
+              "layernorm", "rmsnorm", "positional_embedding")
     first = next((l for l in arch if l[0] not in pseudo), None)
     if first is None:
         # Pure LN/activation chain — fall back to first layer's dim
@@ -817,6 +1066,15 @@ def gen_act_decls(arch):
         # Input X is [seq, d_model] flat; size = seq * d_model.
         seq, d_model, _, _ = first[1], first[2], first[3], first[4]
         sizes = [seq * d_model]
+    elif first[0] == "multi_head_attention_kv":
+        # Decoder mode — single-token input, d_model wide.
+        _, d_model, _ = first[1], first[2], first[3]
+        sizes = [d_model]
+    elif first[0] == "multi_head_attention_gqa_kv":
+        # GQA decoder mode — single-token input, d_model wide.  Args:
+        # (max_seq, d_model, n_heads, n_kv_heads, theta).
+        _, d_model = first[1], first[2]
+        sizes = [d_model]
     elif first[0] == "embedding":
         # Embedding's input is a sequence of token IDs (held in a
         # separate scratch buffer the input loader fills).  Its OUTPUT
@@ -831,6 +1089,13 @@ def gen_act_decls(arch):
         # K > 1, prepend a no-op layer (or a placeholder linear with
         # in_features=K*dim) to fix the input size.
         sizes = [first[1]]   # = dim
+    elif first[0] == "rmsnorm":
+        # Same single-row default as LayerNorm; same arch-JSON
+        # workaround applies for batched use.
+        sizes = [first[1]]
+    elif first[0] == "swiglu_ffn":
+        # Input dimension is d_model (first arg).
+        sizes = [first[1]]
     else:
         raise ValueError(f"first layer must be linear, conv2d_3x3_p1, attention, "
                          f"or layernorm; got {first[0]!r}")
@@ -867,6 +1132,16 @@ def gen_act_decls(arch):
             # projected back to d_model) — same shape as the input.
             seq, d_model, _, _ = args
             sizes.append(seq * d_model)
+        elif kind == "multi_head_attention_kv":
+            # KV-cache MHA always operates on a single token (one
+            # query at a time, attending against all cached keys).
+            # Output is [d_model] — same shape as the single-row input.
+            _, d_model, _ = args
+            sizes.append(d_model)
+        elif kind == "multi_head_attention_gqa_kv":
+            # Same single-token, d_model-out contract as MHA-KV.
+            _, d_model, _, _, _ = args
+            sizes.append(d_model)
         elif kind == "embedding":
             # Token-ID lookup → [seq, d_model] f32.  When embedding is
             # the first layer, this is the same size as sizes[0] (set
@@ -885,6 +1160,17 @@ def gen_act_decls(arch):
         elif kind == "layernorm":
             # In-place — same buffer, same size.
             pass
+        elif kind == "rmsnorm":
+            # In-place — same buffer, same size.
+            pass
+        elif kind == "swiglu_ffn":
+            # ["swiglu_ffn", d_model, d_ffn] — shape-preserving (input
+            # and output both d_model wide).  We still emit into a
+            # fresh buffer because the down projection's output can't
+            # safely alias the input; the size match means the new
+            # buffer is sized exactly d_model.
+            d_model, _ = args
+            sizes.append(d_model)
         elif kind in ("save_residual", "add_residual"):
             # In-place; the save copies, the add accumulates.  Neither
             # changes the activation size.
@@ -902,6 +1188,11 @@ def gen_act_decls(arch):
 def gen_scratch(arch):
     """Extra scratch buffers needed by spatial layers."""
     lines = []
+    # Decoder mode emits its own per-token positional-embedding add
+    # inline in gen_decoder_main (one row of d_model adds per step), so
+    # the (seq*d_model) pe_window scratch is unused there.  Skip the
+    # allocation in that case to avoid an orphan buffer.
+    decoder_mode = is_decoder_arch(arch)
     if any(layer[0] == "conv2d_3x3_p1" for layer in arch):
         lines.append("    let padded: i32 = arr_f32_new(900);  // 30×30 zero-padded")
     # Multi-channel conv now goes through the native AVX2 builtin
@@ -917,7 +1208,18 @@ def gen_scratch(arch):
     pi = 0
     ai = 0
     mi = 0
+    gi = 0    # multi_head_attention_gqa_kv counter
     pei = 0   # positional_embedding counter (for scratch buffer naming)
+    si = 0    # swiglu_ffn counter
+    # SwiGLU FFN needs a zero-bias scratch sized to max(d_ffn) across
+    # all swiglu layers; matvec wants a real bias buffer (not NULL),
+    # and Llama's FFN has zero biases by convention.  One shared buffer
+    # works because matvec only reads bias[0..m-1], and m ≤ max(d_ffn).
+    swiglu_dffns = [args[1] for kind, *args in arch if kind == "swiglu_ffn"]
+    if swiglu_dffns:
+        zb = max(swiglu_dffns)
+        lines.append(f"    let _zb_swg: i32 = arr_f32_new({zb});")
+        lines.append(f"    arr_f32_fill(_zb_swg, 0.0);")
     for kind, *args in arch:
         if kind == "maxpool_2x2":
             c = args[0]
@@ -938,10 +1240,13 @@ def gen_scratch(arch):
             # Need a window scratch sized [seq, d_model] so we can
             # arr_f32_add_scaled the leading seq*d_model slice of
             # the (max_pos, d_model) table into the activation in
-            # one whole-array call.
+            # one whole-array call.  Decoder mode emits the per-row
+            # add inline in main() (single token per step), so it
+            # doesn't need or use this buffer — skip the allocation.
             max_pos, d_model, seq = args
-            lines.append(
-                f"    let pe_window_{pei}: i32 = arr_f32_new({seq * d_model});")
+            if not decoder_mode:
+                lines.append(
+                    f"    let pe_window_{pei}: i32 = arr_f32_new({seq * d_model});")
             pei += 1
         elif kind == "multi_head_attention":
             seq, d_model, n_heads, causal = args
@@ -968,6 +1273,54 @@ def gen_scratch(arch):
             lines.append(
                 f"    let mha_concat_{mi}: i32 = arr_f32_new({seq * d_model});")
             mi += 1
+        elif kind == "multi_head_attention_kv":
+            # Decode-time MHA: one persistent attn_mh_kv state per layer
+            # holds the K/V cache plus all per-head slice scratches.
+            # The state's Q/K/V/O weight slots get bound to the loaded
+            # Wmq{i}/bmq{i}/... tensors right after allocation so the
+            # token loop can call attn_mh_kv_step_f32 with no per-step
+            # rebinding.  The X (input) and out (output) slots stay
+            # rebindable since the per-step forward chooses fresh
+            # activation buffers each iteration.
+            max_seq, d_model, n_heads = args
+            lines.append(
+                f"    let mhkv_state_{mi}: i32 = "
+                f"attn_mh_kv_alloc_f32({max_seq}, {d_model}, {n_heads});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 1, Wmq{mi});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 2, bmq{mi});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 3, Wmk{mi});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 4, bmk{mi});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 5, Wmv{mi});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 6, bmv{mi});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 7, Wmo{mi});")
+            lines.append(f"    arr_set(mhkv_state_{mi}, 8, bmo{mi});")
+            mi += 1
+        elif kind == "multi_head_attention_gqa_kv":
+            # Llama-style GQA decode step: persistent state holds RoPE
+            # table + n_kv_heads KV caches + per-head slice scratches.
+            # No biases — slots 2/4/6/8 stay at the alloc-time 0
+            # sentinel and the step kernel routes them through the
+            # internal zero-fill scratches.
+            max_seq, d_model, n_heads, n_kv_heads, theta = args
+            lines.append(
+                f"    let gqa_state_{gi}: i32 = "
+                f"attn_gqa_kv_alloc_f32({max_seq}, {d_model}, {n_heads}, "
+                f"{n_kv_heads}, {theta!r});")
+            lines.append(f"    arr_set(gqa_state_{gi}, 1, Wgqaq{gi});")
+            lines.append(f"    arr_set(gqa_state_{gi}, 3, Wgqak{gi});")
+            lines.append(f"    arr_set(gqa_state_{gi}, 5, Wgqav{gi});")
+            lines.append(f"    arr_set(gqa_state_{gi}, 7, Wgqao{gi});")
+            gi += 1
+        elif kind == "swiglu_ffn":
+            # Per-layer gate / up scratches sized to d_ffn.  silu_mul
+            # writes silu(gate)*up into the up buffer in place; the
+            # final down matvec reads from the up buffer.
+            d_model, d_ffn = args
+            lines.append(
+                f"    let _swg_gate_{si}: i32 = arr_f32_new({d_ffn});")
+            lines.append(
+                f"    let _swg_up_{si}: i32 = arr_f32_new({d_ffn});")
+            si += 1
     # Residual slot buffers: one per save_residual entry, sized to the
     # activation count at the save point (= same as the matched add).
     for slot_idx, n_elems in residual_slots(arch):
@@ -998,7 +1351,7 @@ def gen_scratch(arch):
         first_lin = next((l for l in arch if l[0] not in
                           ("save_residual", "add_residual", "flatten",
                            "relu", "sigmoid", "tanh", "softmax", "gelu",
-                           "layernorm", "positional_embedding")), None)
+                           "layernorm", "rmsnorm", "positional_embedding")), None)
         if first_lin is not None:
             if first_lin[0] == "linear":
                 cur = first_lin[1]
@@ -1008,6 +1361,12 @@ def gen_scratch(arch):
                 cur = first_lin[1] * first_lin[2]
             elif first_lin[0] == "multi_head_attention":
                 cur = first_lin[1] * first_lin[2]
+            elif first_lin[0] == "multi_head_attention_kv":
+                # Always operates on a single token → cur is just d_model.
+                cur = first_lin[2]
+            elif first_lin[0] == "multi_head_attention_gqa_kv":
+                # Llama-style GQA — same single-token contract.
+                cur = first_lin[2]
             elif first_lin[0] == "embedding":
                 # ["embedding", vocab, d_model, seq] → output [seq, d_model]
                 cur = first_lin[3] * first_lin[2]
@@ -1030,6 +1389,10 @@ def gen_scratch(arch):
                 cur = args[0] * args[2]
             elif kind == "multi_head_attention":
                 cur = args[0] * args[1]
+            elif kind == "multi_head_attention_kv":
+                cur = args[1]   # single-row d_model
+            elif kind == "multi_head_attention_gqa_kv":
+                cur = args[1]   # single-row d_model (GQA mirrors MHA-KV)
             elif kind == "embedding":
                 cur = args[2] * args[1]   # seq * d_model
         if any_batched:
@@ -1052,6 +1415,8 @@ def gen_scratch(arch):
                     cur2 = first_lin[1] * first_lin[2]
                 elif first_lin[0] == "multi_head_attention":
                     cur2 = first_lin[1] * first_lin[2]
+                elif first_lin[0] == "multi_head_attention_kv":
+                    cur2 = first_lin[2]
                 elif first_lin[0] == "embedding":
                     cur2 = first_lin[3] * first_lin[2]
             li2 = 0
@@ -1075,6 +1440,10 @@ def gen_scratch(arch):
                     cur2 = args[0] * args[2]
                 elif kind == "multi_head_attention":
                     cur2 = args[0] * args[1]
+                elif kind == "multi_head_attention_kv":
+                    cur2 = args[1]
+                elif kind == "multi_head_attention_gqa_kv":
+                    cur2 = args[1]
                 elif kind == "embedding":
                     cur2 = args[2] * args[1]
         # MHA's output projection still uses the shared _row_in /
@@ -1203,8 +1572,11 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
     ai = 0
     ni = 0
     mi = 0
+    gi = 0   # multi_head_attention_gqa_kv counter
     ei = 0
     pei = 0
+    ri = 0
+    si = 0
     # Stack of (slot_idx, n_elems) for every save_residual we've emitted
     # but not yet matched with an add_residual.  Pre-validated by
     # residual_slots (called from gen_scratch); here we just track
@@ -1317,6 +1689,33 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(
                 f"    layernorm_affine_f32({src}, {dim}, Wn{ni}, bn{ni});")
             ni += 1
+        elif kind == "rmsnorm":
+            # In-place RMSNorm with affine γ (no β).  Llama / Mistral.
+            dim = args[0]
+            src = f"a{cur_a}"
+            lines.append(
+                f"    rmsnorm_affine_f32({src}, {dim}, Wr{ri});")
+            ri += 1
+        elif kind == "swiglu_ffn":
+            # Llama-style FFN: down(silu(gate(x)) * up(x)).  Three
+            # matvecs + one element-wise silu*mul.  No biases.
+            d_model, d_ffn = args
+            src = f"a{cur_a}"
+            dst = f"a{cur_a + 1}"
+            lines.append(f"    // swiglu_ffn {si}: d_model={d_model} d_ffn={d_ffn}")
+            lines.append(
+                f"    arr_f32_matvec(Wswgate{si}, {src}, _zb_swg, "
+                f"_swg_gate_{si}, {d_ffn}, {d_model});")
+            lines.append(
+                f"    arr_f32_matvec(Wswup{si}, {src}, _zb_swg, "
+                f"_swg_up_{si}, {d_ffn}, {d_model});")
+            lines.append(
+                f"    silu_mul_f32(_swg_gate_{si}, _swg_up_{si}, {d_ffn});")
+            lines.append(
+                f"    arr_f32_matvec(Wswdown{si}, _swg_up_{si}, _zb_swg, "
+                f"{dst}, {d_model}, {d_ffn});")
+            cur_a += 1
+            si += 1
         elif kind == "attention":
             # Single-head scaled dot-product attention.
             # The descriptor was allocated once in gen_scratch; here we
@@ -1407,6 +1806,42 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             lines.append(f"    }}")
             cur_a += 1
             mi += 1
+        elif kind == "multi_head_attention_kv":
+            # KV-cached MHA decode step.  All heads + Q/K/V/O projection
+            # + cache append + scaled-softmax-against-cache + concat
+            # happens inside attn_mh_kv_step_f32 against the persistent
+            # mhkv_state_{mi} (allocated and weight-bound in gen_scratch).
+            # Per token we just rebind input + output and call once.
+            max_seq, d_model, n_heads = args
+            src = f"a{cur_a}"
+            dst = f"a{cur_a + 1}"
+            s = f"mhkv_state_{mi}"
+            lines.append(f"    // multi_head_attention_kv {mi}: "
+                         f"d_model={d_model} n_heads={n_heads} max_seq={max_seq}")
+            lines.append(f"    arr_set({s}, 0, {src});")
+            lines.append(f"    arr_set({s}, 9, {dst});")
+            lines.append(f"    attn_mh_kv_step_f32({s});")
+            cur_a += 1
+            mi += 1
+        elif kind == "multi_head_attention_gqa_kv":
+            # Llama-style GQA decode step.  RoPE + per-KV-head cache +
+            # per-Q-head scoring + output projection all live inside
+            # attn_gqa_kv_step_f32 against gqa_state_{gi} (alloc + weight
+            # binding emitted in gen_scratch).  Per token we just bind
+            # X + out and call once.
+            max_seq, d_model, n_heads, n_kv_heads, theta = args
+            src = f"a{cur_a}"
+            dst = f"a{cur_a + 1}"
+            s = f"gqa_state_{gi}"
+            lines.append(f"    // multi_head_attention_gqa_kv {gi}: "
+                         f"d_model={d_model} n_heads={n_heads} "
+                         f"n_kv_heads={n_kv_heads} theta={theta!r} "
+                         f"max_seq={max_seq}")
+            lines.append(f"    arr_set({s}, 0, {src});")
+            lines.append(f"    arr_set({s}, 9, {dst});")
+            lines.append(f"    attn_gqa_kv_step_f32({s});")
+            cur_a += 1
+            gi += 1
         elif kind == "flatten":
             # Reshape only — same buffer holds the data.  No code emitted.
             pass
@@ -1488,6 +1923,194 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
         else:
             raise ValueError(f"unknown layer kind: {kind!r}")
     return lines, cur_a
+
+
+def parse_sample_spec(spec):
+    """Parse the --sample CLI spec into (mode, kwargs).
+
+    Forms accepted:
+      'greedy'                   → ("greedy", {})
+      'temperature:T'            → ("temperature", {"temperature": float(T)})
+      'topk:K:T'                 → ("topk", {"topk_k": int(K),
+                                              "temperature": float(T)})
+    """
+    parts = spec.split(":")
+    head = parts[0]
+    if head == "greedy":
+        if len(parts) != 1:
+            raise SystemExit(
+                f"--sample greedy takes no parameters; got {spec!r}")
+        return ("greedy", {})
+    if head == "temperature":
+        if len(parts) != 2:
+            raise SystemExit(
+                f"--sample temperature:T (e.g. 'temperature:0.7'); "
+                f"got {spec!r}")
+        return ("temperature", {"temperature": float(parts[1])})
+    if head == "topk":
+        if len(parts) != 3:
+            raise SystemExit(
+                f"--sample topk:K:T (e.g. 'topk:50:0.9'); got {spec!r}")
+        return ("topk", {"topk_k": int(parts[1]),
+                         "temperature": float(parts[2])})
+    raise SystemExit(
+        f"--sample: unknown mode {head!r}.  Expected greedy, "
+        f"temperature:T, or topk:K:T.")
+
+
+def gen_decoder_main(arch, args, out_name, embed_dir, scales):
+    """Decoder-mode main(): one persistent KV cache per attention layer,
+    and a prefill+sample loop that runs the per-token forward once
+    per prompt token (cache-warming) and once per generated token
+    (sample, append, repeat).
+
+    Required arch shape:
+      arch[0]            ["embedding", vocab, d_model, 1]
+      ...interior layers...   (LN, MH-KV, save/add residual, Linear, GELU)
+      arch[-1]           ["linear", d_model, vocab]   (LM head)
+
+    The embedding is consumed manually inside the loop (single-token
+    lookup from cur_tok), so gen_forward sees `arch[1:]` and emits
+    the rest of the per-token forward unchanged.
+
+    --input-file is a raw byte stream of prompt token IDs (1, 2, or 4
+    bytes per token, sized from vocab).  --max-new-tokens controls
+    how many additional tokens to sample after the prompt.
+    """
+    if arch[0][0] != "embedding":
+        raise SystemExit(
+            "decoder mode: arch must start with `embedding`")
+    if arch[-1][0] != "linear":
+        raise SystemExit(
+            "decoder mode: arch must end with `linear` (LM head)")
+    vocab, d_model, _seq = arch[0][1:]
+    lm_in, lm_out = arch[-1][1:]
+    if lm_out != vocab:
+        raise SystemExit(
+            f"decoder mode: LM head out_features ({lm_out}) must match "
+            f"embedding vocab ({vocab})")
+    if lm_in != d_model:
+        raise SystemExit(
+            f"decoder mode: LM head in_features ({lm_in}) must match "
+            f"embedding d_model ({d_model})")
+    if not args.input_file:
+        raise SystemExit(
+            "decoder mode requires --input-file <prompt.bin> "
+            "(raw token IDs, byte-sized from vocab).")
+
+    quant_active = (args.quantize == "int8")
+    # int8 only quantises Linear/conv2d_3x3_p1 weights (see QUANTISABLE in
+    # main()); embedding / positional_embedding / multi_head_attention_kv /
+    # layernorm tensors stay f32, so the KV-cache attention path keeps its
+    # f32 inputs.  The Linear int8 path flows through gen_load/gen_forward
+    # via the existing --quantize int8 wiring.
+    weight_decls = [] if quant_active else gen_weight_decls(arch, args.embed)
+    act_decls, sizes = gen_act_decls(arch)
+    load = gen_load(arch, embed_dir, out_name, args.embed,
+                    args.quantize, scales, False)
+    # If a positional_embedding immediately follows the embedding, the
+    # decoder emits a per-token wpe add inside the loop (below) and the
+    # forward pass skips the entry to avoid double-emission.
+    has_pe = (len(arch) > 1 and arch[1][0] == "positional_embedding")
+    fwd_arch = arch[2:] if has_pe else arch[1:]
+    fwd, last = gen_forward(fwd_arch, scales if quant_active else None, False)
+
+    tb = _embedding_token_bytes(vocab)
+
+    body = []
+    body.append("fn main() -> i32 {")
+    body += weight_decls
+    body += load
+    body += act_decls
+    body += gen_scratch(arch)
+    body.append("")
+    body.append(f"    // decoder loop: prefill prompt, then sample {args.max_new_tokens}")
+    body.append(f"    let _toks: i32 = "
+                f"embed_file_bytes(\"{args.input_file}\");")
+    body.append(f"    let _toks_len: i32 = arr_len(_toks);")
+    if tb == 1:
+        body.append(f"    let prompt_len: i32 = _toks_len;")
+    else:
+        body.append(f"    let prompt_len: i32 = _toks_len / {tb};")
+    body.append(f"    let total: i32 = prompt_len + {args.max_new_tokens} - 1;")
+    body.append(f"    let cur_tok: i32 = 0;")
+    body.append(f"    let t: i32 = 0;")
+    sample_mode, sample_kwargs = parse_sample_spec(args.sample)
+    if sample_mode != "greedy":
+        # 32-bit LCG (glibc rand-style constants); each step advances
+        # rng_state and we feed the low 16 bits to sample_temperature_f32
+        # as a uniform [0, 1) draw.  Reproducible across runs given the
+        # same --rng-seed.
+        body.append(f"    let rng_state: i32 = {args.rng_seed};")
+    body.append(f"    while (t < total) {{")
+    # Get current token: prompt or previous-step argmax.
+    body.append(f"        if (t < prompt_len) {{")
+    if tb == 1:
+        body.append(f"            cur_tok = byte_at(_toks, t);")
+    elif tb == 2:
+        body.append(f"            cur_tok = byte_at(_toks, t * 2) + "
+                    f"byte_at(_toks, t * 2 + 1) * 256;")
+    else:   # tb == 4
+        body.append(f"            cur_tok = byte_at(_toks, t * 4) + "
+                    f"byte_at(_toks, t * 4 + 1) * 256 + "
+                    f"byte_at(_toks, t * 4 + 2) * 65536 + "
+                    f"byte_at(_toks, t * 4 + 3) * 16777216;")
+    body.append(f"        }}")
+    # Embedding lookup: a0[:] = Wemb0[cur_tok, :]
+    body.append(f"        arr_f32_copy_slice(Wemb0, cur_tok * {d_model}, "
+                f"a0, 0, {d_model});")
+    # Optional positional embedding: a0 += Wpos0[t, :] (per absolute
+    # position).  Inline scalar add since arr_f32_add_scaled would
+    # need a separate sliced buffer for one row of d_model elements.
+    if has_pe:
+        max_pos_pe, d_model_pe, _seq_pe = arch[1][1:]
+        body.append(f"        let _pi: i32 = 0;")
+        body.append(f"        while (_pi < {d_model_pe}) {{")
+        body.append(
+            f"            arr_f32_set(a0, _pi, "
+            f"arr_f32_get(a0, _pi) + "
+            f"arr_f32_get(Wpos0, t * {d_model_pe} + _pi));")
+        body.append(f"            _pi = _pi + 1;")
+        body.append(f"        }}")
+    # Inline the per-token forward (sized for indent 8 inside `while`).
+    body += [("    " + l) for l in fwd]
+    # Sample the next token from the LM head logits at a{last}.
+    if sample_mode == "greedy":
+        body.append(f"        let next_tok: i32 = sample_greedy_f32(a{last});")
+    else:
+        if sample_mode == "topk":
+            # Truncate the distribution before softmax: any logit below
+            # the k-th largest gets a -1e6 sentinel so softmax assigns
+            # it ~0 probability.
+            body.append(
+                f"        sample_topk_filter_f32(a{last}, "
+                f"{sample_kwargs['topk_k']});")
+        # Advance the LCG, harvest 16 bits, scale to [0, 1).
+        body.append(f"        rng_state = rng_state * 1103515245 + 12345;")
+        body.append(f"        let _bits: i32 = rng_state & 65535;")
+        body.append(
+            f"        let _unit: f64 = int_to_float(_bits) / 65536.0;")
+        body.append(
+            f"        let next_tok: i32 = sample_temperature_f32("
+            f"a{last}, {sample_kwargs['temperature']!r}, _unit);")
+    # Optional EOS: stop generating BEFORE printing the EOS token so
+    # the consumer sees only real content.  Triggered only past the
+    # prefill window (t >= prompt_len - 1) — an EOS-shaped logit
+    # mid-prompt is by definition impossible (we override cur_tok
+    # from the prompt buffer there) but cheap to skip.
+    if args.eos_token is not None:
+        body.append(
+            f"        if (t >= prompt_len - 1 && next_tok == "
+            f"{args.eos_token}) {{ break; }}")
+    # Print only past prompt (the very first emitted token follows the
+    # last prompt position).
+    body.append(f"        if (t >= prompt_len - 1) {{ print_int(next_tok); }}")
+    body.append(f"        cur_tok = next_tok;")
+    body.append(f"        t = t + 1;")
+    body.append(f"    }}")
+    body.append("    return 0;")
+    body.append("}")
+    return "\n".join(body)
 
 
 def gen_main(arch, args, out_name, embed_dir, scales):
@@ -1644,6 +2267,26 @@ def parse_args():
     p.add_argument("--no-argmax", action="store_true",
                    help="Skip argmax + accuracy reporting (e.g. when the "
                         "model isn't a classifier).")
+    p.add_argument("--max-new-tokens", type=int, default=16,
+                   help="Decoder mode only: number of tokens to sample "
+                        "after consuming the prompt.  Default: 16.")
+    p.add_argument("--sample", default="greedy",
+                   help="Decoder mode sampling strategy.  Forms: "
+                        "'greedy' (default, deterministic argmax); "
+                        "'temperature:T' (e.g. 'temperature:0.7'); "
+                        "'topk:K:T' (top-K filter then temperature, e.g. "
+                        "'topk:50:0.9').  K=1 reduces to greedy.")
+    p.add_argument("--eos-token", type=int, default=None,
+                   help="Decoder mode only: stop generating when this "
+                        "token id is sampled.  GPT-2's <|endoftext|> is "
+                        "50256; Llama's </s> is 2.  Default: no early "
+                        "stop, run full --max-new-tokens.")
+    p.add_argument("--rng-seed", type=int, default=20260502,
+                   help="Decoder mode + non-greedy sampling: initial "
+                        "state for the per-step LCG that produces the "
+                        "uniform draw passed to sample_temperature_f32.  "
+                        "Default chosen for stable regression-test "
+                        "reproducibility.")
     p.add_argument("--out", default=None,
                    help="Output base name.  <out>.ari is always written.  "
                         "Without --embed, a single <out>.f32 sidecar is "
@@ -1880,8 +2523,11 @@ def main():
     ai = 0
     ni = 0
     mi = 0
+    gi = 0   # multi_head_attention_gqa_kv counter
     ei = 0
     pei = 0
+    ri = 0
+    si = 0
     for kind, *largs in arch:
         if kind == "linear":
             in_f, out_f = largs
@@ -2016,6 +2662,93 @@ def main():
                     )
                 collected.append(("multi_head_attention", mi, proj, W, b))
             mi += 1
+        elif kind == "multi_head_attention_kv":
+            # Same weight layout as the one-shot MHA — Q/K/V/O each
+            # (d_model, d_model) — so the same key candidate set works.
+            # Tagged kv in `collected` so tensor_names yields the same
+            # Wm{suffix}{i}/bm{suffix}{i} names (decoder-mode forward
+            # already references those).
+            max_seq, d_model, n_heads = largs
+            proj_to_keys = {
+                "q": ("q_proj", "q_lin"),
+                "k": ("k_proj", "k_lin"),
+                "v": ("v_proj", "v_lin"),
+                "o": ("out_proj", "out_lin"),
+            }
+            for proj in ("q", "k", "v", "o"):
+                hf_key, dbert_key = proj_to_keys[proj]
+                candidates_w = [
+                    f"{hf_key}.weight",
+                    f"attn.{hf_key}.weight",
+                    f"attention.{hf_key}.weight",
+                    f"layers.{mi}.attn.{hf_key}.weight",
+                    f"layers.{mi}.{hf_key}.weight",
+                    f"transformer.layer.{mi}.attention.{dbert_key}.weight",
+                    f"layer.{mi}.attention.{dbert_key}.weight",
+                ]
+                candidates_b = [c.replace(".weight", ".bias") for c in candidates_w]
+                wkey = sd_lookup(sd, candidates_w)
+                bkey = sd_lookup(sd, candidates_b)
+                if wkey is None or bkey is None:
+                    raise SystemExit(
+                        f"multi_head_attention_kv #{mi}: missing {proj} "
+                        f"weight or bias.  Tried: {candidates_w[0]} / "
+                        f"{candidates_w[3]}.  Available: {sorted(sd.keys())}"
+                    )
+                W = sd[wkey].detach().cpu().numpy().astype("float32")
+                b = sd[bkey].detach().cpu().numpy().astype("float32")
+                if W.shape != (d_model, d_model) or b.shape != (d_model,):
+                    raise SystemExit(
+                        f"multi_head_attention_kv #{mi} {proj}: shape "
+                        f"mismatch.  expected ({d_model},{d_model}) + "
+                        f"({d_model},); got {tuple(W.shape)} + "
+                        f"{tuple(b.shape)}."
+                    )
+                collected.append(("multi_head_attention_kv", mi, proj, W, b))
+            mi += 1
+        elif kind == "multi_head_attention_gqa_kv":
+            # Llama / TinyLlama / Mistral attention.  Q is (d_model,
+            # d_model); K/V are (n_kv_heads*d_head, d_model); O is
+            # (d_model, d_model).  No biases.
+            max_seq, d_model, n_heads, n_kv_heads, theta = largs
+            d_head = d_model // n_heads
+            kv_dim = n_kv_heads * d_head
+            shape_for = {
+                "q": (d_model, d_model),
+                "k": (kv_dim,  d_model),
+                "v": (kv_dim,  d_model),
+                "o": (d_model, d_model),
+            }
+            # HuggingFace's Llama state_dict naming:
+            #   model.layers.{i}.self_attn.q_proj.weight ...
+            for proj in ("q", "k", "v", "o"):
+                hf = "o_proj" if proj == "o" else f"{proj}_proj"
+                candidates_w = [
+                    f"model.layers.{gi}.self_attn.{hf}.weight",
+                    f"layers.{gi}.self_attn.{hf}.weight",
+                    f"transformer.h.{gi}.self_attn.{hf}.weight",
+                    # Plain fallback for synthetic test rigs.
+                    f"gqa{gi}.{proj}.weight",
+                ]
+                wkey = sd_lookup(sd, candidates_w)
+                if wkey is None:
+                    raise SystemExit(
+                        f"multi_head_attention_gqa_kv #{gi}: missing "
+                        f"{hf} weight.  Tried: "
+                        f"{candidates_w[0]} / {candidates_w[3]}.  "
+                        f"Available: {sorted(sd.keys())}"
+                    )
+                W = sd[wkey].detach().cpu().numpy().astype("float32")
+                if W.shape != shape_for[proj]:
+                    raise SystemExit(
+                        f"multi_head_attention_gqa_kv #{gi} {proj}: "
+                        f"shape mismatch.  expected {shape_for[proj]}; "
+                        f"got {tuple(W.shape)}."
+                    )
+                import numpy as _np
+                b = _np.zeros(0, dtype=_np.float32)
+                collected.append(("multi_head_attention_gqa_kv", gi, proj, W, b))
+            gi += 1
         elif kind == "layernorm":
             # ["layernorm", dim] — γ ("LayerNorm.weight") and β ("LayerNorm.bias")
             # both shape (dim,).  HuggingFace naming.  The packer's per-LN
@@ -2086,6 +2819,86 @@ def main():
                 )
             collected.append(("layernorm", ni, "", W, b))
             ni += 1
+        elif kind == "rmsnorm":
+            # ["rmsnorm", dim] — γ only, no β.  Llama state_dict layout:
+            #   model.layers.{i}.input_layernorm.weight        (pre-attn)
+            #   model.layers.{i}.post_attention_layernorm.weight (pre-FFN)
+            #   model.norm.weight                              (final)
+            # Counter `ri` walks RMSNorm entries in arch order.  For a
+            # decoder with K blocks the layout is:
+            #   ri=0      block 0 input_layernorm
+            #   ri=1      block 0 post_attention_layernorm
+            #   ri=2      block 1 input_layernorm
+            #   ...
+            #   ri=2K     final model.norm
+            dim = largs[0]
+            block_idx = ri // 2
+            is_input = (ri % 2 == 0)
+            sa_or_post = "input_layernorm" if is_input else "post_attention_layernorm"
+            candidates_w = [
+                f"model.layers.{block_idx}.{sa_or_post}.weight",
+                f"layers.{block_idx}.{sa_or_post}.weight",
+                "model.norm.weight",   # final RMSNorm; matches when ri == 2*K
+                "norm.weight",
+                f"rmsnorm{ri}.weight",
+                f"rn_{ri}.weight",
+            ]
+            wkey = sd_lookup(sd, candidates_w)
+            if wkey is None:
+                raise SystemExit(
+                    f"rmsnorm #{ri}: missing γ.  Tried: "
+                    f"{candidates_w[0]} / {candidates_w[1]} / "
+                    f"{candidates_w[2]}.  Available: {sorted(sd.keys())}"
+                )
+            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            if W.shape != (dim,):
+                raise SystemExit(
+                    f"rmsnorm #{ri}: shape mismatch.  expected ({dim},); "
+                    f"got {tuple(W.shape)}."
+                )
+            import numpy as _np
+            b = _np.zeros(0, dtype=_np.float32)
+            collected.append(("rmsnorm", ri, "", W, b))
+            ri += 1
+        elif kind == "swiglu_ffn":
+            # ["swiglu_ffn", d_model, d_ffn] — three weight tensors,
+            # NO biases (Llama convention).  HF state_dict layout:
+            #   model.layers.{i}.mlp.gate_proj.weight   (d_ffn, d_model)
+            #   model.layers.{i}.mlp.up_proj.weight     (d_ffn, d_model)
+            #   model.layers.{i}.mlp.down_proj.weight   (d_model, d_ffn)
+            d_model, d_ffn = largs
+            shape_for = {
+                "gate": (d_ffn, d_model),
+                "up":   (d_ffn, d_model),
+                "down": (d_model, d_ffn),
+            }
+            for proj in ("gate", "up", "down"):
+                hf = f"{proj}_proj"
+                candidates_w = [
+                    f"model.layers.{si}.mlp.{hf}.weight",
+                    f"layers.{si}.mlp.{hf}.weight",
+                    # Plain fallback — useful for synthetic test rigs
+                    # that don't follow the HF block-tree naming.
+                    f"swiglu{si}.{proj}.weight",
+                ]
+                wkey = sd_lookup(sd, candidates_w)
+                if wkey is None:
+                    raise SystemExit(
+                        f"swiglu_ffn #{si}: missing {proj}_proj weight.  "
+                        f"Tried: {candidates_w[0]} / {candidates_w[1]} / "
+                        f"{candidates_w[2]}.  "
+                        f"Available: {sorted(sd.keys())}"
+                    )
+                W = sd[wkey].detach().cpu().numpy().astype("float32")
+                if W.shape != shape_for[proj]:
+                    raise SystemExit(
+                        f"swiglu_ffn #{si} {proj}: shape mismatch.  "
+                        f"expected {shape_for[proj]}; got {tuple(W.shape)}."
+                    )
+                import numpy as _np
+                b = _np.zeros(0, dtype=_np.float32)
+                collected.append(("swiglu_ffn", si, proj, W, b))
+            si += 1
         elif kind == "embedding":
             # ["embedding", vocab_size, d_model, seq] — only a weight
             # tensor (no bias).  HuggingFace canonical names cover BERT/
@@ -2255,11 +3068,19 @@ def main():
         prologue_parts.append(DEQUANT_HELPER)
     if needs_attention_lib(arch):
         prologue_parts.append(ATTENTION_LIB)
+    if needs_kv_attention_lib(arch):
+        prologue_parts.append(_load_kv_attention_lib())
     if needs_layernorm_helper(arch):
         prologue_parts.append(LAYERNORM_HELPER)
+    if needs_rmsnorm_helper(arch):
+        prologue_parts.append(RMSNORM_HELPER)
     if needs_gelu_helper(arch):
         prologue_parts.append(GELU_HELPER)
+    if needs_swiglu_helper(arch):
+        prologue_parts.append(SWIGLU_HELPER)
     prologue_parts.append(PROLOGUE_TAIL)
+    main_emitter = (gen_decoder_main if is_decoder_arch(arch)
+                    else gen_main)
     src = (
         "".join(prologue_parts)
         + "\n"
@@ -2267,7 +3088,7 @@ def main():
                               mean=args.mean,
                               std=args.std)
         + "\n"
-        + gen_main(arch, args, out_base.name, embed_dir, scales)
+        + main_emitter(arch, args, out_base.name, embed_dir, scales)
         + "\n"
     )
     src_path.write_text(src)

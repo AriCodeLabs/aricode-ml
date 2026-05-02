@@ -1,0 +1,9 @@
+[
+    ["embedding", 32, 16, 1],
+    ["save_residual"],
+    ["rmsnorm", 16],
+    ["multi_head_attention_gqa_kv", 8, 16, 4, 4, 10000.0],
+    ["add_residual"],
+    ["rmsnorm", 16],
+    ["linear", 16, 32]
+]

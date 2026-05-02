@@ -1,0 +1,4 @@
+*.f32
+*.bin
+tiny_decoder
+__pycache__/

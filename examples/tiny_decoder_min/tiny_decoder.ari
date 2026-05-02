@@ -1,0 +1,169 @@
+// tiny_decoder_min — hand-coded 1-block GPT-style decoder using the
+// new KV-cache stdlib (attention_mh_kv_f32 + sampling_f32).
+//
+// Architecture:
+//   vocab=16, d_model=8, n_heads=2, max_seq=8, ff=16
+//   embed → LN1 → MH-KV-attn → +res → LN2 → FFN(GELU) → +res → LN_f
+//        → LM head (Linear d_model→vocab) → greedy argmax
+//
+// Decode:  prompt = [1, 5];  greedy autoregressive 3 new tokens.
+//
+// Validates against PyTorch reference produced by prepare.py — the
+// 3 token IDs printed must match expected_tokens.bin element-by-element.
+
+import "../../attention_mh_kv_f32.ari" as mhkv;
+import "../../sampling_f32.ari" as samp;
+
+fn ln_affine(buf: i32, dim: i32, gamma: i32, beta: i32) -> i32 {
+    arr_f32_layernorm(buf, dim, 0.00001);
+    let i: i32 = 0;
+    while (i < dim) {
+        arr_f32_set(buf, i,
+            arr_f32_get(buf, i) * arr_f32_get(gamma, i) + arr_f32_get(beta, i));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn gelu_tanh(buf: i32) -> i32 {
+    let n: i32 = arr_len(buf);
+    let i: i32 = 0;
+    let c: f64 = 0.7978845608028654;
+    while (i < n) {
+        let x: f64 = arr_f32_get(buf, i);
+        let inner: f64 = c * (x + 0.044715 * x * x * x);
+        let two_inner: f64 = 2.0 * inner;
+        let t: f64 = 0.0;
+        if (two_inner > 20.0) {
+            t = 1.0;
+        } else {
+            if (two_inner < 0.0 - 20.0) {
+                t = 0.0 - 1.0;
+            } else {
+                let e2z: f64 = math_exp(two_inner);
+                t = 1.0 - 2.0 / (e2z + 1.0);
+            }
+        }
+        arr_f32_set(buf, i, 0.5 * x * (1.0 + t));
+        i = i + 1;
+    }
+    return 0;
+}
+
+fn main() -> i32 {
+    let vocab: i32 = 16;
+    let d_model: i32 = 8;
+    let n_heads: i32 = 2;
+    let max_seq: i32 = 8;
+    let ff_dim: i32 = 16;
+    let prompt_len: i32 = 2;
+    let max_new: i32 = 3;
+
+    // ---- embed all PyTorch tensors ----
+    let embed_W: i32  = embed_file("embed_W.f32");
+    let ln1_g: i32    = embed_file("ln1_gamma.f32");
+    let ln1_b: i32    = embed_file("ln1_beta.f32");
+    let q_W: i32      = embed_file("q_W.f32");
+    let q_b: i32      = embed_file("q_b.f32");
+    let k_W: i32      = embed_file("k_W.f32");
+    let k_b: i32      = embed_file("k_b.f32");
+    let v_W: i32      = embed_file("v_W.f32");
+    let v_b: i32      = embed_file("v_b.f32");
+    let o_W: i32      = embed_file("o_W.f32");
+    let o_b: i32      = embed_file("o_b.f32");
+    let ln2_g: i32    = embed_file("ln2_gamma.f32");
+    let ln2_b: i32    = embed_file("ln2_beta.f32");
+    let ff1_W: i32    = embed_file("ff1_W.f32");
+    let ff1_b: i32    = embed_file("ff1_b.f32");
+    let ff2_W: i32    = embed_file("ff2_W.f32");
+    let ff2_b: i32    = embed_file("ff2_b.f32");
+    let lnf_g: i32    = embed_file("lnf_gamma.f32");
+    let lnf_b: i32    = embed_file("lnf_beta.f32");
+    let lm_W: i32     = embed_file("lm_W.f32");
+    let lm_b: i32     = embed_file("lm_b.f32");
+
+    // ---- per-step scratch ----
+    let x: i32       = arr_f32_new(d_model);   // current activation
+    let x_attn: i32  = arr_f32_new(d_model);   // attention output (post W_O)
+    let h_ln: i32    = arr_f32_new(d_model);   // LN scratch
+    let h_ff: i32    = arr_f32_new(ff_dim);    // FFN hidden
+    let x_ff: i32    = arr_f32_new(d_model);   // FFN output
+    let logits: i32  = arr_f32_new(vocab);     // LM head output
+
+    // ---- KV-cache attention state ----
+    let mh: i32 = mhkv.attn_mh_kv_alloc_f32(max_seq, d_model, n_heads);
+    arr_set(mh, 1, q_W); arr_set(mh, 2, q_b);
+    arr_set(mh, 3, k_W); arr_set(mh, 4, k_b);
+    arr_set(mh, 5, v_W); arr_set(mh, 6, v_b);
+    arr_set(mh, 7, o_W); arr_set(mh, 8, o_b);
+    arr_set(mh, 0, h_ln);     // attn input row (post-LN)
+    arr_set(mh, 9, x_attn);   // attn output row
+
+    // ---- prompt tokens (matches prepare.py PROMPT) ----
+    let prompt0: i32 = 1;
+    let prompt1: i32 = 5;
+
+    // ---- decode loop ----
+    // We need (prompt_len - 1) prefill steps to seed the KV cache for
+    // positions 0..prompt_len-2, then exactly `max_new` decode steps,
+    // each consuming the previous step's argmax and emitting one new
+    // token.  Total = prompt_len - 1 + max_new = prompt_len + max_new - 1.
+    let total: i32 = prompt_len + max_new - 1;
+    let t: i32 = 0;
+    let cur_tok: i32 = 0;
+    while (t < total) {
+        if (t == 0) {
+            cur_tok = prompt0;
+        } else {
+            if (t == 1) {
+                cur_tok = prompt1;
+            } else {
+                // cur_tok already set by previous step's argmax
+            }
+        }
+
+        // 1. Embedding lookup: x = embed_W[cur_tok, :]
+        arr_f32_copy_slice(embed_W, cur_tok * d_model, x, 0, d_model);
+
+        // 2. Pre-LN + MH-KV attention + residual
+        arr_f32_copy_slice(x, 0, h_ln, 0, d_model);
+        ln_affine(h_ln, d_model, ln1_g, ln1_b);
+        mhkv.attn_mh_kv_step_f32(mh);
+        let i: i32 = 0;
+        while (i < d_model) {
+            arr_f32_set(x, i, arr_f32_get(x, i) + arr_f32_get(x_attn, i));
+            i = i + 1;
+        }
+
+        // 3. Pre-LN + FFN + residual
+        arr_f32_copy_slice(x, 0, h_ln, 0, d_model);
+        ln_affine(h_ln, d_model, ln2_g, ln2_b);
+        arr_f32_matvec(ff1_W, h_ln, ff1_b, h_ff, ff_dim, d_model);
+        gelu_tanh(h_ff);
+        arr_f32_matvec(ff2_W, h_ff, ff2_b, x_ff, d_model, ff_dim);
+        i = 0;
+        while (i < d_model) {
+            arr_f32_set(x, i, arr_f32_get(x, i) + arr_f32_get(x_ff, i));
+            i = i + 1;
+        }
+
+        // 4. Final LN + LM head
+        arr_f32_copy_slice(x, 0, h_ln, 0, d_model);
+        ln_affine(h_ln, d_model, lnf_g, lnf_b);
+        arr_f32_matvec(lm_W, h_ln, lm_b, logits, vocab, d_model);
+
+        // 5. Greedy argmax → next token (only print past prompt)
+        let next_tok: i32 = samp.sample_greedy_f32(logits);
+        if (t >= prompt_len - 1) {
+            // The position-(prompt_len-1) query is the FIRST position
+            // whose argmax becomes a generated token (the very next one
+            // after the prompt).  Subsequent steps consume that argmax
+            // as the next input and predict the one after.
+            print_int(next_tok);
+        }
+        cur_tok = next_tok;
+        t = t + 1;
+    }
+
+    return 0;
+}

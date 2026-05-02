@@ -1,0 +1,28 @@
+[
+    ["embedding", 32, 16, 1],
+
+    ["save_residual"],
+    ["layernorm", 16],
+    ["multi_head_attention_kv", 8, 16, 4],
+    ["add_residual"],
+    ["save_residual"],
+    ["layernorm", 16],
+    ["linear", 16, 32],
+    ["gelu"],
+    ["linear", 32, 16],
+    ["add_residual"],
+
+    ["save_residual"],
+    ["layernorm", 16],
+    ["multi_head_attention_kv", 8, 16, 4],
+    ["add_residual"],
+    ["save_residual"],
+    ["layernorm", 16],
+    ["linear", 16, 32],
+    ["gelu"],
+    ["linear", 32, 16],
+    ["add_residual"],
+
+    ["layernorm", 16],
+    ["linear", 16, 32]
+]

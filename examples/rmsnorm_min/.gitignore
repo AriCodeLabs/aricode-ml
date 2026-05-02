@@ -1,0 +1,7 @@
+synth.pt
+X_input.f32
+expected.f32
+*.f32
+*.ari
+__pycache__/
+rmsnorm_min
