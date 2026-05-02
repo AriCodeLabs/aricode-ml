@@ -10,19 +10,17 @@
 // memory entries live next to each.
 
 // ---------------------------------------------------------------------
-// QUIRK #1 — expr_is_float misclassifies user-fn calls returning i32
-// when ANY argument is f64.  See:
-//   memory/project_codegen_return_type_bug.md
-//   src/codegen/codegen.c:634-645  (expr_is_float)
-//   src/codegen/codegen.c:1601-1614 (emit_call_expr; never syncs RAX→xmm0
-//                                    for user fns)
+// QUIRK #1 (FIXED) — expr_is_float used to misclassify user-fn calls
+// returning i32 when ANY argument was f64, routing inline
+// `if (user_fn(f64_args...) == 0)` through the SSE compare path with
+// stale xmm0 (RAX→xmm0 sync only fires for builtins).  Fixed by adding
+// `return_is_float` to FuncEntry, populated at emit_function_def time
+// from the AST return-type annotation; expr_is_float now consults that
+// directly instead of guessing by arg type.
 //
-// Repro: an inline `if (user_fn(f64_args...) == 0)` routes through
-// the SSE float path, comparing stale xmm0 against itself → ZF=1
-// → `(call == 0)` is always true.
-//
-// Workaround: bind the call result to a variable BEFORE comparing,
-// which sends the comparison through the integer-compare path.
+// This test stays as a regression — both the workaround pattern (bind
+// to a variable before comparing) AND the previously-broken inline
+// pattern must now agree on the boolean.
 // ---------------------------------------------------------------------
 
 fn ret_one_with_f64(x: f64) -> i32 {
@@ -36,40 +34,28 @@ fn ret_zero_with_f64(x: f64) -> i32 {
 fn quirk_return_type() -> i32 {
     let ok: i32 = 1;
 
-    // Workaround pattern: bind result to i32, THEN compare.
+    // Variable-bind path (was the workaround during the bug's lifetime).
     let r1: i32 = ret_one_with_f64(0.0);
     if (r1 != 1) {
-        print_str("FAIL quirk1: ret_one returned");
+        print_str("FAIL quirk1 var-bind: ret_one returned");
         print_int(r1);
         ok = 0;
     }
     let r0: i32 = ret_zero_with_f64(0.0);
     if (r0 != 0) {
-        print_str("FAIL quirk1: ret_zero returned");
+        print_str("FAIL quirk1 var-bind: ret_zero returned");
         print_int(r0);
         ok = 0;
     }
 
-    // Demonstrate the BROKEN inline pattern (left as a positive test
-    // of the bug's continued existence).  If aricode ever fixes the
-    // underlying expr_is_float, this branch starts behaving as the
-    // language semantics suggest and the assertion below flips —
-    // someone would notice and update the memory entry.
-    //
-    // We DO NOT use this pattern in production code; the variable-bind
-    // workaround above is the rule.
-    let bug_still_present: i32 = 0;
+    // Inline-compare path (was the broken pattern).  Now must agree.
     if (ret_one_with_f64(0.0) == 0) {
-        // SHOULD never enter (ret_one returns 1, not 0); WILL enter
-        // today because of the bug.
-        bug_still_present = 1;
+        print_str("FAIL quirk1 inline: ret_one(0.0) == 0 took the true branch");
+        ok = 0;
     }
-    if (bug_still_present == 0) {
-        // The bug got fixed!  Update memory + this test.  Not a
-        // failure per se — but someone needs to know.
-        print_str("INFO: codegen return-type bug appears FIXED.");
-        print_str("      Update memory/project_codegen_return_type_bug.md");
-        print_str("      and remove this informational branch.");
+    if (ret_zero_with_f64(0.0) != 0) {
+        print_str("FAIL quirk1 inline: ret_zero(0.0) != 0 took the true branch");
+        ok = 0;
     }
     return ok;
 }
