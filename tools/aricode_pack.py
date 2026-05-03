@@ -2043,10 +2043,14 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     body.append(f"    // decoder loop: prefill prompt, then sample {args.max_new_tokens}")
     if args.input_format == "stdin-tokens":
         # Dynamic prompt from stdin.  Wire format:
-        #   [u32 LE prompt_len_in_tokens] [N · {tb}-byte token IDs LE]
+        #   [u32 LE prompt_len_in_tokens]
+        #   [u32 LE seed]
+        #   [N · {tb}-byte token IDs LE]
         # Each token is tb bytes wide (1 / 2 / 4 derived from vocab).
-        # Buffer is sized at pack time; --max-prompt-tokens caps the
-        # caller's prompt length (default 512).
+        # Seed is consumed only in non-greedy modes; greedy still reads
+        # and ignores it so the wire format is constant.  Buffer is
+        # sized at pack time; --max-prompt-tokens caps the caller's
+        # prompt length (default 512).
         max_prompt_bytes = args.max_prompt_tokens * tb
         # arr_new(N) allocates N i64 slots = 8N bytes; round up.
         toks_slots = (max_prompt_bytes + 7) // 8 + 1
@@ -2057,6 +2061,12 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
         body.append(f"                       + byte_at(_len_buf, 1) * 256")
         body.append(f"                       + byte_at(_len_buf, 2) * 65536")
         body.append(f"                       + byte_at(_len_buf, 3) * 16777216;")
+        body.append(f"    let _seed_buf: i32 = arr_new(1);")
+        body.append(f"    file_read(0, _seed_buf, 4);")
+        body.append(f"    let _stdin_seed: i32 = byte_at(_seed_buf, 0)")
+        body.append(f"                        + byte_at(_seed_buf, 1) * 256")
+        body.append(f"                        + byte_at(_seed_buf, 2) * 65536")
+        body.append(f"                        + byte_at(_seed_buf, 3) * 16777216;")
         body.append(f"    file_read(0, _toks, prompt_len * {tb});")
     else:
         body.append(f"    let _toks: i32 = "
@@ -2073,9 +2083,13 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     if sample_mode != "greedy":
         # 32-bit LCG (glibc rand-style constants); each step advances
         # rng_state and we feed the low 16 bits to sample_temperature_f32
-        # as a uniform [0, 1) draw.  Reproducible across runs given the
-        # same --rng-seed.
-        body.append(f"    let rng_state: i32 = {args.rng_seed};")
+        # as a uniform [0, 1) draw.  In stdin-tokens mode the caller
+        # provides a fresh seed per turn (so repeated prompts diverge);
+        # otherwise the seed is baked at pack time.
+        if args.input_format == "stdin-tokens":
+            body.append(f"    let rng_state: i32 = _stdin_seed;")
+        else:
+            body.append(f"    let rng_state: i32 = {args.rng_seed};")
     body.append(f"    while (t < total) {{")
     # Get current token: prompt or previous-step argmax.
     body.append(f"        if (t < prompt_len) {{")

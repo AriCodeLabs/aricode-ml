@@ -9,8 +9,11 @@ The wrapper:
   1. Loads the HF tokenizer for the given model id.
   2. Tokenizes the text prompt (BOS auto-added by transformers if the
      tokenizer config requests it — Llama / GPT-2 differ).
-  3. Sends `struct.pack("<I", N) + tokens_as_uint{1,2,4}` to the binary's
-     stdin.  Token byte width is auto-derived from vocab size:
+  3. Sends `struct.pack("<II", N, seed) + tokens_as_uint{1,2,4}` to the
+     binary's stdin.  Seed is consumed only when the binary was packed
+     with a non-greedy `--sample`; greedy binaries read+ignore it so the
+     wire format is constant.  Token byte width is auto-derived from
+     vocab size:
        vocab ≤ 256       → uint8     (MNIST / very small classifiers)
        vocab ≤ 65536     → uint16 LE (GPT-2 50257, Llama 32000, BERT 30522)
        vocab > 65536     → uint32 LE (Llama-3 128k, etc.)
@@ -28,6 +31,7 @@ Example:
 """
 
 import os
+import random
 import struct
 import subprocess
 import sys
@@ -43,17 +47,16 @@ def _token_byte_width(vocab_size: int) -> int:
     return 4
 
 
-def _pack_tokens(tokens: list[int], tb: int) -> bytes:
+def _pack_tokens(tokens: list[int], tb: int, seed: int) -> bytes:
     """Pack a token-id list into the wire format the binary reads:
-    4-byte uint32 LE length prefix, then N · tb-byte little-endian
-    token IDs."""
+    [u32 LE prompt_len] [u32 LE seed] [N · tb-byte LE token IDs]."""
     if tb == 1:
         body = bytes(tokens)
     elif tb == 2:
         body = b"".join(struct.pack("<H", t) for t in tokens)
     else:
         body = b"".join(struct.pack("<I", t) for t in tokens)
-    return struct.pack("<I", len(tokens)) + body
+    return struct.pack("<II", len(tokens), seed) + body
 
 
 def main():
@@ -76,7 +79,8 @@ def main():
           f"{'...' if len(prompt_ids) > 8 else ''}", file=sys.stderr,
           flush=True)
 
-    payload = _pack_tokens(prompt_ids, tb)
+    seed = random.randrange(1, 2**32)
+    payload = _pack_tokens(prompt_ids, tb, seed)
     print(f"  payload: {len(payload)} bytes", file=sys.stderr, flush=True)
     print(f"  launching {binary}...", file=sys.stderr, flush=True)
     print(f"---", file=sys.stderr, flush=True)
