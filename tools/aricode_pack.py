@@ -155,8 +155,10 @@ def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
     past the W weights and trip the bounds check.
 
     `quant_scale` is None for the f32 path (single arr_f32_matvec call)
-    or a Python float when the weights are int8 — uses the native
-    arr_i8_matvec_f32 builtin + arr_f32_add_scaled for the bias.
+    or non-None when the weights are int8.  Linear uses the per-row
+    int8 path (arr_i8_matvec_f32_perrow + an f32 scales buffer named
+    `{w_var}_scales` allocated by gen_load); the scales-buffer name is
+    derived from w_var so callers don't need to thread it explicitly.
     """
     if seq <= 1:
         if quant_scale is None:
@@ -164,7 +166,7 @@ def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
                 f"    arr_f32_matvec({w_var}, {src_var}, {b_var}, {dst_var}, {out_f}, {in_f});",
             ]
         return [
-            f"    arr_i8_matvec_f32({w_var}, {src_var}, {dst_var}, {out_f}, {quant_scale!r});",
+            f"    arr_i8_matvec_f32_perrow({w_var}, {src_var}, {dst_var}, {out_f}, {w_var}_scales);",
             f"    arr_f32_add_scaled({dst_var}, {b_var}, 1.0);",
         ]
     # Batched: loop seq times, slicing [in_f] rows of src into the
@@ -188,7 +190,7 @@ def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
             f"    let _li{idx}: i32 = 0;",
             f"    while (_li{idx} < {seq}) {{",
             f"        arr_f32_copy_slice({src_var}, _li{idx} * {in_f}, {si}, 0, {in_f});",
-            f"        arr_i8_matvec_f32({w_var}, {si}, {so}, {out_f}, {quant_scale!r});",
+            f"        arr_i8_matvec_f32_perrow({w_var}, {si}, {so}, {out_f}, {w_var}_scales);",
             f"        arr_f32_add_scaled({so}, {b_var}, 1.0);",
             f"        arr_f32_copy_slice({so}, 0, {dst_var}, _li{idx} * {out_f}, {out_f});",
             f"        _li{idx} = _li{idx} + 1;",
@@ -1502,16 +1504,23 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
                 continue
             scale_w = scales[(kind, idx, suffix, "W")]
             if kind == "linear":
+                # Per-row scales: int8 weight + an f32 scales buffer of
+                # length out_f.  Runtime calls arr_i8_matvec_f32_perrow
+                # which loads scale[j] per output row.
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                lines.append(f"    let {wname}_scales: i32 = embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
             elif kind == "swiglu_ffn":
                 # 3 weight tensors per layer (gate / up / down), each
-                # int8 with its own scale.  No biases (Llama).  Stored
-                # as embed_file_bytes; the runtime swiglu path reads
-                # them through arr_i8_matvec_f32(W, x, b, y, m, n, scale).
+                # int8 with its OWN per-row scales buffer.  No biases
+                # (Llama).  Runtime: arr_i8_matvec_f32_perrow(W, x, y, m,
+                # W_scales).
                 lines.append(
                     f"    let {wname}: i32 = "
                     f"embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                lines.append(
+                    f"    let {wname}_scales: i32 = "
+                    f"embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
                 # nb == 0 for swiglu — skip bias emit entirely.
             elif kind == "conv2d_3x3_p1" and c_in == 1:
                 # Single-channel conv: int8 weights stay int8.
@@ -1692,23 +1701,25 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             sc_gate = scales.get(("swiglu_ffn", idx, "gate", "W")) if scales else None
             sc_up   = scales.get(("swiglu_ffn", idx, "up",   "W")) if scales else None
             sc_down = scales.get(("swiglu_ffn", idx, "down", "W")) if scales else None
-            # arr_i8_matvec_f32(W, x, y, m, scale) — 5 args (n is taken
-            # from x's length header).  No bias term: Llama's FFN omits
-            # them, so this path skips the zero-bias scratch entirely.
+            # arr_i8_matvec_f32_perrow(W, x, y, m, scales_buf) — 5 args
+            # (n implicit from x's length header).  Per-row scales buffer
+            # is allocated by gen_load as `{w_var}_scales` (one f32 per
+            # output row of W).  No bias term: Llama's FFN omits them,
+            # so the int8 path skips the zero-bias scratch entirely.
             lines.append(f"    // swiglu_ffn {idx}: d_model={d_model} d_ffn={d_ffn}"
-                         f"{' [int8]' if sc_gate is not None else ''}")
+                         f"{' [int8 per-row]' if sc_gate is not None else ''}")
             if sc_gate is not None:
                 lines.append(
-                    f"    arr_i8_matvec_f32(Wswgate{idx}, {src}, "
-                    f"_swg_gate_{idx}, {d_ffn}, {sc_gate!r});")
+                    f"    arr_i8_matvec_f32_perrow(Wswgate{idx}, {src}, "
+                    f"_swg_gate_{idx}, {d_ffn}, Wswgate{idx}_scales);")
             else:
                 lines.append(
                     f"    arr_f32_matvec(Wswgate{idx}, {src}, _zb_swg, "
                     f"_swg_gate_{idx}, {d_ffn}, {d_model});")
             if sc_up is not None:
                 lines.append(
-                    f"    arr_i8_matvec_f32(Wswup{idx}, {src}, "
-                    f"_swg_up_{idx}, {d_ffn}, {sc_up!r});")
+                    f"    arr_i8_matvec_f32_perrow(Wswup{idx}, {src}, "
+                    f"_swg_up_{idx}, {d_ffn}, Wswup{idx}_scales);")
             else:
                 lines.append(
                     f"    arr_f32_matvec(Wswup{idx}, {src}, _zb_swg, "
@@ -1717,8 +1728,8 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
                 f"    silu_mul_f32(_swg_gate_{idx}, _swg_up_{idx}, {d_ffn});")
             if sc_down is not None:
                 lines.append(
-                    f"    arr_i8_matvec_f32(Wswdown{idx}, _swg_up_{idx}, "
-                    f"{dst}, {d_model}, {sc_down!r});")
+                    f"    arr_i8_matvec_f32_perrow(Wswdown{idx}, _swg_up_{idx}, "
+                    f"{dst}, {d_model}, Wswdown{idx}_scales);")
             else:
                 lines.append(
                     f"    arr_f32_matvec(Wswdown{idx}, _swg_up_{idx}, _zb_swg, "
@@ -2991,15 +3002,45 @@ def main():
         # "Undefined function" compile errors on transformer-class
         # models.
         QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn")
+        # Matvec layers use PER-ROW scales (one f32 per output row of W);
+        # conv2d_3x3_p1 stays per-tensor (its kernel,
+        # arr_i8_conv2d_3x3_p1*, has no per-row variant yet).  Per-row
+        # dramatically improves quantisation fidelity on large matrices
+        # — gate/up/down on TinyLlama (5632 × 2048) collapse from "model
+        # diverges from f32 greedy after 0 tokens" to ~5/8 prefix match
+        # because each row no longer competes for a shared dynamic range.
+        PER_ROW = ("linear", "swiglu_ffn")
         import numpy as _np
         wrote = []
         for kind, idx, suffix, W, b in collected:
             wname, bname = tensor_names(kind, idx, suffix)
-            if kind in QUANTISABLE:
-                # Weight → int8 (per-tensor symmetric scale).  For
-                # multi-tensor layers (swiglu_ffn) each suffix gets
-                # its OWN scale; gate/up share roughly the same
-                # distribution but down is consistently tighter.
+            if kind in PER_ROW:
+                # Per-row symmetric int8: scales[i] = max(|W[i,:]|) / 127.
+                # Each output row gets its own scale, so fat rows don't
+                # waste the dynamic range of skinny rows.
+                if W.size:
+                    abs_max_row = _np.abs(W).max(axis=1)            # (m,)
+                else:
+                    abs_max_row = _np.zeros((0,), dtype=_np.float32)
+                scales_arr = abs_max_row / 127.0
+                # Empty rows or all-zero rows would divide by zero;
+                # substitute 1.0 (q values stay zero, so the scale is a
+                # no-op).
+                safe = _np.where(scales_arr > 0, scales_arr, 1.0)
+                q = _np.round(W / safe[:, None]).clip(-128, 127).astype(_np.int8)
+                scales_arr = scales_arr.astype(_np.float32)
+                scales[(kind, idx, suffix, "W")] = scales_arr
+                wp = out_base.parent / f"{out_base.name}_{wname}.i8"
+                q.tofile(wp)
+                wrote.append(wp)
+                # Per-row scale sidecar.  gen_load embeds it via
+                # embed_file (f32 path) alongside the .i8 weight.
+                sp = out_base.parent / f"{out_base.name}_{wname}_scales.f32"
+                scales_arr.tofile(sp)
+                wrote.append(sp)
+            elif kind in QUANTISABLE:
+                # conv2d_3x3_p1 — per-tensor.  Same staging shape as
+                # before per-row landed.
                 abs_max = float(_np.abs(W).max()) if W.size else 0.0
                 scale = abs_max / 127.0 if abs_max > 0 else 0.0
                 if scale == 0.0:
