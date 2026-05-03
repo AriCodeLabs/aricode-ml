@@ -6,3 +6,4 @@ expected_tokens.bin
 *.ari
 __pycache__/
 llama2_7b
+llama2_7b_chat

@@ -2004,10 +2004,15 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
         raise SystemExit(
             f"decoder mode: LM head in_features ({lm_in}) must match "
             f"embedding d_model ({d_model})")
-    if not args.input_file:
+    if args.input_format == "embedded" and not args.input_file:
         raise SystemExit(
-            "decoder mode requires --input-file <prompt.bin> "
-            "(raw token IDs, byte-sized from vocab).")
+            "decoder mode --input-format embedded requires --input-file "
+            "<prompt.bin> (raw token IDs, byte-sized from vocab).")
+    if args.input_format not in ("embedded", "stdin-tokens"):
+        raise SystemExit(
+            f"decoder mode supports --input-format embedded (baked-in "
+            f"prompt) or stdin-tokens (dynamic prompt from stdin); got "
+            f"{args.input_format!r}.")
 
     quant_active = (args.quantize == "int8")
     # int8 only quantises Linear/conv2d_3x3_p1 weights (see QUANTISABLE in
@@ -2036,13 +2041,31 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     body += gen_scratch(arch)
     body.append("")
     body.append(f"    // decoder loop: prefill prompt, then sample {args.max_new_tokens}")
-    body.append(f"    let _toks: i32 = "
-                f"embed_file_bytes(\"{args.input_file}\");")
-    body.append(f"    let _toks_len: i32 = arr_len(_toks);")
-    if tb == 1:
-        body.append(f"    let prompt_len: i32 = _toks_len;")
+    if args.input_format == "stdin-tokens":
+        # Dynamic prompt from stdin.  Wire format:
+        #   [u32 LE prompt_len_in_tokens] [N · {tb}-byte token IDs LE]
+        # Each token is tb bytes wide (1 / 2 / 4 derived from vocab).
+        # Buffer is sized at pack time; --max-prompt-tokens caps the
+        # caller's prompt length (default 512).
+        max_prompt_bytes = args.max_prompt_tokens * tb
+        # arr_new(N) allocates N i64 slots = 8N bytes; round up.
+        toks_slots = (max_prompt_bytes + 7) // 8 + 1
+        body.append(f"    let _toks: i32 = arr_new({toks_slots});")
+        body.append(f"    let _len_buf: i32 = arr_new(1);")
+        body.append(f"    file_read(0, _len_buf, 4);")
+        body.append(f"    let prompt_len: i32 = byte_at(_len_buf, 0)")
+        body.append(f"                       + byte_at(_len_buf, 1) * 256")
+        body.append(f"                       + byte_at(_len_buf, 2) * 65536")
+        body.append(f"                       + byte_at(_len_buf, 3) * 16777216;")
+        body.append(f"    file_read(0, _toks, prompt_len * {tb});")
     else:
-        body.append(f"    let prompt_len: i32 = _toks_len / {tb};")
+        body.append(f"    let _toks: i32 = "
+                    f"embed_file_bytes(\"{args.input_file}\");")
+        body.append(f"    let _toks_len: i32 = arr_len(_toks);")
+        if tb == 1:
+            body.append(f"    let prompt_len: i32 = _toks_len;")
+        else:
+            body.append(f"    let prompt_len: i32 = _toks_len / {tb};")
     body.append(f"    let total: i32 = prompt_len + {args.max_new_tokens} - 1;")
     body.append(f"    let cur_tok: i32 = 0;")
     body.append(f"    let t: i32 = 0;")
@@ -2263,8 +2286,19 @@ def parse_args():
                    help="state_dict key template.  {idx} = layer index "
                         "(0-based), {idx_plus_1} = 1-based, {kind} = "
                         "weight|bias.  Default: fc{idx_plus_1}.{kind}.")
-    p.add_argument("--input-format", choices=("mnist", "stdin", "embedded"),
-                   default="mnist")
+    p.add_argument("--input-format",
+                   choices=("mnist", "stdin", "embedded", "stdin-tokens"),
+                   default="mnist",
+                   help="`stdin-tokens` is the dynamic-prompt mode for "
+                        "decoder LLMs: the binary reads a 4-byte uint32 "
+                        "LE prompt-length prefix followed by that many "
+                        "uint8/16/32 LE token IDs from stdin (byte width "
+                        "auto-sized from vocab).  Prompts up to "
+                        "--max-prompt-tokens long, default 512.")
+    p.add_argument("--max-prompt-tokens", type=int, default=512,
+                   help="Decoder mode + --input-format stdin-tokens: "
+                        "upper bound on prompt length the binary will "
+                        "accept.  Buffer is sized at pack time.")
     p.add_argument("--input-file",
                    help="path to .f32 input file (used by --input-format embedded)")
     p.add_argument("--input-images", default=None,
