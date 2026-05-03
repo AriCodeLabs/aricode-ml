@@ -5,7 +5,4 @@ expected_tokens.bin
 *.i8
 *.ari
 __pycache__/
-tinyllama_1b
-tinyllama_1b_int8
-tinyllama_1b_perrow
-tl_simd
+llama2_7b

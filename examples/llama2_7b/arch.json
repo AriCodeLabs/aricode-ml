@@ -1,0 +1,102 @@
+[
+    ["embedding", 32000, 4096, 1],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["save_residual"], ["rmsnorm", 4096], ["multi_head_attention_gqa_kv", 32, 4096, 32, 32, 10000.0], ["add_residual"],
+    ["save_residual"], ["rmsnorm", 4096], ["swiglu_ffn", 4096, 11008], ["add_residual"],
+
+    ["rmsnorm", 4096],
+    ["linear", 4096, 32000]
+]

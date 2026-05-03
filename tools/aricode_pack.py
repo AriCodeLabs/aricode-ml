@@ -127,8 +127,8 @@ def linear_weights(idx: int, in_f: int, out_f: int, sd, key_pattern: str):
             f"linear layer #{idx}: missing key '{w_key}' or '{b_key}' "
             f"in state_dict.  Pass --keys to customise."
         )
-    W = sd[w_key].detach().cpu().numpy().astype("float32")
-    b = sd[b_key].detach().cpu().numpy().astype("float32")
+    W = sd[w_key].detach().float().cpu().numpy()
+    b = sd[b_key].detach().float().cpu().numpy()
     if W.shape != (out_f, in_f) or b.shape != (out_f,):
         raise ValueError(
             f"linear #{idx}: shape mismatch.  expected W=({out_f},{in_f}) "
@@ -2545,8 +2545,8 @@ def main():
                     f"linear #{idx}: missing '{wkey}' or '{bkey}' in checkpoint. "
                     f"Available keys: {sorted(sd.keys())}"
                 )
-            W = sd[wkey].detach().cpu().numpy().astype("float32")
-            b = sd[bkey].detach().cpu().numpy().astype("float32")
+            W = sd[wkey].detach().float().cpu().numpy()
+            b = sd[bkey].detach().float().cpu().numpy()
             if W.shape != (out_f, in_f) or b.shape != (out_f,):
                 raise SystemExit(
                     f"linear #{idx}: shape mismatch.  expected ({out_f},{in_f}) "
@@ -2575,8 +2575,8 @@ def main():
                     f"checkpoint.  Tried: conv.weight / layers.{idx}.weight / "
                     f"{keys(idx, 'weight')}.  Available: {sorted(sd.keys())}"
                 )
-            W = sd[wkey].detach().cpu().numpy().astype("float32")
-            b = sd[bkey].detach().cpu().numpy().astype("float32")
+            W = sd[wkey].detach().float().cpu().numpy()
+            b = sd[bkey].detach().float().cpu().numpy()
             if W.shape != (c_out, c_in, 3, 3) or b.shape != (c_out,):
                 raise SystemExit(
                     f"conv2d_3x3_p1 #{idx}: shape mismatch.  expected "
@@ -2612,8 +2612,8 @@ def main():
                         f"{candidates_w[3]}.  "
                         f"Available: {sorted(sd.keys())}"
                     )
-                W = sd[wkey].detach().cpu().numpy().astype("float32")
-                b = sd[bkey].detach().cpu().numpy().astype("float32")
+                W = sd[wkey].detach().float().cpu().numpy()
+                b = sd[bkey].detach().float().cpu().numpy()
                 if W.shape != (d_head, d_in) or b.shape != (d_head,):
                     raise SystemExit(
                         f"attention #{idx} {proj}_proj: shape mismatch. "
@@ -2657,8 +2657,8 @@ def main():
                         f"weight or bias.  Tried: {candidates_w[0]} / "
                         f"{candidates_w[3]}.  Available: {sorted(sd.keys())}"
                     )
-                W = sd[wkey].detach().cpu().numpy().astype("float32")
-                b = sd[bkey].detach().cpu().numpy().astype("float32")
+                W = sd[wkey].detach().float().cpu().numpy()
+                b = sd[bkey].detach().float().cpu().numpy()
                 if W.shape != (d_model, d_model) or b.shape != (d_model,):
                     raise SystemExit(
                         f"multi_head_attention #{idx} {proj}: shape "
@@ -2704,8 +2704,8 @@ def main():
                         f"weight or bias.  Tried: {candidates_w[0]} / "
                         f"{candidates_w[3]}.  Available: {sorted(sd.keys())}"
                     )
-                W = sd[wkey].detach().cpu().numpy().astype("float32")
-                b = sd[bkey].detach().cpu().numpy().astype("float32")
+                W = sd[wkey].detach().float().cpu().numpy()
+                b = sd[bkey].detach().float().cpu().numpy()
                 if W.shape != (d_model, d_model) or b.shape != (d_model,):
                     raise SystemExit(
                         f"multi_head_attention_kv #{idx} {proj}: shape "
@@ -2746,7 +2746,7 @@ def main():
                         f"{candidates_w[0]} / {candidates_w[3]}.  "
                         f"Available: {sorted(sd.keys())}"
                     )
-                W = sd[wkey].detach().cpu().numpy().astype("float32")
+                W = sd[wkey].detach().float().cpu().numpy()
                 if W.shape != shape_for[proj]:
                     raise SystemExit(
                         f"multi_head_attention_gqa_kv #{idx} {proj}: "
@@ -2815,8 +2815,8 @@ def main():
                     f"{candidates_w[0]} / {candidates_w[1]}.  "
                     f"Available: {sorted(sd.keys())}"
                 )
-            W = sd[wkey].detach().cpu().numpy().astype("float32")
-            b = sd[bkey].detach().cpu().numpy().astype("float32")
+            W = sd[wkey].detach().float().cpu().numpy()
+            b = sd[bkey].detach().float().cpu().numpy()
             if W.shape != (dim,) or b.shape != (dim,):
                 raise SystemExit(
                     f"layernorm #{idx}: shape mismatch.  expected "
@@ -2855,7 +2855,7 @@ def main():
                     f"{candidates_w[0]} / {candidates_w[1]} / "
                     f"{candidates_w[2]}.  Available: {sorted(sd.keys())}"
                 )
-            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            W = sd[wkey].detach().float().cpu().numpy()
             if W.shape != (dim,):
                 raise SystemExit(
                     f"rmsnorm #{idx}: shape mismatch.  expected ({dim},); "
@@ -2892,7 +2892,7 @@ def main():
                         f"{candidates_w[2]}.  "
                         f"Available: {sorted(sd.keys())}"
                     )
-                W = sd[wkey].detach().cpu().numpy().astype("float32")
+                W = sd[wkey].detach().float().cpu().numpy()
                 if W.shape != shape_for[proj]:
                     raise SystemExit(
                         f"swiglu_ffn #{idx} {proj}: shape mismatch.  "
@@ -2922,7 +2922,7 @@ def main():
                     f"Tried: {candidates[0]} / {candidates[1]} / ...  "
                     f"Available: {sorted(sd.keys())}"
                 )
-            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            W = sd[wkey].detach().float().cpu().numpy()
             if W.shape != (vocab_size, d_model):
                 raise SystemExit(
                     f"embedding #{idx}: shape mismatch.  expected "
@@ -2953,7 +2953,7 @@ def main():
                     f"in checkpoint.  Tried: {candidates[0]} / "
                     f"{candidates[1]} / ...  Available: {sorted(sd.keys())}"
                 )
-            W = sd[wkey].detach().cpu().numpy().astype("float32")
+            W = sd[wkey].detach().float().cpu().numpy()
             if W.shape != (max_pos, d_model):
                 raise SystemExit(
                     f"positional_embedding #{idx}: shape mismatch.  "

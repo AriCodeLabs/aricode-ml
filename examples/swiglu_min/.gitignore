@@ -7,3 +7,4 @@ expected.f32
 __pycache__/
 swiglu_min
 swiglu_min_int8
+swiglu_min_perrow
