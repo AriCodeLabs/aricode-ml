@@ -559,27 +559,30 @@ fn gelu_f32(buf: i32) -> i32 {
 
 # RMSNorm with affine γ, no bias.  Used by Llama / TinyLlama / Mistral.
 # Skips the mean-subtract pass that LayerNorm does — divides by RMS
-# (root-mean-square) directly.  eps default 1e-5 matches HF Llama.
+# (root-mean-square) directly.  eps 1e-5 matches HF Llama.
+#
+# Two paths:
+#   K=1 (decoder mode, single-token activation): both passes are SIMD —
+#       arr_f32_rmsnorm normalises in place, arr_f32_mul applies γ.
+#   K>1 (batched / encoder-style): the rmsnorm builtin handles all K
+#       groups internally; the γ pass falls back to a per-row scalar
+#       loop because γ is shape (dim,) but buf is shape (K, dim).
 RMSNORM_HELPER = """
 fn rmsnorm_affine_f32(buf: i32, dim: i32, gamma: i32) -> i32 {
+    arr_f32_rmsnorm(buf, dim, 0.00001);
     let n: i32 = arr_len(buf);
+    if (n == dim) {
+        arr_f32_mul(buf, buf, gamma);
+        return 0;
+    }
     let K: i32 = n / dim;
-    let eps: f64 = 0.00001;
     let k: i32 = 0;
     while (k < K) {
         let off: i32 = k * dim;
-        let sq: f64 = 0.0;
         let i: i32 = 0;
         while (i < dim) {
-            let v: f64 = arr_f32_get(buf, off + i);
-            sq = sq + v * v;
-            i = i + 1;
-        }
-        let inv_rms: f64 = 1.0 / math_sqrt(sq / int_to_float(dim) + eps);
-        i = 0;
-        while (i < dim) {
             arr_f32_set(buf, off + i,
-                arr_f32_get(buf, off + i) * arr_f32_get(gamma, i) * inv_rms);
+                arr_f32_get(buf, off + i) * arr_f32_get(gamma, i));
             i = i + 1;
         }
         k = k + 1;
@@ -593,31 +596,22 @@ def needs_rmsnorm_helper(arch):
     return any(layer[0] == "rmsnorm" for layer in arch)
 
 
-# SwiGLU element-wise step: out[i] = silu(gate[i]) * up[i].  Used by
-# Llama / Mistral / Falcon FFNs after the two parallel projections.
-# silu(x) = x * sigmoid(x); we use the identity silu(x) = x / (1 + e^-x)
-# with branched saturation to keep math_exp inside its safe range
-# (mirrors the GELU helper's clamp at |2*inner| > 20).
+# SwiGLU element-wise step: up_then_dst[i] = silu(gate[i]) * up_then_dst[i].
+# Used by Llama / Mistral / Falcon FFNs after the two parallel
+# projections.  Two SIMD passes:
+#   arr_f32_silu(gate)              -- gate[i] = silu(gate[i])
+#   arr_f32_mul(up_then_dst, gate, up_then_dst)
+#                                   -- up_then_dst[i] *= gate[i]
+# arr_f32_silu (codegen_builtins.c, 4-lane f64-promote-then-narrow,
+# inherits the math_exp clamp from vec_exp_body) replaces a scalar
+# 8-branch loop with explicit |g| > 20 saturation; arr_f32_mul is
+# the existing 8-lane vmulps.  Net: ~5-10× faster on d_ffn=5632
+# (TinyLlama).  `d` parameter retained for source compatibility but
+# unused — both builtins read length from arr_len(buf - 8).
 SWIGLU_HELPER = """
 fn silu_mul_f32(gate: i32, up_then_dst: i32, d: i32) -> i32 {
-    let i: i32 = 0;
-    while (i < d) {
-        let g: f64 = arr_f32_get(gate, i);
-        let sg: f64 = 0.0;
-        if (g > 20.0) {
-            sg = g;
-        } else {
-            if (g < 0.0 - 20.0) {
-                sg = 0.0;
-            } else {
-                let e_neg: f64 = math_exp(0.0 - g);
-                sg = g / (1.0 + e_neg);
-            }
-        }
-        let u: f64 = arr_f32_get(up_then_dst, i);
-        arr_f32_set(up_then_dst, i, sg * u);
-        i = i + 1;
-    }
+    arr_f32_silu(gate);
+    arr_f32_mul(up_then_dst, gate, up_then_dst);
     return 0;
 }
 """

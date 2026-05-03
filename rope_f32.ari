@@ -59,19 +59,14 @@ fn rope_alloc_f32(max_seq: i32, d_head: i32, theta: f64) -> i32 {
 //
 // Rotates the d_head-wide `vec` in place using the pre-computed `table`
 // row at `pos`.  Pair convention: (vec[2i], vec[2i+1]).
+//
+// Delegates to the arr_f32_rope_apply_pairs builtin (codegen_builtins.c)
+// for a tighter scalar SSE inner loop than what arr_f32_get / arr_f32_set
+// produce going through the heap-header round-trip.  The builtin's arg
+// order has vec first; this wrapper preserves the (table, vec, ...)
+// signature the rest of the stdlib calls with.
 // ----------------------------------------------------------------------
 fn rope_apply_f32(table: i32, vec: i32, pos: i32, d_head: i32) -> i32 {
-    let half: i32 = d_head / 2;
-    let row_off: i32 = pos * d_head;
-    let i: i32 = 0;
-    while (i < half) {
-        let c: f64 = arr_f32_get(table, row_off + 2 * i);
-        let s: f64 = arr_f32_get(table, row_off + 2 * i + 1);
-        let x0: f64 = arr_f32_get(vec, 2 * i);
-        let x1: f64 = arr_f32_get(vec, 2 * i + 1);
-        arr_f32_set(vec, 2 * i,     x0 * c - x1 * s);
-        arr_f32_set(vec, 2 * i + 1, x0 * s + x1 * c);
-        i = i + 1;
-    }
+    arr_f32_rope_apply_pairs(vec, table, pos, d_head);
     return 0;
 }
