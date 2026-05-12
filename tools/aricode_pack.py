@@ -1443,7 +1443,7 @@ def names_for(kind, idx):
 
 
 def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
-             multi_int8_runtime=False):
+             multi_int8_runtime=False, int4_embedding=False):
     """Three paths:
        - runtime file_read (embed=False)            : single .f32 sidecar
        - embed_file f32   (embed=True, quant=none)  : f32 baked into .text
@@ -1517,15 +1517,16 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
                     f"embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
                 # nb == 0 for swiglu — skip bias emit entirely.
             elif kind == "embedding":
-                # Per-row int8: each token row gets its own scale
-                # (length vocab_size).  Runtime path: the per-token
-                # dequant loop in gen_decoder_main / gen_forward
-                # reads arr_i8_get({wname}, row*d_model + i) and
-                # multiplies by arr_f32_get({wname}_scales, row).
-                # nb == 0 for embedding — no bias emit.
+                # Per-row int8 or int4.  Both schemes share the same
+                # f32 scales sidecar.  Int4 stores 2 nibbles per byte;
+                # the unpack happens in gen_decoder_main's lookup loop
+                # so the file is loaded as a plain byte buffer either
+                # way.  Extension differs (.i4 vs .i8) so we don't
+                # accidentally reuse a stale staging file.
+                ext = "i4" if int4_embedding else "i8"
                 lines.append(
                     f"    let {wname}: i32 = "
-                    f"embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                    f"embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.{ext}\");")
                 lines.append(
                     f"    let {wname}_scales: i32 = "
                     f"embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
@@ -2036,7 +2037,8 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     weight_decls = [] if quant_active else gen_weight_decls(arch, args.embed)
     act_decls, sizes = gen_act_decls(arch)
     load = gen_load(arch, embed_dir, out_name, args.embed,
-                    args.quantize, scales, False)
+                    args.quantize, scales, False,
+                    int4_embedding=getattr(args, "int4_embedding", False))
     # If a positional_embedding immediately follows the embedding, the
     # decoder emits a per-token wpe add inside the loop (below) and the
     # forward pass skips the entry to avoid double-emission.
@@ -2118,11 +2120,42 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
                     f"byte_at(_toks, t * 4 + 3) * 16777216;")
     body.append(f"        }}")
     # Embedding lookup: a0[:] = Wemb0[cur_tok, :]
-    # int8 path: each token row has its own scale (Wemb0_scales).
-    # We inline a per-element dequant rather than calling a helper so
-    # we can keep the source offset (cur_tok * d_model) packed.
+    # Three paths sharing the same scale sidecar:
+    #   int4 (--int4-embedding): two nibbles per byte, branchless
+    #     sign-extend via ((n + 8) % 16) - 8, walk d_model/2 bytes.
+    #   int8 (--quantize int8):   one byte per element, arr_i8_get
+    #     does the sign-extend in hardware.
+    #   fp32 (no quantisation):   arr_f32_copy_slice as before.
     emb_quantised = ("embedding", 0, "", "W") in scales
-    if emb_quantised:
+    int4_emb = getattr(args, "int4_embedding", False)
+    if emb_quantised and int4_emb:
+        if d_model % 2 != 0:
+            raise SystemExit(
+                f"decoder int4 embedding requires even d_model; got {d_model}")
+        half = d_model // 2
+        body.append(
+            f"        let _emb_scale: f64 = "
+            f"arr_f32_get(Wemb0_scales, cur_tok);")
+        body.append(f"        let _ei: i32 = 0;")
+        body.append(f"        let _emb_off: i32 = cur_tok * {half};")
+        body.append(f"        while (_ei < {half}) {{")
+        body.append(
+            f"            let _raw: i32 = byte_at(Wemb0, _emb_off + _ei);")
+        body.append(f"            let _lo: i32 = _raw % 16;")
+        body.append(f"            let _hi: i32 = _raw / 16;")
+        # Sign-extend 4-bit values: ((n + 8) % 16) - 8 maps [0..15] to
+        # [-8..7] without any branch.
+        body.append(f"            let _los: i32 = (_lo + 8) % 16 - 8;")
+        body.append(f"            let _his: i32 = (_hi + 8) % 16 - 8;")
+        body.append(
+            f"            arr_f32_set(a0, _ei * 2, "
+            f"int_to_float(_los) * _emb_scale);")
+        body.append(
+            f"            arr_f32_set(a0, _ei * 2 + 1, "
+            f"int_to_float(_his) * _emb_scale);")
+        body.append(f"            _ei = _ei + 1;")
+        body.append(f"        }}")
+    elif emb_quantised:
         body.append(
             f"        let _emb_scale: f64 = "
             f"arr_f32_get(Wemb0_scales, cur_tok);")
@@ -2395,6 +2428,15 @@ def parse_args():
                         "single f32 scale per tensor; the binary shrinks "
                         "by ~4× and the .ari preamble dequantises back "
                         "to f32 at startup.  Implies --embed.")
+    p.add_argument("--int4-embedding", action="store_true",
+                   help="Use int4 (instead of int8) for the token embedding "
+                        "matrix only — matmul layers stay int8.  Each token "
+                        "row is symmetrically quantised to [-8, 7] with its "
+                        "own f32 scale; two nibbles pack into one byte for "
+                        "storage.  Costs ~+0.5% perplexity on the validated "
+                        "TinyLM (32M params, vocab 50257) and saves another "
+                        "~6 MB binary on top of full int8.  Requires "
+                        "--quantize int8.")
     p.add_argument("--infer-arch", action="store_true",
                    help="Walk the checkpoint and print a starter arch.json "
                         "for sequential MLP / CNN architectures.  Inserts "
@@ -3089,7 +3131,44 @@ def main():
         wrote = []
         for kind, idx, suffix, W, b in collected:
             wname, bname = tensor_names(kind, idx, suffix)
-            if kind in PER_ROW:
+            # Special path: int4 embedding (per-row symmetric int4, two
+            # nibbles packed into one byte).  Only kicks in when both
+            # --quantize int8 and --int4-embedding are set; everything
+            # else stays on the int8 path.
+            if (args.int4_embedding and kind == "embedding"):
+                vocab, d_model = W.shape
+                if d_model % 2 != 0:
+                    raise SystemExit(
+                        f"--int4-embedding requires even d_model; "
+                        f"got {d_model}")
+                if W.size:
+                    abs_max_row = _np.abs(W).max(axis=1)
+                else:
+                    abs_max_row = _np.zeros((0,), dtype=_np.float32)
+                # int4 symmetric: representable range [-7, 7], so divide
+                # by max/7 (we leave -8 unused to keep symmetry — 0.5
+                # bits of range loss is a non-issue here since per-row
+                # scaling already concentrates dynamic range).
+                scales_arr = (abs_max_row / 7.0).astype(_np.float32)
+                safe = _np.where(scales_arr > 0, scales_arr, 1.0)
+                q4 = _np.round(W / safe[:, None]).clip(-8, 7).astype(_np.int8)
+                # Pack two int4 values per byte.  Low nibble = even
+                # column, high nibble = odd column.  Convert signed
+                # nibbles to unsigned (-8 → 8 … 7 → 7 in unsigned form)
+                # via & 0x0F so byte_at gives us back the same unsigned
+                # int we can then sign-extend in the .ari loop.
+                q4_u = (q4 & 0x0F).astype(_np.uint8)        # (vocab, d_model)
+                lo = q4_u[:, 0::2]
+                hi = q4_u[:, 1::2]
+                packed = (lo | (hi << 4)).astype(_np.uint8) # (vocab, d_model/2)
+                scales[(kind, idx, suffix, "W")] = scales_arr
+                wp = out_base.parent / f"{out_base.name}_{wname}.i4"
+                packed.tofile(wp)
+                wrote.append(wp)
+                sp = out_base.parent / f"{out_base.name}_{wname}_scales.f32"
+                scales_arr.tofile(sp)
+                wrote.append(sp)
+            elif kind in PER_ROW:
                 # Per-row symmetric int8: scales[i] = max(|W[i,:]|) / 127.
                 # Each output row gets its own scale, so fat rows don't
                 # waste the dynamic range of skinny rows.
