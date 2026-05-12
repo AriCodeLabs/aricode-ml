@@ -138,7 +138,7 @@ def linear_weights(idx: int, in_f: int, out_f: int, sd, key_pattern: str):
 
 
 def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
-                quant_scale=None, seq=1):
+                quant_scale=None, seq=1, bits=8):
     """Emit a Linear-layer forward.
 
     `seq` defaults to 1 — the original single-row matvec form used by
@@ -164,6 +164,48 @@ def emit_linear(idx, in_f, out_f, src_var, dst_var, w_var, b_var,
         if quant_scale is None:
             return [
                 f"    arr_f32_matvec({w_var}, {src_var}, {b_var}, {dst_var}, {out_f}, {in_f});",
+            ]
+        if bits == 4:
+            # Inline int4 matmul.  Walks the packed byte buffer:
+            #   byte_at({w_var}, j * in_f/2 + i) holds two nibbles.
+            # Sign-extend each nibble via ((n + 8) % 16) - 8, multiply
+            # by scale[j] AT THE END (one mul per row instead of per
+            # element), add bias.  Pure inline f32 accumulator — no
+            # SIMD kernel — so it's slower per element than the int8
+            # path but the weights occupy half the bytes.
+            half = in_f // 2
+            return [
+                f"    // int4 inline matmul (linear #{idx}): "
+                f"in_f={in_f} out_f={out_f}",
+                f"    let _lmj_{idx}: i32 = 0;",
+                f"    while (_lmj_{idx} < {out_f}) {{",
+                f"        let _scl_{idx}: f64 = "
+                f"arr_f32_get({w_var}_scales, _lmj_{idx});",
+                f"        let _acc_{idx}: f64 = 0.0;",
+                f"        let _lmi_{idx}: i32 = 0;",
+                f"        let _roff_{idx}: i32 = _lmj_{idx} * {half};",
+                f"        while (_lmi_{idx} < {half}) {{",
+                f"            let _raw_{idx}: i32 = "
+                f"byte_at({w_var}, _roff_{idx} + _lmi_{idx});",
+                f"            let _lo_{idx}: i32 = _raw_{idx} % 16;",
+                f"            let _hi_{idx}: i32 = _raw_{idx} / 16;",
+                f"            let _los_{idx}: i32 = "
+                f"(_lo_{idx} + 8) % 16 - 8;",
+                f"            let _his_{idx}: i32 = "
+                f"(_hi_{idx} + 8) % 16 - 8;",
+                f"            _acc_{idx} = _acc_{idx} + "
+                f"int_to_float(_los_{idx}) * "
+                f"arr_f32_get({src_var}, _lmi_{idx} * 2);",
+                f"            _acc_{idx} = _acc_{idx} + "
+                f"int_to_float(_his_{idx}) * "
+                f"arr_f32_get({src_var}, _lmi_{idx} * 2 + 1);",
+                f"            _lmi_{idx} = _lmi_{idx} + 1;",
+                f"        }}",
+                f"        arr_f32_set({dst_var}, _lmj_{idx}, "
+                f"_acc_{idx} * _scl_{idx} + "
+                f"arr_f32_get({b_var}, _lmj_{idx}));",
+                f"        _lmj_{idx} = _lmj_{idx} + 1;",
+                f"    }}",
             ]
         return [
             f"    arr_i8_matvec_f32_perrow({w_var}, {src_var}, {dst_var}, {out_f}, {w_var}_scales);",
@@ -1443,7 +1485,8 @@ def names_for(kind, idx):
 
 
 def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
-             multi_int8_runtime=False, int4_embedding=False):
+             multi_int8_runtime=False, int4_embedding=False,
+             int4_linear=False):
     """Three paths:
        - runtime file_read (embed=False)            : single .f32 sidecar
        - embed_file f32   (embed=True, quant=none)  : f32 baked into .text
@@ -1500,8 +1543,11 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
             if kind == "linear":
                 # Per-row scales: int8 weight + an f32 scales buffer of
                 # length out_f.  Runtime calls arr_i8_matvec_f32_perrow
-                # which loads scale[j] per output row.
-                lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                # which loads scale[j] per output row.  Int4 variant
+                # uses the same layout but packs 2 nibbles/byte (.i4)
+                # and is dequantised inline by emit_linear.
+                ext = "i4" if int4_linear else "i8"
+                lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.{ext}\");")
                 lines.append(f"    let {wname}_scales: i32 = embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
                 lines.append(f"    let {bname}: i32 = embed_file(\"{embed_dir}/{out_name}_{bname}.f32\");")
             elif kind == "swiglu_ffn":
@@ -1562,7 +1608,7 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
     return lines
 
 
-def gen_forward(arch, scales=None, multi_int8_runtime=False):
+def gen_forward(arch, scales=None, multi_int8_runtime=False, int4_linear=False):
     """Emit the per-sample forward pass on activation buffers a0..aN.
 
     cur_a tracks which activation buffer holds the running tensor.
@@ -1599,7 +1645,8 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False):
             seq_in = cur_size // in_f if (cur_size >= in_f and cur_size % in_f == 0) else 1
             lines += emit_linear(idx, in_f, out_f, src, dst,
                                  f"W{idx}", f"b{idx}", quant_scale=sc,
-                                 seq=seq_in)
+                                 seq=seq_in,
+                                 bits=(4 if int4_linear and sc is not None else 8))
             cur_a += 1
         elif kind == "conv2d_3x3_p1":
             c_in, c_out = args
@@ -2038,13 +2085,15 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     act_decls, sizes = gen_act_decls(arch)
     load = gen_load(arch, embed_dir, out_name, args.embed,
                     args.quantize, scales, False,
-                    int4_embedding=getattr(args, "int4_embedding", False))
+                    int4_embedding=getattr(args, "int4_embedding", False),
+                    int4_linear=getattr(args, "int4_linear", False))
     # If a positional_embedding immediately follows the embedding, the
     # decoder emits a per-token wpe add inside the loop (below) and the
     # forward pass skips the entry to avoid double-emission.
     has_pe = (len(arch) > 1 and arch[1][0] == "positional_embedding")
     fwd_arch = arch[2:] if has_pe else arch[1:]
-    fwd, last = gen_forward(fwd_arch, scales if quant_active else None, False)
+    fwd, last = gen_forward(fwd_arch, scales if quant_active else None, False,
+                            int4_linear=getattr(args, "int4_linear", False))
 
     tb = _embedding_token_bytes(vocab)
 
@@ -2428,6 +2477,16 @@ def parse_args():
                         "single f32 scale per tensor; the binary shrinks "
                         "by ~4× and the .ari preamble dequantises back "
                         "to f32 at startup.  Implies --embed.")
+    p.add_argument("--int4-linear", action="store_true",
+                   help="Use int4 (instead of int8) for every Linear "
+                        "layer's weight matrix.  On decoder models that "
+                        "means the LM head — the second-largest tensor "
+                        "after the embedding.  Per-row symmetric int4, "
+                        "two nibbles per byte, dequantised by an inline "
+                        "matmul (no SIMD kernel — slower than int8 but "
+                        "saves ~7 MB on the LM head of a 32M model).  "
+                        "Costs ~+4.5% perplexity at this scale.  "
+                        "Requires --quantize int8.")
     p.add_argument("--int4-embedding", action="store_true",
                    help="Use int4 (instead of int8) for the token embedding "
                         "matrix only — matmul layers stay int8.  Each token "
@@ -3135,7 +3194,31 @@ def main():
             # nibbles packed into one byte).  Only kicks in when both
             # --quantize int8 and --int4-embedding are set; everything
             # else stays on the int8 path.
-            if (args.int4_embedding and kind == "embedding"):
+            if (args.int4_linear and kind == "linear"):
+                out_f, in_f = W.shape    # (out_features, in_features)
+                if in_f % 2 != 0:
+                    raise SystemExit(
+                        f"--int4-linear requires even in_features; "
+                        f"linear #{idx} has in_f={in_f}")
+                if W.size:
+                    abs_max_row = _np.abs(W).max(axis=1)
+                else:
+                    abs_max_row = _np.zeros((0,), dtype=_np.float32)
+                scales_arr = (abs_max_row / 7.0).astype(_np.float32)
+                safe = _np.where(scales_arr > 0, scales_arr, 1.0)
+                q4 = _np.round(W / safe[:, None]).clip(-8, 7).astype(_np.int8)
+                q4_u = (q4 & 0x0F).astype(_np.uint8)
+                lo = q4_u[:, 0::2]
+                hi = q4_u[:, 1::2]
+                packed = (lo | (hi << 4)).astype(_np.uint8)   # (out_f, in_f/2)
+                scales[(kind, idx, suffix, "W")] = scales_arr
+                wp = out_base.parent / f"{out_base.name}_{wname}.i4"
+                packed.tofile(wp)
+                wrote.append(wp)
+                sp = out_base.parent / f"{out_base.name}_{wname}_scales.f32"
+                scales_arr.tofile(sp)
+                wrote.append(sp)
+            elif (args.int4_embedding and kind == "embedding"):
                 vocab, d_model = W.shape
                 if d_model % 2 != 0:
                     raise SystemExit(
