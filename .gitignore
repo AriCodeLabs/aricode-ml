@@ -27,3 +27,18 @@ arch_just_mha.json
 jm.pt
 jm_e.f32
 jm_t.bin
+
+# Per-example compiled artifacts (ELFs + .ari + per-tensor staging .i8/.f32/.i4).
+# All regenerable from each example's synth.pt + arch.json via aricode_pack.py
+# and aric.  Source/scripts stay tracked.
+examples/gpt2_small/gpt2_chat
+examples/mnist/mnist_*
+examples/mnist_infer/cli_classifier
+examples/mnist_infer/cli_classifier.ari
+examples/mnist_infer/cnn2_*
+examples/mnist_infer/cnn_*
+examples/mnist_infer/packed_mlp*
+examples/mnist_infer/single_bin*
+examples/mnist_infer/mlp_*
+examples/threading/parallel_matvec
+examples/threading/serial_matvec
