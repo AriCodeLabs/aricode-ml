@@ -1479,12 +1479,12 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
         arch_by_idx = {("conv2d_3x3_p1", i): _conv_c_in(layer)
                        for i, layer in enumerate(
                            [l for l in arch if l[0] == "conv2d_3x3_p1"])}
-        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn")
+        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn", "embedding")
         lines = []
         for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
             c_in = arch_by_idx.get((kind, idx))
             if kind not in QUANTISABLE:
-                # Not int8-supported (attention / MHA / embedding /
+                # Not int8-supported (attention / MHA /
                 # positional_embedding / layernorm / rmsnorm) — staged
                 # as f32 by the main pack(), embed via embed_file
                 # directly.
@@ -1516,6 +1516,19 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
                     f"    let {wname}_scales: i32 = "
                     f"embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
                 # nb == 0 for swiglu — skip bias emit entirely.
+            elif kind == "embedding":
+                # Per-row int8: each token row gets its own scale
+                # (length vocab_size).  Runtime path: the per-token
+                # dequant loop in gen_decoder_main / gen_forward
+                # reads arr_i8_get({wname}, row*d_model + i) and
+                # multiplies by arr_f32_get({wname}_scales, row).
+                # nb == 0 for embedding — no bias emit.
+                lines.append(
+                    f"    let {wname}: i32 = "
+                    f"embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                lines.append(
+                    f"    let {wname}_scales: i32 = "
+                    f"embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
             elif kind == "conv2d_3x3_p1" and c_in == 1:
                 # Single-channel conv: int8 weights stay int8.
                 lines.append(f"    let {wname}: i32 = embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
@@ -2105,8 +2118,25 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
                     f"byte_at(_toks, t * 4 + 3) * 16777216;")
     body.append(f"        }}")
     # Embedding lookup: a0[:] = Wemb0[cur_tok, :]
-    body.append(f"        arr_f32_copy_slice(Wemb0, cur_tok * {d_model}, "
-                f"a0, 0, {d_model});")
+    # int8 path: each token row has its own scale (Wemb0_scales).
+    # We inline a per-element dequant rather than calling a helper so
+    # we can keep the source offset (cur_tok * d_model) packed.
+    emb_quantised = ("embedding", 0, "", "W") in scales
+    if emb_quantised:
+        body.append(
+            f"        let _emb_scale: f64 = "
+            f"arr_f32_get(Wemb0_scales, cur_tok);")
+        body.append(f"        let _ei: i32 = 0;")
+        body.append(f"        let _emb_off: i32 = cur_tok * {d_model};")
+        body.append(f"        while (_ei < {d_model}) {{")
+        body.append(
+            f"            arr_f32_set(a0, _ei, "
+            f"int_to_float(arr_i8_get(Wemb0, _emb_off + _ei)) * _emb_scale);")
+        body.append(f"            _ei = _ei + 1;")
+        body.append(f"        }}")
+    else:
+        body.append(f"        arr_f32_copy_slice(Wemb0, cur_tok * {d_model}, "
+                    f"a0, 0, {d_model});")
     # Optional positional embedding: a0 += Wpos0[t, :] (per absolute
     # position).  Inline scalar add since arr_f32_add_scaled would
     # need a separate sliced buffer for one row of d_model elements.
@@ -3033,25 +3063,28 @@ def main():
         args.embed = True
 
     if args.embed and args.quantize == "int8":
-        # int8 staging: only LINEAR and CONV tensors get quantised —
-        # those are the kinds with native int8 matvec/conv kernels.
-        # Other kinds (attention, multi_head_attention, embedding,
+        # int8 staging: LINEAR, CONV, SwiGLU, and EMBEDDING get
+        # quantised.  Other kinds (attention, multi_head_attention,
         # positional_embedding, layernorm) keep f32 staging because
         # their forward paths consume f32 weights (no int8 kernel
-        # exists for them).  Without this gate the packer used to
-        # emit `dequant_int8_to_f32` calls for tensors that the
-        # prologue didn't even include the helper for, producing
-        # "Undefined function" compile errors on transformer-class
-        # models.
-        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn")
-        # Matvec layers use PER-ROW scales (one f32 per output row of W);
-        # conv2d_3x3_p1 stays per-tensor (its kernel,
-        # arr_i8_conv2d_3x3_p1*, has no per-row variant yet).  Per-row
-        # dramatically improves quantisation fidelity on large matrices
-        # — gate/up/down on TinyLlama (5632 × 2048) collapse from "model
-        # diverges from f32 greedy after 0 tokens" to ~5/8 prefix match
-        # because each row no longer competes for a shared dynamic range.
-        PER_ROW = ("linear", "swiglu_ffn")
+        # exists for them).
+        # Embedding was added 2026-05-12 after measure_quant.py showed
+        # that per-row int8 of the embedding row costs ~0.01% ppl
+        # while the matrix occupies ~40% of the binary on small
+        # vocab=50K models; it's the single biggest binary-shrink
+        # opportunity per quality-cost dollar.
+        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn", "embedding")
+        # Matvec/embedding layers use PER-ROW scales (one f32 per
+        # output row of W); conv2d_3x3_p1 stays per-tensor (its kernel,
+        # arr_i8_conv2d_3x3_p1*, has no per-row variant yet).
+        # Per-row dramatically improves quantisation fidelity on large
+        # matrices — gate/up/down on TinyLlama (5632 × 2048) collapse
+        # from "model diverges from f32 greedy after 0 tokens" to ~5/8
+        # prefix match because each row no longer competes for a
+        # shared dynamic range.  For embeddings each token row has its
+        # own scale so high-magnitude rare tokens don't waste the
+        # dynamic range of the more common ones.
+        PER_ROW = ("linear", "swiglu_ffn", "embedding")
         import numpy as _np
         wrote = []
         for kind, idx, suffix, W, b in collected:
