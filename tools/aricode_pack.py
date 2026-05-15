@@ -1580,7 +1580,23 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
     return lines
 
 
-def gen_forward(arch, scales=None, multi_int8_runtime=False, int4_linear=False):
+def _prof_cat(kind):
+    """Map an arch op kind to a coarse profiling bucket."""
+    if kind == "embedding":               return "emb"
+    if kind == "rmsnorm" or kind == "layernorm": return "norm"
+    if kind in ("multi_head_attention_gqa_kv", "multi_head_attention",
+                "multi_head_attention_kv", "attention"):       return "attn"
+    if kind == "swiglu_ffn":              return "ffn"
+    if kind == "linear":                  return "linear"
+    if kind in ("save_residual", "add_residual"): return "resid"
+    return "other"
+
+
+_PROF_BUCKETS = ("emb", "norm", "attn", "ffn", "linear", "resid", "other")
+
+
+def gen_forward(arch, scales=None, multi_int8_runtime=False, int4_linear=False,
+                profile=False):
     """Emit the per-sample forward pass on activation buffers a0..aN.
 
     cur_a tracks which activation buffer holds the running tensor.
@@ -1607,7 +1623,9 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False, int4_linear=False):
     # emit a per-row loop.  Could share the list with gen_act_decls'
     # return value, but recomputing is cheaper than threading through.
     _, sizes_for_seq = gen_act_decls(arch)
+    _prof_gid = [0]   # unique-id source for per-op rdtsc temporaries
     for kind, idx, args in arch_walk(arch):
+        _op_start = len(lines)   # bracket this op's emitted lines
         if kind == "linear":
             in_f, out_f = args
             src = f"a{cur_a}"
@@ -1966,6 +1984,17 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False, int4_linear=False):
                 f"    arr_f32_add_scaled(a{cur_a}, _resid_{slot_idx}, 1.0);")
         else:
             raise ValueError(f"unknown layer kind: {kind!r}")
+        if profile and len(lines) > _op_start:
+            # Bracket every op with rdtsc into a per-category f64
+            # accumulator (declared in the decoder main).  Adds 2
+            # rdtsc calls (~40 cyc) per op per token — negligible vs
+            # the op cost, and the RATIO between buckets is what we
+            # actually want.
+            cat = _prof_cat(kind)
+            gid = _prof_gid[0]; _prof_gid[0] += 1
+            lines.insert(_op_start, f"    let _pts{gid}: f64 = rdtsc();")
+            lines.append(
+                f"    _prof_{cat} = _prof_{cat} + (rdtsc() - _pts{gid});")
     return lines, cur_a
 
 
@@ -2064,8 +2093,10 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     # forward pass skips the entry to avoid double-emission.
     has_pe = (len(arch) > 1 and arch[1][0] == "positional_embedding")
     fwd_arch = arch[2:] if has_pe else arch[1:]
+    _profile = getattr(args, "profile", False)
     fwd, last = gen_forward(fwd_arch, scales if quant_active else None, False,
-                            int4_linear=getattr(args, "int4_linear", False))
+                            int4_linear=getattr(args, "int4_linear", False),
+                            profile=_profile)
 
     tb = _embedding_token_bytes(vocab)
 
@@ -2126,6 +2157,13 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
             body.append(f"    let rng_state: i32 = _stdin_seed;")
         else:
             body.append(f"    let rng_state: i32 = {args.rng_seed};")
+    if _profile:
+        # Per-category cycle accumulators (f64 — i32 would overflow
+        # mid-run; see the rdtsc builtin comment).  gen_forward's
+        # bracketing references _prof_<bucket>; we also time the
+        # embedding lookup and sampling here in the decoder loop.
+        for _bk in _PROF_BUCKETS + ("sample",):
+            body.append(f"    let _prof_{_bk}: f64 = 0.0;")
     body.append(f"    while (t < total) {{")
     # Get current token: prompt or previous-step argmax.
     body.append(f"        if (t < prompt_len) {{")
@@ -2149,6 +2187,7 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     #   fp32 (no quantisation):   arr_f32_copy_slice as before.
     emb_quantised = ("embedding", 0, "", "W") in scales
     int4_emb = getattr(args, "int4_embedding", False)
+    _emb_start = len(body)
     if emb_quantised and int4_emb:
         if d_model % 2 != 0:
             raise SystemExit(
@@ -2191,6 +2230,9 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     else:
         body.append(f"        arr_f32_copy_slice(Wemb0, cur_tok * {d_model}, "
                     f"a0, 0, {d_model});")
+    if _profile:
+        body.insert(_emb_start, f"        let _ets: f64 = rdtsc();")
+        body.append(f"        _prof_emb = _prof_emb + (rdtsc() - _ets);")
     # Optional positional embedding: a0 += Wpos0[t, :] (per absolute
     # position).  Inline scalar add since arr_f32_add_scaled would
     # need a separate sliced buffer for one row of d_model elements.
@@ -2207,6 +2249,7 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     # Inline the per-token forward (sized for indent 8 inside `while`).
     body += [("    " + l) for l in fwd]
     # Sample the next token from the LM head logits at a{last}.
+    _samp_start = len(body)
     if sample_mode == "greedy":
         body.append(f"        let next_tok: i32 = sample_greedy_f32(a{last});")
     else:
@@ -2225,6 +2268,9 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
         body.append(
             f"        let next_tok: i32 = sample_temperature_f32("
             f"a{last}, {sample_kwargs['temperature']!r}, _unit);")
+    if _profile:
+        body.insert(_samp_start, f"        let _sts: f64 = rdtsc();")
+        body.append(f"        _prof_sample = _prof_sample + (rdtsc() - _sts);")
     # Optional EOS: stop generating BEFORE printing the EOS token so
     # the consumer sees only real content.  Triggered only past the
     # prefill window (t >= prompt_len - 1) — an EOS-shaped logit
@@ -2240,6 +2286,23 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     body.append(f"        cur_tok = next_tok;")
     body.append(f"        t = t + 1;")
     body.append(f"    }}")
+    if _profile:
+        # Per-token breakdown printed to stdout as integer
+        # percentages (print_f64 can't render the raw cycle
+        # magnitudes; ratios are what matter anyway).  Sum all
+        # buckets, print each as pct * 100 so the consumer just
+        # reads a column of small numbers in _PROF_BUCKETS+sample
+        # order.  Prefixed with a sentinel line so chat.py / a
+        # parser can find it.
+        all_bk = list(_PROF_BUCKETS) + ["sample"]
+        tot_expr = " + ".join(f"_prof_{b}" for b in all_bk)
+        body.append(f'    let _ptot: f64 = {tot_expr};')
+        body.append(f'    print_int(909090);')   # sentinel marker
+        for b in all_bk:
+            body.append(
+                f'    print_int(float_to_int('
+                f'_prof_{b} / _ptot * 10000.0));')
+        body.append(f'    print_int(909090);')
     body.append("    return 0;")
     body.append("}")
     return "\n".join(body)
@@ -2430,6 +2493,16 @@ def parse_args():
                         "uniform draw passed to sample_temperature_f32.  "
                         "Default chosen for stable regression-test "
                         "reproducibility.")
+    p.add_argument("--profile", action="store_true",
+                   help="Decoder mode: bracket every forward op with "
+                        "rdtsc() into per-category f64 cycle "
+                        "accumulators (emb / norm / attn / ffn / "
+                        "linear / resid / other / sample).  After "
+                        "generation, prints a sentinel-delimited "
+                        "block of integer permille shares (0..10000) "
+                        "to stdout so a wrapper can show where "
+                        "per-token time actually goes.  ~40 cyc/op "
+                        "overhead — negligible vs the op cost.")
     p.add_argument("--out", default=None,
                    help="Output base name.  <out>.ari is always written.  "
                         "Without --embed, a single <out>.f32 sidecar is "
