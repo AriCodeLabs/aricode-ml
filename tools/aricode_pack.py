@@ -451,6 +451,7 @@ def _load_kv_attention_lib() -> str:
         "attention_mh_kv_f32.ari",
         "rope_f32.ari",
         "attention_gqa_kv_f32.ari",
+        "attention_gqa_kv_i8.ari",
         "sampling_f32.ari",
     ]
     parts = []
@@ -1218,7 +1219,7 @@ def gen_act_decls(arch):
     return lines, sizes
 
 
-def gen_scratch(arch):
+def gen_scratch(arch, int8_attention=False):
     """Extra scratch buffers needed by spatial layers."""
     lines = []
     # Decoder mode emits its own per-token positional-embedding add
@@ -1331,14 +1332,30 @@ def gen_scratch(arch):
             # sentinel and the step kernel routes them through the
             # internal zero-fill scratches.
             max_seq, d_model, n_heads, n_kv_heads, theta = args
-            lines.append(
-                f"    let gqa_state_{idx}: i32 = "
-                f"attn_gqa_kv_alloc_f32({max_seq}, {d_model}, {n_heads}, "
-                f"{n_kv_heads}, {theta!r});")
-            lines.append(f"    arr_set(gqa_state_{idx}, 1, Wgqaq{idx});")
-            lines.append(f"    arr_set(gqa_state_{idx}, 3, Wgqak{idx});")
-            lines.append(f"    arr_set(gqa_state_{idx}, 5, Wgqav{idx});")
-            lines.append(f"    arr_set(gqa_state_{idx}, 7, Wgqao{idx});")
+            if int8_attention:
+                # int8 kernel: weights → slots 1/3/5/7, per-row
+                # f32 scales → slots 2/4/6/8.
+                lines.append(
+                    f"    let gqa_state_{idx}: i32 = "
+                    f"attn_gqa_kv_alloc_i8({max_seq}, {d_model}, "
+                    f"{n_heads}, {n_kv_heads}, {theta!r});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 1, Wgqaq{idx});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 2, Wgqaq{idx}_scales);")
+                lines.append(f"    arr_set(gqa_state_{idx}, 3, Wgqak{idx});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 4, Wgqak{idx}_scales);")
+                lines.append(f"    arr_set(gqa_state_{idx}, 5, Wgqav{idx});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 6, Wgqav{idx}_scales);")
+                lines.append(f"    arr_set(gqa_state_{idx}, 7, Wgqao{idx});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 8, Wgqao{idx}_scales);")
+            else:
+                lines.append(
+                    f"    let gqa_state_{idx}: i32 = "
+                    f"attn_gqa_kv_alloc_f32({max_seq}, {d_model}, {n_heads}, "
+                    f"{n_kv_heads}, {theta!r});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 1, Wgqaq{idx});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 3, Wgqak{idx});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 5, Wgqav{idx});")
+                lines.append(f"    arr_set(gqa_state_{idx}, 7, Wgqao{idx});")
         elif kind == "swiglu_ffn":
             # Per-layer gate / up scratches sized to d_ffn.  silu_mul
             # writes silu(gate)*up into the up buffer in place; the
@@ -1458,7 +1475,7 @@ def names_for(kind, idx):
 
 def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
              multi_int8_runtime=False, int4_embedding=False,
-             int4_linear=False):
+             int4_linear=False, int8_attention=False):
     """Three paths:
        - runtime file_read (embed=False)            : single .f32 sidecar
        - embed_file f32   (embed=True, quant=none)  : f32 baked into .text
@@ -1494,7 +1511,10 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
         arch_by_idx = {("conv2d_3x3_p1", i): _conv_c_in(layer)
                        for i, layer in enumerate(
                            [l for l in arch if l[0] == "conv2d_3x3_p1"])}
-        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn", "embedding")
+        QUANTISABLE = ["linear", "conv2d_3x3_p1", "swiglu_ffn", "embedding"]
+        if int8_attention:
+            QUANTISABLE.append("multi_head_attention_gqa_kv")
+        QUANTISABLE = tuple(QUANTISABLE)
         lines = []
         for kind, idx, suffix, nw, nb, wname, bname in weight_tensors(arch):
             c_in = arch_by_idx.get((kind, idx))
@@ -1534,6 +1554,17 @@ def gen_load(arch, embed_dir, out_name, embed, quantize, scales,
                     f"    let {wname}_scales: i32 = "
                     f"embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
                 # nb == 0 for swiglu — skip bias emit entirely.
+            elif kind == "multi_head_attention_gqa_kv":
+                # Q/K/V/O — per-row int8 + f32 scales, exactly the
+                # swiglu layout.  Consumed by attention_gqa_kv_i8 via
+                # arr_i8_matvec_f32_perrow.  No biases (Llama / our
+                # pack convention).
+                lines.append(
+                    f"    let {wname}: i32 = "
+                    f"embed_file_bytes(\"{embed_dir}/{out_name}_{wname}.i8\");")
+                lines.append(
+                    f"    let {wname}_scales: i32 = "
+                    f"embed_file(\"{embed_dir}/{out_name}_{wname}_scales.f32\");")
             elif kind == "embedding":
                 # Per-row int8 or int4.  Both schemes share the same
                 # f32 scales sidecar.  Int4 stores 2 nibbles per byte;
@@ -1596,7 +1627,7 @@ _PROF_BUCKETS = ("emb", "norm", "attn", "ffn", "linear", "resid", "other")
 
 
 def gen_forward(arch, scales=None, multi_int8_runtime=False, int4_linear=False,
-                profile=False):
+                profile=False, int8_attention=False):
     """Emit the per-sample forward pass on activation buffers a0..aN.
 
     cur_a tracks which activation buffer holds the running tensor.
@@ -1904,7 +1935,10 @@ def gen_forward(arch, scales=None, multi_int8_runtime=False, int4_linear=False,
                          f"max_seq={max_seq}")
             lines.append(f"    arr_set({s}, 0, {src});")
             lines.append(f"    arr_set({s}, 9, {dst});")
-            lines.append(f"    attn_gqa_kv_step_f32({s});")
+            if int8_attention:
+                lines.append(f"    attn_gqa_kv_step_i8({s});")
+            else:
+                lines.append(f"    attn_gqa_kv_step_f32({s});")
             cur_a += 1
         elif kind == "flatten":
             # Reshape only — same buffer holds the data.  No code emitted.
@@ -2084,10 +2118,12 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     # via the existing --quantize int8 wiring.
     weight_decls = [] if quant_active else gen_weight_decls(arch, args.embed)
     act_decls, sizes = gen_act_decls(arch)
+    _int8_attn = getattr(args, "int8_attention", False)
     load = gen_load(arch, embed_dir, out_name, args.embed,
                     args.quantize, scales, False,
                     int4_embedding=getattr(args, "int4_embedding", False),
-                    int4_linear=getattr(args, "int4_linear", False))
+                    int4_linear=getattr(args, "int4_linear", False),
+                    int8_attention=_int8_attn)
     # If a positional_embedding immediately follows the embedding, the
     # decoder emits a per-token wpe add inside the loop (below) and the
     # forward pass skips the entry to avoid double-emission.
@@ -2096,7 +2132,7 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     _profile = getattr(args, "profile", False)
     fwd, last = gen_forward(fwd_arch, scales if quant_active else None, False,
                             int4_linear=getattr(args, "int4_linear", False),
-                            profile=_profile)
+                            profile=_profile, int8_attention=_int8_attn)
 
     tb = _embedding_token_bytes(vocab)
 
@@ -2105,7 +2141,7 @@ def gen_decoder_main(arch, args, out_name, embed_dir, scales):
     body += weight_decls
     body += load
     body += act_decls
-    body += gen_scratch(arch)
+    body += gen_scratch(arch, int8_attention=_int8_attn)
     body.append("")
     body.append(f"    // decoder loop: prefill prompt, then sample {args.max_new_tokens}")
     if args.input_format == "stdin-tokens":
@@ -2503,6 +2539,17 @@ def parse_args():
                         "to stdout so a wrapper can show where "
                         "per-token time actually goes.  ~40 cyc/op "
                         "overhead — negligible vs the op cost.")
+    p.add_argument("--int8-attention", action="store_true",
+                   help="Quantise the GQA attention Q/K/V/O weight "
+                        "projections to per-row int8 (uses the "
+                        "attention_gqa_kv_i8 kernel + "
+                        "arr_i8_matvec_f32_perrow).  Attention is the "
+                        "largest f32 chunk on bigger models (e.g. ~54% "
+                        "of the 100M Spanish binary, 39% of per-token "
+                        "time).  int8 weight quant is ~+0.01% ppl.  "
+                        "Requires --quantize int8.  The score matvec "
+                        "against the KV cache stays f32 (cache holds "
+                        "runtime activations, not weights).")
     p.add_argument("--out", default=None,
                    help="Output base name.  <out>.ari is always written.  "
                         "Without --embed, a single <out>.f32 sidecar is "
@@ -3219,7 +3266,14 @@ def main():
         # while the matrix occupies ~40% of the binary on small
         # vocab=50K models; it's the single biggest binary-shrink
         # opportunity per quality-cost dollar.
-        QUANTISABLE = ("linear", "conv2d_3x3_p1", "swiglu_ffn", "embedding")
+        QUANTISABLE = ["linear", "conv2d_3x3_p1", "swiglu_ffn", "embedding"]
+        if getattr(args, "int8_attention", False):
+            # GQA attention Q/K/V/O — same per-row int8 scheme as
+            # swiglu; consumed by attention_gqa_kv_i8 via
+            # arr_i8_matvec_f32_perrow.  Opt-in only so default
+            # f32-attention behaviour is untouched.
+            QUANTISABLE.append("multi_head_attention_gqa_kv")
+        QUANTISABLE = tuple(QUANTISABLE)
         # Matvec/embedding layers use PER-ROW scales (one f32 per
         # output row of W); conv2d_3x3_p1 stays per-tensor (its kernel,
         # arr_i8_conv2d_3x3_p1*, has no per-row variant yet).
@@ -3230,7 +3284,10 @@ def main():
         # shared dynamic range.  For embeddings each token row has its
         # own scale so high-magnitude rare tokens don't waste the
         # dynamic range of the more common ones.
-        PER_ROW = ("linear", "swiglu_ffn", "embedding")
+        PER_ROW = ["linear", "swiglu_ffn", "embedding"]
+        if getattr(args, "int8_attention", False):
+            PER_ROW.append("multi_head_attention_gqa_kv")
+        PER_ROW = tuple(PER_ROW)
         import numpy as _np
         wrote = []
         for kind, idx, suffix, W, b in collected:
