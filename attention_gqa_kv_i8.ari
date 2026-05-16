@@ -1,0 +1,195 @@
+// GQA + RoPE incremental attention, int8-quantised weights.
+//
+// Mirrors attention_gqa_kv_f32.ari exactly but the four weight
+// projections (Q, K, V, O) are int8 + per-row f32 scales, run
+// through arr_i8_matvec_f32_perrow (the proven AVX2 int8 matvec).
+//
+// Key design difference from the f32 file: the f32 version slices
+// W_K/W_Q per head into a scratch buffer then matvecs that slice.
+// There is no int8 slice builtin, and slicing per head per token
+// is wasteful anyway — so here we do ONE full int8 matvec per
+// projection (all heads at once) and treat each head as a
+// contiguous f32 segment of the result.  This both avoids needing
+// an int8 slice AND is faster than the per-head-slice f32 path.
+//
+// Weights are bias-less (Llama / our pack convention — the GQA
+// arch entry never carries an attention bias).  The score matvec
+// against the KV cache stays f32: the cache holds runtime
+// activations, not quantisable weights.
+//
+// Slot layout (state array, 30 slots):
+//   [0]  X            (f32 input, d_model)
+//   [1]  W_Q i8       [2]  W_Q_scales f32  (len n_heads*d_head)
+//   [3]  W_K i8       [4]  W_K_scales f32  (len n_kv_heads*d_head)
+//   [5]  W_V i8       [6]  W_V_scales f32  (len n_kv_heads*d_head)
+//   [7]  W_O i8       [8]  W_O_scales f32  (len d_model)
+//   [9]  out          (f32, d_model)
+//   [10] rope_tbl
+//   [11] states_kv
+//   [12] Q_all f32    (n_heads*d_head)
+//   [14] K_all f32    (n_kv_heads*d_head)
+//   [16] V_all f32    (n_kv_heads*d_head)
+//   [18] head_out f32 (d_head)
+//   [19] concat f32   (n_heads*d_head == d_model)
+//   [20] max_seq [21] d_model [22] n_heads [23] n_kv_heads
+//   [24] d_head  [25] count
+
+import "attention_kv_f32.ari" as kv;
+import "rope_f32.ari" as rope;
+
+fn attn_gqa_kv_alloc_i8(max_seq: i32, d_model: i32, n_heads: i32,
+                        n_kv_heads: i32, theta: f64) -> i32 {
+    let s: i32 = arr_new(30);
+    let d_head: i32 = d_model / n_heads;
+    let kv_dim: i32 = n_kv_heads * d_head;
+
+    arr_set(s, 0, 0);
+    arr_set(s, 1, 0); arr_set(s, 2, 0);
+    arr_set(s, 3, 0); arr_set(s, 4, 0);
+    arr_set(s, 5, 0); arr_set(s, 6, 0);
+    arr_set(s, 7, 0); arr_set(s, 8, 0);
+    arr_set(s, 9, 0);
+
+    let table: i32 = rope.rope_alloc_f32(max_seq, d_head, theta);
+    arr_set(s, 10, table);
+
+    let states_kv: i32 = arr_new(n_kv_heads);
+    let kh: i32 = 0;
+    while (kh < n_kv_heads) {
+        let st: i32 = kv.attn_kv_alloc_f32(max_seq, d_model, d_head);
+        arr_set(states_kv, kh, st);
+        kh = kh + 1;
+    }
+    arr_set(s, 11, states_kv);
+
+    // Full-projection output scratches (one int8 matvec fills each).
+    arr_set(s, 12, arr_f32_new(n_heads * d_head));   // Q_all
+    arr_set(s, 14, arr_f32_new(kv_dim));              // K_all
+    arr_set(s, 16, arr_f32_new(kv_dim));              // V_all
+
+    arr_set(s, 18, arr_f32_new(d_head));             // head_out
+    arr_set(s, 19, arr_f32_new(n_heads * d_head));   // concat
+
+    arr_set(s, 20, max_seq);
+    arr_set(s, 21, d_model);
+    arr_set(s, 22, n_heads);
+    arr_set(s, 23, n_kv_heads);
+    arr_set(s, 24, d_head);
+    arr_set(s, 25, 0);
+    return s;
+}
+
+fn attn_gqa_kv_reset_i8(s: i32) -> i32 {
+    let states_kv: i32 = arr_get(s, 11);
+    let n_kv_heads: i32 = arr_get(s, 23);
+    let kh: i32 = 0;
+    while (kh < n_kv_heads) {
+        kv.attn_kv_reset_f32(arr_get(states_kv, kh));
+        kh = kh + 1;
+    }
+    arr_set(s, 25, 0);
+    return 0;
+}
+
+// Identical maths to attention_gqa_kv_f32._gqa_score_head — duplicated
+// here so the i8 file is self-contained (Q/Kc/Vc are all f32
+// activations; only the projection WEIGHTS were int8).
+fn _gqa_score_head_i8(kv_st: i32, Q: i32, head_out: i32,
+                      count: i32, max_seq: i32, d_head: i32) -> i32 {
+    let Kc: i32 = arr_get(kv_st, 7);
+    let Vc: i32 = arr_get(kv_st, 8);
+    let scores: i32 = arr_get(kv_st, 11);
+    let zero_bias: i32 = arr_get(kv_st, 17);
+
+    let n: i32 = count + 1;
+    arr_f32_matvec(Kc, Q, zero_bias, scores, n, d_head);
+
+    let neg_big: f64 = 0.0 - 60.0;
+    let j: i32 = n;
+    while (j < max_seq) {
+        arr_f32_set(scores, j, neg_big);
+        j = j + 1;
+    }
+    arr_f32_softmax(scores);
+
+    arr_f32_matvec_T(Vc, scores, head_out, n, d_head);
+    return 0;
+}
+
+fn attn_gqa_kv_step_i8(s: i32) -> i32 {
+    let X: i32        = arr_get(s,  0);
+    let W_Q: i32      = arr_get(s,  1);  let W_Q_sc: i32 = arr_get(s, 2);
+    let W_K: i32      = arr_get(s,  3);  let W_K_sc: i32 = arr_get(s, 4);
+    let W_V: i32      = arr_get(s,  5);  let W_V_sc: i32 = arr_get(s, 6);
+    let W_O: i32      = arr_get(s,  7);  let W_O_sc: i32 = arr_get(s, 8);
+    let out: i32      = arr_get(s,  9);
+    let rope_tbl: i32 = arr_get(s, 10);
+    let states_kv: i32 = arr_get(s, 11);
+    let Q_all: i32    = arr_get(s, 12);
+    let K_all: i32    = arr_get(s, 14);
+    let V_all: i32    = arr_get(s, 16);
+    let head_out: i32 = arr_get(s, 18);
+    let concat: i32   = arr_get(s, 19);
+    let max_seq: i32  = arr_get(s, 20);
+    let d_model: i32  = arr_get(s, 21);
+    let n_heads: i32  = arr_get(s, 22);
+    let n_kv_heads: i32 = arr_get(s, 23);
+    let d_head: i32   = arr_get(s, 24);
+    let count: i32    = arr_get(s, 25);
+
+    if (count >= max_seq) {
+        return 0 - 1;
+    }
+
+    let group_size: i32 = n_heads / n_kv_heads;
+    let kv_dim: i32 = n_kv_heads * d_head;
+    let inv_sqrt_dh: f64 = 1.0 / math_sqrt(int_to_float(d_head));
+
+    // ---- Project Q/K/V in one int8 matvec each (all heads at once) ----
+    arr_i8_matvec_f32_perrow(W_K, X, K_all, kv_dim,        W_K_sc);
+    arr_i8_matvec_f32_perrow(W_V, X, V_all, kv_dim,        W_V_sc);
+    arr_i8_matvec_f32_perrow(W_Q, X, Q_all, n_heads*d_head, W_Q_sc);
+
+    // ---- Stage 1: per-KV-head RoPE(K) + cache write ----
+    let kh: i32 = 0;
+    while (kh < n_kv_heads) {
+        let kv_st: i32 = arr_get(states_kv, kh);
+        let Kc: i32 = arr_get(kv_st, 7);
+        let Vc: i32 = arr_get(kv_st, 8);
+        let row_scratch: i32 = arr_get(kv_st, 10);
+
+        // K row = K_all[kh*d_head : (kh+1)*d_head] → RoPE → cache.
+        arr_f32_copy_slice(K_all, kh * d_head, row_scratch, 0, d_head);
+        rope.rope_apply_f32(rope_tbl, row_scratch, count, d_head);
+        arr_f32_copy_slice(row_scratch, 0, Kc, count * d_head, d_head);
+
+        // V row = V_all[kh*d_head : ...] → cache (no RoPE on V).
+        arr_f32_copy_slice(V_all, kh * d_head, row_scratch, 0, d_head);
+        arr_f32_copy_slice(row_scratch, 0, Vc, count * d_head, d_head);
+
+        kh = kh + 1;
+    }
+
+    // ---- Stage 2: per-Q-head RoPE(Q) + score + concat ----
+    let h: i32 = 0;
+    while (h < n_heads) {
+        let kv_h: i32 = h / group_size;
+        let kv_st: i32 = arr_get(states_kv, kv_h);
+        let Q: i32 = arr_get(kv_st, 9);
+
+        arr_f32_copy_slice(Q_all, h * d_head, Q, 0, d_head);
+        rope.rope_apply_f32(rope_tbl, Q, count, d_head);
+        arr_f32_scale(Q, inv_sqrt_dh);
+
+        _gqa_score_head_i8(kv_st, Q, head_out, count, max_seq, d_head);
+
+        arr_f32_copy_slice(head_out, 0, concat, h * d_head, d_head);
+        h = h + 1;
+    }
+
+    // ---- Stage 3: output projection (int8) ----
+    arr_i8_matvec_f32_perrow(W_O, concat, out, d_model, W_O_sc);
+
+    arr_set(s, 25, count + 1);
+    return 0;
+}
